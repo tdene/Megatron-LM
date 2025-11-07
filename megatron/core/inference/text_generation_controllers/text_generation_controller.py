@@ -653,6 +653,11 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
 
+        # CUDA graph batch size.
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.is_decode_only() else None
+        )
+
         # Active sequence lengths.
         active_request_ids = context.request_ids[
             context.paused_request_count : context.total_request_count
@@ -681,6 +686,7 @@ class TextGenerationController:
             "active_request_ids": active_request_ids,
             "newly_paused_request_ids": newly_paused_request_ids,
             "finished_request_ids": finished_request_ids,
+            "cuda_graph_request_count": cuda_graph_request_count,
         }
 
     @torch.inference_mode()
@@ -715,35 +721,25 @@ class TextGenerationController:
         if context.active_token_count == 0:
             return None
 
-        # This method only performs computations using CPU tensors.
+        # This bloc of methods performs CPU tensor operations and H2D transfers.
         input_ids, position_ids = self._dynamic_step_context_init()
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.is_decode_only() else None
-        )
-
-        # This method only performs computations using GPU tensors.
-        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
-
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
-
-        # This method will only perform computations using CPU tensors in the future.
         self._dynamic_step_sample_bookkeeping(active_sampling_map)
-        # This method will only perform computations using GPU tensors in the future.
-        new_sample, termination_id = self._dynamic_step_sample_logits(logits, active_sampling_map)
-
-        # This method will only perform computations using CPU tensors in the future.
         self._dynamic_step_log_probs_bookkeeping()
-        # This method will only perform computations using GPU tensors in the future.
+
+        # This bloc of methods is exclusively GPU work.
+        critical_path = torch.cuda.Event()
+        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        new_sample, termination_id = self._dynamic_step_sample_logits(logits, active_sampling_map)
+        critical_path.record()
+
+        while not critical_path.query():
+            await asyncio.sleep(0)
+
+        # This will be exclusively GPU work in the future.
+        # NOTE: This is not on the critical path; we do not need log_probs for the forward pass.
         log_probs = self._dynamic_step_calculate_log_probs(logits, new_sample, active_sampling_map)
 
-        # This method only performs computations using CPU tensors.
+        # This performs D2H transfers and CPU tensor operations.
         if skip_bookkeeping:
             request_bookeeping = {}
         else:
@@ -752,7 +748,6 @@ class TextGenerationController:
         ret = {
             "sample": new_sample,
             "log_probs": log_probs,
-            "cuda_graph_request_count": cuda_graph_request_count,
         }
         ret.update(request_bookeeping)
         return ret
