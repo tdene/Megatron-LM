@@ -383,7 +383,9 @@ class DynamicInferenceEngine(AbstractEngine):
             self.tensor_parallel_publisher_socket.bind(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
 
             # 3. Create another publisher socket to broadcast the number of messages to receive.
-            self.tensor_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
+            self.tensor_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.XPUB)
+            self.tensor_parallel_num_msgs_publisher_socket.setsockopt(zmq.XPUB_VERBOSE, 1)
+            self.tensor_parallel_num_msgs_publisher_socket.setsockopt(zmq.RCVTIMEO, 1000)
             self.tensor_parallel_num_msgs_publisher_socket.bind(
                 f"ipc:///tmp/{identity}-tp-bcast-socket-len"
             )
@@ -392,6 +394,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.tensor_parallel_num_msgs_publisher_socket,
                 self.tensor_parallel_publisher_socket,
             ]
+
+            # 4. Wait for all subscriber ranks to connect to the publisher sockets.
+            need = parallel_state.get_tensor_model_parallel_world_size() - 1
+            seen = 0
+            while seen < need:
+                try:
+                    msg = self.tensor_parallel_num_msgs_publisher_socket.recv()
+                    if msg[:1] == b'\x01':
+                        seen += 1
+                except zmq.Again:
+                    pass
+
         # All TP ranks subscribe to the two publisher sockets
         self.tensor_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
         self.tensor_parallel_subscriber_socket.connect(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
