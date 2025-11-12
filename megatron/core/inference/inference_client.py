@@ -73,6 +73,10 @@ class InferenceClient:
         inference_coordinator_address = os.getenv('MASTER_ADDR', '127.0.0.1')
         socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
 
+        self._loop = None
+        self._is_paused = asyncio.Event()
+        self._is_stopped = asyncio.Event()
+
         self.socket = socket
         self.completion_futures = {}
         self.request_submission_times = {}
@@ -104,7 +108,7 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = get_asyncio_loop().create_future()
+        self.completion_futures[request_id] = self._loop.create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
@@ -145,7 +149,7 @@ class InferenceClient:
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
         assert Headers(reply) == Headers.ACK
 
-    async def start(self):
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None)
         """
         Connects to the coordinator and starts the background listener task.
 
@@ -154,8 +158,9 @@ class InferenceClient:
         coroutine.
         """
         logging.info("Client: Connecting to InferenceCoordinator...")
+        self._loop = get_asyncio_loop(loop)
         self._connect_with_inference_coordinator()
-        self.listener_task = asyncio.create_task(self._listen_for_completed_requests())
+        self.listener_task = self._loop.create_task(self._listen_for_completed_requests())
 
     def _send_signal_to_engines(self, signal):
         """
@@ -168,15 +173,16 @@ class InferenceClient:
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
 
-    def pause_engines(self):
+    async def pause_engines(self):
         """Sends a signal to pause all inference engines."""
         self._send_signal_to_engines(Headers.PAUSE)
+        await self._is_paused
 
     def unpause_engines(self):
         """Sends a signal to unpause all inference engines."""
         self._send_signal_to_engines(Headers.UNPAUSE)
 
-    def stop_engines(self):
+    async def stop_engines(self):
         """Sends a signal to gracefully stop all inference engines."""
         self._send_signal_to_engines(Headers.STOP)
 
