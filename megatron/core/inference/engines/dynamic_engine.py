@@ -430,6 +430,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
         await self.run_engine(use_coordinator=True, loop=loop)
+        #self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -979,8 +980,11 @@ class DynamicInferenceEngine(AbstractEngine):
         """Runs the bookkeeping task in an infinite loop."""
         try:
             while not self.stopped:
+                print(f"Waiting for step data in bookkeep task...")
                 step_data = await self._step_queue.get()
+                print(f"Got step data in bookkeep task...")
                 await self.async_bookkeep(*step_data, verbose=verbose)
+                print(f"Completed bookkeep for step data...")
         except asyncio.CancelledError:
             pass
 
@@ -988,14 +992,18 @@ class DynamicInferenceEngine(AbstractEngine):
         """Runs the forward task in an infinite loop."""
         try:
             while not self.stopped:
+                print(f"Waiting for condition in forward task...")
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: self.context.get_active_request_count() > 0
                         or self.waiting_request_ids
                         or self.paused
                     )
+                print(f"Woke up from condition in forward task...")
                 if not self.stopped and not self.paused:
+                    print(f"Running forward step in forward task...")
                     await self._step_queue.put(await self.async_forward())
+                    print(f"Completed forward step in forward task...")
         except asyncio.CancelledError:
             if self.use_coordinator:
                 self.stop()
@@ -1130,7 +1138,9 @@ class DynamicInferenceEngine(AbstractEngine):
         loop = get_asyncio_loop(loop)
         try:
             while not self.stopped:
-                await self.schedule_requests()
+                print("Running schedule requests...")
+                num_scheduled = await self.schedule_requests()
+                print(f"Completed schedule requests: {num_scheduled} requests scheduled.")
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             pass
@@ -1167,7 +1177,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = use_coordinator
-        self._step_queue = asyncio.Queue()
+        self._step_queue = asyncio.Queue(maxsize=1)
         self.engine_loop_tasks = []
 
         if self.use_coordinator:
