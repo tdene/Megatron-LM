@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import asyncio
+import functools
 import random
 import time
 from collections import deque
@@ -112,7 +113,7 @@ class CoordinatorTestConfig:
     min_time_offset: float = 10 ** (-4)
     max_time_offset: float = 10 ** (-3)
 
-    tensor_model_parallel_size: int = 1
+    tensor_model_parallel_size: int = 2
     pipeline_model_parallel_size: int = 1
 
 
@@ -147,10 +148,14 @@ class TestCoordinator:
         return CoordinatorTestEnv(config=test_config, requests=requests, engine=engine)
 
     @classmethod
-    async def _run_test(cls, **test_config_kwargs):
+    async def _run_test(cls, env_override=None, **test_config_kwargs):
         # Test environment.
-        test_config = CoordinatorTestConfig(**test_config_kwargs)
-        env = cls._build_test_env(test_config)
+        if env_override:
+            env = env_override
+            test_config = env.config
+        else:
+            test_config = CoordinatorTestConfig(**test_config_kwargs)
+            env = cls._build_test_env(test_config)
 
         await env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port, launch_inference_coordinator=True
@@ -207,6 +212,48 @@ class TestCoordinator:
         end = time.time()
         if dist.get_rank() == 0:
             print(f"Throughput test time: {end - start} seconds.")
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_mp_race_condition(self):
+        """Test whether the coordinator is robust to race conditions across MP."""
+        cfg = CoordinatorTestConfig()
+        env = self._build_test_env(cfg)
+
+        if dist.get_rank() != 0:
+            original_fn = env.engine.schedule_requests
+            first_time = True
+
+            @functools.wraps(original_fn)
+            def new_fn(*args, **kwargs):
+                nonlocal first_time
+                if first_time:
+                    first_time = False
+                    time.sleep(2)
+                return original_fn(*args, **kwargs)
+            env.engine.schedule_requests = new_fn
+
+        await self._run_test(env_override=env)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_dp_race_condition(self):
+        """Test whether the coordinator is robust to race conditions across DP."""
+        cfg = CoordinatorTestConfig()
+        env = self._build_test_env(cfg)
+
+        if dist.get_rank() != 0:
+            original_fn = env.engine.start_listening_to_data_parallel_coordinator
+
+            @functools.wraps(original_fn)
+            async def new_fn(*args, **kwargs):
+                await asyncio.sleep(2)
+                return await original_fn(*args, **kwargs)
+            env.engine.start_listening_to_data_parallel_coordinator = new_fn
+
+        await self._run_test(env_override=env)
 
 
 if __name__ == "__main__":
