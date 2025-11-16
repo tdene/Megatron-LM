@@ -363,16 +363,30 @@ class DynamicInferenceEngine(AbstractEngine):
         # Spawn a DP coordinator process and get the connection info.
         if launch_inference_coordinator and self.is_dp_coordinator:
             spawn_context = multiprocessing.get_context('spawn')
+            dp_pipe, dp_process_pipe = spawn_context.Pipe()
             coordinator_ready_event = spawn_context.Event()
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 args=(
+                    dp_process_pipe,
                     coordinator_ready_event,
+                    dp_size,
                     inference_coordinator_port,
-                    parallel_state.get_data_parallel_world_size(),
                 ),
             )
             self.inference_coordinator_process.start()
+            dp_addr = [dp_pipe.recv()]
+
+            # Check if the port number is not inference_coordinator_port
+            actual_port = int(dp_addr[0].rsplit(":", 1)[-1])
+            if actual_port != inference_coordinator_port:
+                logging.warning(
+                    f"Requested InferenceCoordinator port {inference_coordinator_port} "
+                    f"but got port {actual_port} instead. This happens if the request port "
+                    f"is already in use."
+                )
+        else:
+            dp_addr = [None]
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
@@ -388,11 +402,10 @@ class DynamicInferenceEngine(AbstractEngine):
             mp_len_addr = [None]
 
         # Broadcast addresses to respective ranks.
+        torch.distributed.broadcast_object_list(dp_addr, src=dp_src, group=dp_group)
         torch.distributed.broadcast_object_list(mp_req_addr, src=mp_src, group=mp_group)
         torch.distributed.broadcast_object_list(mp_len_addr, src=mp_src, group=mp_group)
 
-        ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
-        dp_addr = [f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"]
         identity = f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
@@ -435,10 +448,13 @@ class DynamicInferenceEngine(AbstractEngine):
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_event(coordinator_ready_event, self.inference_coordinator_process)
             logging.info("Inference co-ordinator is ready to receive requests!")
+            logging.info(f"Data parallel coordinator can be found at {dp_addr[0]}")
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+
+        return dp_addr[0]
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
