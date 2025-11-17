@@ -140,8 +140,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
-        self.paused = False
-        self.stopped = False
+        self.running = asyncio.Event()
+        self.paused = asyncio.Event()
+        self.stopped = asyncio.Event()
+        self.pending_microbatch = deque()
+        self.microbatch_suspend: bool = False
+        self.microbatch_shutdown: bool = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.rank = torch.distributed.get_rank()
 
@@ -986,7 +990,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         torch.cuda.nvtx.range_push("drain_zmq_socket")
-        all_messages = []
+        # Retrieve any pending messages.
+        all_messages = list(self.pending_microbatch)
         if self.is_mp_coordinator:
             while True:
                 try:
@@ -1017,14 +1022,35 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages.append(self.model_parallel_subscriber_socket.recv())
 
         torch.cuda.nvtx.range_pop()
-        for message in all_messages:
+        cnt = len(all_messages)
+        while len(all_messages) > 0:
+            message = all_messages.pop()
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
+
+            if self.microbatch_suspend:
+                assert header == Headers.PAUSE_ACK, (
+                    "Engine is waiting for PAUSE_ACK. No other messages allowed."
+                )
+            if self.microbatch_shutdown:
+                assert header == Headers.STOP_ACK, (
+                    "Engine is shutting down. No other messages allowed except STOP_ACK."
+                )
+            if self.paused.is_set():
+                assert header == Headers.UNPAUSE, (
+                    "Engine is paused. No other messages allowed except UNPAUSE."
+                )
+
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
             elif header == Headers.PAUSE:
+                # Save the remaining messages from this microbatch.
+                self.pending_microbatch.extend(all_messages)
+                # Pause thyself.
+                self.microbatch_suspend = True
+                self.running.clear()
                 # Send PAUSE_ACK back to coordinator.
                 if rank == 0:
                     payload = msgpack.packb(
@@ -1033,6 +1059,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     self.socket_for_receiving_requests.send(payload)
             elif header == Headers.STOP:
+                # Save the remaining messages from this microbatch.
+                self.pending_microbatch.extend(all_messages)
+                # Stop thyself.
+                self.microbatch_shutdown = True
+                self.running.clear()
                 # Send STOP_ACK back to coordinator.
                 if rank == 0:
                     payload = msgpack.packb(
@@ -1041,13 +1072,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     self.socket_for_receiving_requests.send(payload)
             elif header == Headers.PAUSE_ACK:
-                self.paused = True
+                self.paused.set()
             elif header == Headers.STOP_ACK:
-                self.stopped = True
+                self.stopped.set()
+                self.stop()
             elif header == Headers.UNPAUSE:
-                self.paused = False
+                self.paused.clear()
+                self.running.set()
 
-        return len(all_messages)
+        return cnt
 
     def stop(self):
         """
@@ -1091,11 +1124,8 @@ class DynamicInferenceEngine(AbstractEngine):
         try:
             while True:
                 self.schedule_requests()
-                if self.stopped:
-                    self.stop()
-                    return
 
-                # for the cases below (engine is paused or no active requests),
+                # for the cases below (no active requests, or undergoing a state-change)
                 # do not use asyncio.sleep(0)
                 # as tp-rank=0 will flood the num_messages publisher
                 # with "0" repeatedly. This causes some packets to drop.
@@ -1107,7 +1137,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.paused:
+                if self.microbatch_suspend or self.microbatch_shutdown:
                     await asyncio.sleep(0.02)
                     continue
 
