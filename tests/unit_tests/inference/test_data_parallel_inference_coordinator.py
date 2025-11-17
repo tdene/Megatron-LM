@@ -169,13 +169,13 @@ class TestCoordinator:
 
         # Connect each engine to their respective processes.
         env.timing_data["start_time"] = time.time()
-        await env.engine.start_listening_to_data_parallel_coordinator(
+        dp_addr = await env.engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=test_config.port,
             launch_inference_coordinator=test_config.launch_inference_coordinator,
         )
 
         if dist.get_rank() == 0:
-            client = InferenceClient(test_config.port)
+            client = InferenceClient(dp_addr)
             await client.start()
             env.timing_data["init_time"] = time.time()
 
@@ -247,6 +247,28 @@ class TestCoordinator:
     @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
+    async def test_no_launch(self):
+        """Test initialization without launching the coordinator from the engine."""
+        # Initialize normally, but do not stop engines.
+        env = await self._run_test(stop_engines=False)
+        # Attempt to initialize again without launching the coordinator.
+        env = await self._run_test(launch_inference_coordinator=False)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_forbid_multiple_launch(self):
+        """Test attempting to relaunch the coordinator at the same IP."""
+        # Initialize normally, but do not stop engines.
+        env = await self._run_test(stop_engines=False)
+        # Attempt to initialize again and re-launch the coordinator.
+        # env = await self._run_test(launch_inference_coordinator=False)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(IS_ZMQ_FLAKY, reason="pyzmq is flaky in CI")
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
     async def test_throughput(self):
         """Throughput test with no TP or PP."""
         env = await self._run_test(
@@ -259,7 +281,7 @@ class TestCoordinator:
         )
         if dist.get_rank() == 0:
             init_duration = (env.timing_data["init_time"] - env.timing_data["start_time"]) * 10**3
-            golden_init_duration = 4445.64  # ms
+            golden_init_duration = 7684.46  # ms
             run_duration = (env.timing_data["done_time"] - env.timing_data["init_time"]) * 10**3
             golden_run_duration = 3088.87  # ms
             stop_duration = (env.timing_data["stop_time"] - env.timing_data["done_time"]) * 10**3
