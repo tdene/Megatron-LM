@@ -24,7 +24,7 @@ from wandb import wandb_run
 
 from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
-from megatron.core.inference.utils import get_event_loop
+from megatron.core.utils import get_asyncio_loop
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.optimizer import MegatronOptimizer
@@ -607,7 +607,7 @@ def get_environment_rollouts(
     ), "n_prompts must be divisible by data_parallel_world_size"
 
     with nvtx_range("rollout-collection"):
-        loop = get_event_loop()
+        loop = get_asyncio_loop()
         with megatron_rl_inference_mode(
             model,
             optimizer,
@@ -2056,7 +2056,7 @@ def evaluate_and_print_results_rl(
             args.rl_remove_kv_cache_during_training,
         ) as inference_interface:
 
-            loop = get_event_loop()
+            loop = get_asyncio_loop()
 
             rank = torch.distributed.get_rank()
             if rank == 0:
@@ -2252,7 +2252,7 @@ def megatron_rl_inference_mode(
 
     """
     args = get_args()
-    loop = get_event_loop()
+    loop = get_asyncio_loop()
     nvtx_range = get_nvtx_range()
 
     print(f"[{dist.get_rank()}:DP] Entering inference mode")

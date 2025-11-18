@@ -10,6 +10,8 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
+import torch.distributed as dist
+
 from .headers import Headers
 
 try:
@@ -99,6 +101,7 @@ class InferenceClient:
             `DynamicInferenceRequest` object containing the completed result.
         """
         request_id = self.next_request_id
+        logging.info(f"Adding request {request_id} to client")
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serializable()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
@@ -141,11 +144,13 @@ class InferenceClient:
         connection is established and acknowledged by the coordinator.
         """
         payload = [Headers.CONNECT.value]
+        logging.info(f"Sending CONNECT message to coordinator on rank {dist.get_rank()}")
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
+        logging.info(f"Received ACK message from coordinator on rank {dist.get_rank()}")
         assert Headers(reply) == Headers.ACK
 
-    async def start(self):
+    def start(self):
         """
         Connects to the coordinator and starts the background listener task.
 

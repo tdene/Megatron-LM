@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
+from megatron.core.utils import log_single_rank
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
@@ -1005,6 +1006,9 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.UNPAUSE:
                 self.paused = False
 
+        if len(all_messages) > 0:
+            logging.info(f"Drained {len(all_messages)} messages from coordinator on rank {torch.distributed.get_rank()}")
+
         return len(all_messages)
 
     def stop(self):
@@ -1049,6 +1053,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         try:
+            logging.info(f"Running engine with coordinator on rank {torch.distributed.get_rank()}")
             while True:
                 self.schedule_requests()
                 if self.stopped:
@@ -1096,6 +1101,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         ],
                         use_bin_type=True,
                     )
+                    logging.info(f"Sending {len(engine_output['finished_requests'])} finished requests to coordinator on rank {torch.distributed.get_rank()}")
                     self.socket_for_receiving_requests.send(payload)
 
         except asyncio.CancelledError:

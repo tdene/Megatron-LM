@@ -25,7 +25,8 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import log_single_rank, get_attr_wrapped_model
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.training.global_vars import get_args, get_tokenizer
 from megatron.training import get_wandb_writer
 
@@ -104,11 +105,16 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     """
     tokenizer = get_tokenizer()
 
-    num_cuda_graphs = None
-    if args.enable_cuda_graph:
-        num_cuda_graphs = args.inference_dynamic_batching_num_cuda_graphs
+    enable_cuda_graph = args.cuda_graph_impl == "local"
 
-    module = model.module.module if hasattr(model.module, "module") else model.module
+    # Layer type list for hybrid models
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+    else:
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
 
     # Inference context.
     inference_context = DynamicInferenceContext(
@@ -119,23 +125,25 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=args.inference_max_seq_length,
-        num_cuda_graphs=num_cuda_graphs,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
-        buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
-        max_requests_override=args.inference_dynamic_batching_max_requests_override,
-        max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        num_cuda_graphs=(
+            args.inference_dynamic_batching_num_cuda_graphs
+            if enable_cuda_graph
+            else None
+        ),
+        block_size_tokens=args.inference_dynamic_batching_block_size,
+        active_buffer_size_gb=args.inference_dynamic_batching_active_buffer_size_gb,
+        max_tokens=args.inference_dynamic_batching_max_tokens,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=True,
-        unified_memory_kvcache=args.inference_dynamic_batching_unified_memory_kvcache,
-        is_hybrid_model=args.is_hybrid_model,
-        layer_type_list=module.decoder.layer_type_list if args.is_hybrid_model else None,
-        mamba_head_dim=args.mamba_head_dim,
-        mamba_num_groups=args.mamba_num_groups,
-        mamba_d_model=args.hidden_size,
-        mamba_d_conv=4 if args.is_hybrid_model else None,
-        mamba_d_state=args.mamba_state_dim,
+        layer_type_list=None,
+        mamba_conv_states_shape=mamba_conv_states_shape,
+        mamba_ssm_states_shape=mamba_ssm_states_shape,
+        cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
+        kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
+        qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
+        use_flashinfer_fused_rope=None,
+        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         metrics_writer=metrics_writer,
     )
 
@@ -152,7 +160,7 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
     return DynamicInferenceEngine(
         controller=text_generation_controller,
         context=inference_context,
-        enable_cuda_graph=args.enable_cuda_graph,
+        enable_cuda_graph=enable_cuda_graph,
         random_seed=args.seed,
         inference_logging_step_interval=inference_logging_step_interval,
     )
@@ -175,6 +183,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             isinstance(p, str) for p in request.prompt
         ), "MegatronLocal only supports string prompts."
 
+        assert self._client is not None, "Client is not initialized"
+        
         tokenizer = get_tokenizer()
 
         sampling_params = SamplingParams(
@@ -182,7 +192,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             temperature=request.generation_args.temperature or 1.0,
             top_k=request.generation_args.top_k or 0,
             top_p=request.generation_args.top_p or 0.0,
-            termination_id=self._coordinator.engine.controller.tokenizer.eod,
+            termination_id=self._inference_engine.controller.tokenizer.eod,
             return_log_probs=True,
             skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
@@ -192,7 +202,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             for prompt in request.prompt
         ]
         responses = await asyncio.gather(
-            requests
+            *requests
         )
         return [
             InferenceResponse(
@@ -230,8 +240,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                            "wandb module is available. Inference logging will be disabled.")
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
-        await inference_engine.start_listening_to_data_parallel_coordinator(launch_inference_coordinator=True)
-        client = InferenceClient()
+        await inference_engine.start_listening_to_data_parallel_coordinator(inference_coordinator_port=41521, launch_inference_coordinator=True)
+        if dist.get_rank() == 0:
+            # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
+            client = InferenceClient(inference_coordinator_port=41521)
+            client.start()
+        else:
+            client = None
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._inference_engine = inference_engine
@@ -246,6 +261,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     async def suspend(self):
         if dist.get_rank() == 0:
             await self._client.suspend_engines()
+        await asyncio.sleep(600)
         await self._inference_engine.is_paused()
 
     def resume(self):
