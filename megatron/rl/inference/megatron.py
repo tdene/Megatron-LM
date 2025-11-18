@@ -5,10 +5,11 @@ import logging
 from argparse import Namespace
 
 from pydantic import PrivateAttr
+import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.coordinator import DynamicEngineCoordinator
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
@@ -26,6 +27,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.training import get_wandb_writer
 
 from ..inference.inference_interface import (
     ChatInferenceInterface,
@@ -159,9 +161,8 @@ def get_dynamic_inference_engine(args: Namespace, model: MegatronModule, inferen
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
 
-    _coordinator: DynamicEngineCoordinator = PrivateAttr(None)
-    _engine_task: asyncio.Task = PrivateAttr(None)
-    _kill_engine: bool = PrivateAttr(False)
+    _client: InferenceClient = PrivateAttr(None)
+    _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest):
 
@@ -186,12 +187,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
         )
-        request_ids = [
-            self._coordinator.schedule_request(prompt=prompt, sampling_params=sampling_params)
+        requests = [
+            self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
         responses = await asyncio.gather(
-            *[self._coordinator.get_response(id) for id in request_ids]
+            requests
         )
         return [
             InferenceResponse(
@@ -229,28 +230,29 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                            "wandb module is available. Inference logging will be disabled.")
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(args, model, inference_logging_step_interval, metrics_writer)
-        coordinator = DynamicEngineCoordinator(
-            inference_engine,
-            inference_max_requests=inference_engine.context.max_requests,
-            log_level=0,
-        )
+        await inference_engine.start_listening_to_data_parallel_coordinator(launch_inference_coordinator=True)
+        client = InferenceClient()
         launched_server = cls(**kwargs)
-        launched_server._coordinator = coordinator
-
-        loop = asyncio.get_running_loop()
-
-        coordinator.startup(loop)
+        launched_server._client = client
+        launched_server._inference_engine = inference_engine
 
         return launched_server
 
     async def kill(self):
-        await self._coordinator.shutdown()
+        if dist.get_rank() == 0:
+            await self._client.stop_engines()
+        await self._inference_engine.is_stopped()
 
     async def suspend(self):
-        await self._coordinator.suspend_engine()
+        if dist.get_rank() == 0:
+            await self._client.suspend_engines()
+        await self._inference_engine.is_paused()
 
     def resume(self):
-        self._coordinator.resume_engine()
+        #if dist.get_rank() == 0:
+        #    self._client.resume_engine()
+        #await self._inference_engine.is_running()
+        pass
 
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
