@@ -1006,7 +1006,7 @@ def prepare_trajectories(
     args = get_args()
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
-        if args.use_sequence_packing:
+        if args.rl_use_sequence_packing:
             # For sequence packing, we need to pad all logprobs to the same size
             padded_logprobs = []
             for logprobs in inference_logprobs:
@@ -1207,14 +1207,14 @@ def prepare_data_for_update(
         # [g, group_size]
         # Making an assumption that all groups are of the same size!
         # For packing mode, use all rollouts to compute rewards
-        rollouts_for_rewards = all_rollouts if args.use_sequence_packing else rollouts
+        rollouts_for_rewards = all_rollouts if args.rl_use_sequence_packing else rollouts
         rewards = torch.tensor(
             [[rollout.reward for rollout in group] for group in rollouts_for_rewards], device='cpu'
         )
 
         # We flatten them for logging.
         with nvtx_range("prepare_trajectories"):
-            if args.use_sequence_packing:
+            if args.rl_use_sequence_packing:
                 trajs, generation_masks, inference_logprobs = prepare_packed_trajectories(
                     all_rollouts, tokenizer, args
                 )
@@ -1228,14 +1228,14 @@ def prepare_data_for_update(
         # Sequence packing or standard processing
         packing_context = {}  # Store all packing-related data
 
-        if args.use_sequence_packing:
+        if args.rl_use_sequence_packing:
             with nvtx_range("sequence_packing"):
                 timers('sequence-packing-overhead', log_level=1).start()
 
-                bin_size = args.sequence_packing_bin_size
+                bin_size = args.rl_sequence_packing_bin_size
 
                 # Create packer with max sequences per bin limit to prevent extreme imbalance
-                max_sequences_per_bin = getattr(args, 'sequence_packing_max_sequences_per_bin', 100)
+                max_sequences_per_bin = getattr(args, 'rl_sequence_packing_max_sequences_per_bin', 100)
                 packer = SequencePacker(
                     bin_size=bin_size,
                     pad_token=tokenizer.pad,
@@ -1276,7 +1276,7 @@ def prepare_data_for_update(
                 world_size = mpu.get_expert_data_parallel_world_size()
 
                 # Choose distribution algorithm based on args.sequence_packing_algo
-                packing_algo = getattr(args, 'sequence_packing_algo', 'fifo')
+                packing_algo = getattr(args, 'rl_sequence_packing_algo', 'fifo')
 
                 if packing_algo == 'round-robin':
                     # Round-robin assignment: rank i gets bins [i, i+world_size, i+2*world_size, ...]
@@ -1596,7 +1596,7 @@ def prepare_data_for_update(
             )
             original_loss_mask[~generation_masks] = 0.0
 
-        if not args.use_sequence_packing:
+        if not args.rl_use_sequence_packing:
             # Use original masks if not packing
             attention_mask = original_attention_mask
             loss_mask = original_loss_mask
@@ -1606,7 +1606,7 @@ def prepare_data_for_update(
             timers('compute-logprobs', log_level=0).start()
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
             # Use packed sequences if packing is enabled for performance benefits
-            if args.use_sequence_packing and 'packed_trajs' in packing_context:
+            if args.rl_use_sequence_packing and 'packed_trajs' in packing_context:
                 compute_trajs = packing_context['packed_trajs']
                 compute_position_ids = packing_context['packed_position_ids']
                 compute_attention_mask = packing_context['packed_attention_mask']
@@ -1661,7 +1661,7 @@ def prepare_data_for_update(
         if (
             inference_logprobs is not None
             and args.rl_inference_logprobs_is_correction
-            and not args.use_sequence_packing
+            and not args.rl_use_sequence_packing
         ):
             inference_logprobs = align_unpacked_inference_logprobs(
                 inference_logprobs=inference_logprobs,
@@ -1670,14 +1670,14 @@ def prepare_data_for_update(
                 group_stats=group_stats,
             )
         else:
-            if not args.use_sequence_packing:
+            if not args.rl_use_sequence_packing:
                 # Keep inference_logprobs as None instead of zeros
                 inference_logprobs = None
             # For sequence packing, inference_logprobs will be handled separately
 
         # Handle packing of inference_logprobs for sequence packing mode
         if (
-            args.use_sequence_packing
+            args.rl_use_sequence_packing
             and inference_logprobs is not None
             and args.rl_inference_logprobs_is_correction
         ):
@@ -1687,7 +1687,7 @@ def prepare_data_for_update(
                     inference_logprobs=inference_logprobs,
                     packing_info=packing_context['packing_info'],
                     generation_masks=generation_masks,
-                    bin_size=args.sequence_packing_bin_size,
+                    bin_size=args.rl_sequence_packing_bin_size,
                 )
 
                 # Store packed inference logprobs in packing context
@@ -1754,7 +1754,7 @@ def prepare_data_for_update(
 
             timers('prepare-advantages').stop()
         with nvtx_range("create_dataloader"):
-            if args.use_sequence_packing:
+            if args.rl_use_sequence_packing:
                 # Store packing context in runtime state for forward_step
                 runtime_state = get_rl_runtime_state()
                 runtime_state.packing_context = packing_context
@@ -2303,7 +2303,7 @@ def megatron_rl_inference_mode(
             with nvtx_range("build-cuda-graphs"):
                 inference_interface._inference_engine.create_cuda_graphs(reset_context=False)
 
-        #loop.run_until_complete(inference_interface.resume())
+        loop.run_until_complete(inference_interface.resume())
 
         print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
@@ -2349,7 +2349,7 @@ def get_iteration_sequence_count(args):
 
 def update_sequence_packing_metrics(args):
     """Update bin tracking for sequence packing mode."""
-    if args.use_sequence_packing:
+    if args.rl_use_sequence_packing:
         bin_count = (
             mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
         )
