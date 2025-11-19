@@ -2301,7 +2301,7 @@ def megatron_rl_inference_mode(
                         inference_interface._inference_engine.async_step()
                     )
             with nvtx_range("build-cuda-graphs"):
-                inference_interface._inference_engine.create_cuda_graphs(reset_context=False)
+                inference_interface._inference_engine.create_cuda_graphs(reset_context=True)
 
         loop.run_until_complete(inference_interface.resume())
 
