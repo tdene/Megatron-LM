@@ -184,11 +184,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         ), "MegatronLocal only supports string prompts."
 
         assert self._client is not None, "Client is not initialized"
-        
+
         tokenizer = get_tokenizer()
 
         sampling_params = SamplingParams(
-            num_tokens_to_generate=request.generation_args.max_tokens or 1024,
+            num_tokens_to_generate=None,
+            num_tokens_total=request.generation_args.max_tokens,
             temperature=request.generation_args.temperature or 1.0,
             top_k=request.generation_args.top_k or 0,
             top_p=request.generation_args.top_p or 0.0,

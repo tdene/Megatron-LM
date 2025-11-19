@@ -1101,7 +1101,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         ],
                         use_bin_type=True,
                     )
-                    logging.info(f"Sending {len(engine_output['finished_requests'])} finished requests to coordinator on rank {torch.distributed.get_rank()}")
                     self.socket_for_receiving_requests.send(payload)
 
         except asyncio.CancelledError:

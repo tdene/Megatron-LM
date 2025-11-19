@@ -101,7 +101,7 @@ class InferenceClient:
             `DynamicInferenceRequest` object containing the completed result.
         """
         request_id = self.next_request_id
-        logging.info(f"Adding request {request_id} to client")
+        logging.info(f"Adding request {request_id}")
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serializable()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
@@ -129,6 +129,7 @@ class InferenceClient:
                     request_id
                 )
                 completion_future = self.completion_futures.pop(request_id)
+                logging.info(f"Received reply for request {request_id}")
                 completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
             except zmq.Again:
                 await asyncio.sleep(0.005)
@@ -144,10 +145,8 @@ class InferenceClient:
         connection is established and acknowledged by the coordinator.
         """
         payload = [Headers.CONNECT.value]
-        logging.info(f"Sending CONNECT message to coordinator on rank {dist.get_rank()}")
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         reply = msgpack.unpackb(self.socket.recv(), raw=False)[0]
-        logging.info(f"Received ACK message from coordinator on rank {dist.get_rank()}")
         assert Headers(reply) == Headers.ACK
 
     def start(self):
