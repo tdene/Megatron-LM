@@ -1031,15 +1031,15 @@ class DynamicInferenceEngine(AbstractEngine):
             if self.microbatch_suspend:
                 assert (
                     header == Headers.PAUSE_ACK
-                ), "Engine is waiting for PAUSE_ACK. No other messages allowed."
+                ), f"Engine is waiting for PAUSE_ACK. No other messages allowed. (Rx'd {header})"
             if self.microbatch_shutdown:
                 assert (
                     header == Headers.STOP_ACK
-                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
+                ), f"Engine is shutting down. No other messages allowed except STOP_ACK. (Rx'd {header})"
             if self.paused.is_set():
                 assert (
                     header == Headers.UNPAUSE
-                ), "Engine is paused. No other messages allowed except UNPAUSE."
+                ), f"Engine is paused. No other messages allowed except UNPAUSE. (Rx'd {header})"
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
@@ -1074,7 +1074,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.running.set()
 
         if cnt > 0:
-            logging.info(f"Drained {len(all_messages)} messages from coordinator on rank {torch.distributed.get_rank()}")
+            logging.info(f"Drained {cnt} messages from coordinator on rank {torch.distributed.get_rank()}")
 
         return cnt
 

@@ -611,7 +611,7 @@ def get_environment_rollouts(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl == "local",
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -2049,7 +2049,7 @@ def evaluate_and_print_results_rl(
         with megatron_rl_inference_mode(
             model,
             optimizer,
-            args.enable_cuda_graph,
+            args.cuda_graph_impl == "local",
             args.rl_reset_cuda_graphs,
             args.rl_offload_optimizer_during_inference,
             args.rl_offload_kv_cache_during_training,
@@ -2276,7 +2276,7 @@ def megatron_rl_inference_mode(
                 optimizer.offload_to_cpu()
 
         if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, True, reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, 'local', reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
 
@@ -2288,20 +2288,20 @@ def megatron_rl_inference_mode(
                 print(
                     f"[{dist.get_rank()}:DP] Restoring kv cache ({inference_interface._coordinator.engine.context.memory_buffer.numel() / 1024**3:.2f} GB) to GPU"
                 )
-                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
-                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cuda()
+                kv_cache = inference_interface._inference_engine.context.memory_buffer
+                inference_interface._inference_engine.context.memory_buffer = kv_cache.cuda()
             elif remove_kv_cache_during_training:
-                if inference_interface._coordinator.engine.context.memory_buffer is None:
-                    inference_interface._coordinator.engine.context.build_memory_buffer()
+                if inference_interface._inference_engine.context.memory_buffer is None:
+                    inference_interface._inference_engine.context.build_memory_buffer()
 
         if enable_cuda_graph and not _CudagraphGlobalRecord.cudagraph_created:
             with nvtx_range("wait-for-decode-only"):
-                while not inference_interface._coordinator.engine.context.is_decode_only():
+                while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
-                        inference_interface._coordinator.engine.async_step()
+                        inference_interface._inference_engine.async_step()
                     )
             with nvtx_range("build-cuda-graphs"):
-                inference_interface._coordinator.engine.build_cuda_graphs(reset_context=False)
+                inference_interface._inference_engine.create_cuda_graphs(reset_context=False)
 
         inference_interface.resume()
 
@@ -2312,16 +2312,16 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("offload-kv-cache-after-inference"):
             if offload_kv_cache_during_training:
-                kv_cache = inference_interface._coordinator.engine.context.memory_buffer
+                kv_cache = inference_interface._inference_engine.context.memory_buffer
                 print(
                     f"[{dist.get_rank()}:DP] Offloading kv cache ({kv_cache.numel() * kv_cache.element_size() / 1024**3:.2f} GB) to CPU"
                 )
-                inference_interface._coordinator.engine.context.memory_buffer = kv_cache.cpu()
+                inference_interface._inference_engine.context.memory_buffer = kv_cache.cpu()
             elif remove_kv_cache_during_training:
-                inference_interface._coordinator.engine.context.memory_buffer = None
+                inference_interface._inference_engine.context.memory_buffer = None
 
         if enable_cuda_graph:
-            toggle_cuda_graphs(lang_module, False, reset_cuda_graphs=reset_cuda_graphs)
+            toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
