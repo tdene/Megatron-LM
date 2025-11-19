@@ -134,8 +134,13 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.next_request_id = 0
-
         self._send_awaitables = asyncio.Queue()
+
+        # Attempt to connect, and do not allow any sends until we are connected.
+        self.is_running = asyncio.Event()
+        self._startup_sends = []
+
+        self.startup_sends_task = loop.create_task(self._startup_sends_task())
         self.send_task = loop.create_task(self._send_task())
         self.recv_task = loop.create_task(self._recv_task())
 
@@ -144,31 +149,30 @@ class DataParallelInferenceCoordinator:
         """Main loop of the inference coordinator."""
 
         print("Inference Coordinator: waiting for connections from data parallel ranks...")
-        # First wait for all data parallel ranks to establish connections.
-        for _ in range(self.data_parallel_size):
-            identity, header, _ = await self._irecv()
-            assert header == Headers.CONNECT
-            assert identity not in self.identities_of_data_parallel_ranks
-            self.identities_of_data_parallel_ranks.append(identity)
-            print(f"Inference Coordinator: Data parallel rank connected: {identity}")
-        print("All data parallel ranks connected.")
-        logging.info("Inference Coordinator: Connected with data parallel ranks...")
-        self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
-        self.ready_event.set()
-        print("Inference Coordinator: Ready to accept client connections.")
-
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         while True:
             identity, header, data = await self._irecv()
 
-            if header == Headers.CONNECT:
+            if header == Headers.ENGINE_CONNECT:
+                assert identity not in self.identities_of_data_parallel_ranks
+                self.identities_of_data_parallel_ranks.append(identity)
+                print(f"Inference Coordinator: Data parallel rank connected: {identity}")
+                if len(self.identities_of_data_parallel_ranks) == self.data_parallel_size:
+                    self.data_parallel_rank_iterator = cycle(self.identities_of_data_parallel_ranks)
+                    self.ready_event.set()
+                    self.is_running.set()
+                    print("All data parallel ranks connected.")
+                    logging.info("Inference Coordinator: Connected with data parallel ranks...")
+                    print("Inference Coordinator: Ready to accept client connections.")
+
+            elif header == Headers.CLIENT_CONNECT:
                 if identity in self.known_clients:
                     logging.info(
                         f"Client {identity} sent a duplicate connect request. Ignoring .."
                     )
                     continue
-
                 self.known_clients.add(identity)
+                # Due to the `startup_sends` logic, this will not be sent until we are connected.
                 self._isend(identity, Headers.ACK)
 
             elif header == Headers.SUBMIT_REQUEST:
@@ -240,6 +244,13 @@ class DataParallelInferenceCoordinator:
             await (await self._send_awaitables.get())
             self._send_awaitables.task_done()
 
+    @trace_async_exceptions
+    async def _startup_sends_task(self):
+        """Before a connection is established, we queue up sends for later."""
+        await self.is_running.wait()
+        for (identity, header, data) in self._startup_sends:
+            self._isend(identity, header, data)
+
     def _isend(
         self, identity: bytes, header: Headers, data: Optional[List] = None
     ) -> asyncio.Future:
@@ -251,6 +262,13 @@ class DataParallelInferenceCoordinator:
             header (Headers): The signal header to send.
             data (Optional[List]): The data payload to send.
         """
+        # If we have not connected yet, wait on sends.
+        if not self.is_running.is_set():
+            if header not in [Headers.ENGINE_CONNECT, Headers.CLIENT_CONNECT]:
+                self._startup_sends.append((identity, header, data))
+                return
+
+        # Once we are connected, we do an atomic send and await its completion later.
         to_send = [identity, header.value.to_bytes()]
         if data is not None:
             to_send.append(msgpack.packb(data, use_bin_type=True))

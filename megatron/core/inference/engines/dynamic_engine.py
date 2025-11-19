@@ -416,8 +416,8 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
             self.socket_for_receiving_requests.connect(dp_addr[0])
 
-            # send empty string. this is used to register with the coordinator.
-            self._isend(self.socket_for_receiving_requests, Headers.CONNECT, b"")
+            # Register with the coordinator.
+            self._isend(self.socket_for_receiving_requests, Headers.ENGINE_CONNECT)
 
             # 2. Create a publisher socket. This is used to publish or broadcast
             #    requests within the model parallel group

@@ -8,11 +8,12 @@ class Headers(Enum):
     Enum representing headers used for communication with the inference-coordinator.
     """
 
-    CONNECT = 0
-    ACK = 1
-    MICROBATCH_SYNC = 2
-    SUBMIT_REQUEST = 3
-    ENGINE_REPLY = 4
-    PAUSE = 5
-    UNPAUSE = 6
-    STOP = 7
+    ENGINE_CONNECT = 0
+    CLIENT_CONNECT = 1
+    ACK = 2
+    MICROBATCH_SYNC = 3
+    SUBMIT_REQUEST = 4
+    ENGINE_REPLY = 5
+    PAUSE = 6
+    UNPAUSE = 7
+    STOP = 8

@@ -121,7 +121,7 @@ class InferenceClient:
             try:
                 _, header, data = await self._irecv()
 
-                assert header == Headers.ACK or self.initial_reply
+                assert header == Headers.ACK or self.is_running.is_set()
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data
                     reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
@@ -130,7 +130,7 @@ class InferenceClient:
                     completion_future = self.completion_futures.pop(request_id)
                     completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
                 elif header == Headers.ACK:
-                    self.initial_reply = True
+                    self.is_running.set()
             except asyncio.CancelledError:
                 break
 
@@ -149,9 +149,12 @@ class InferenceClient:
         self.next_request_id = 0
         self._send_awaitables = asyncio.Queue()
 
-        self.initial_reply = False
-        self._isend(Headers.CONNECT)
+        # Attempt to connect, and do not allow any sends until we are connected.
+        self.is_running = asyncio.Event()
+        self._startup_sends = []
+        self._isend(Headers.CLIENT_CONNECT)
 
+        self.startup_sends_task = loop.create_task(self._startup_sends_task())
         self.send_task = loop.create_task(self._send_task())
         self.recv_task = loop.create_task(self._recv_task())
 
@@ -166,6 +169,13 @@ class InferenceClient:
             await (await self._send_awaitables.get())
             self._send_awaitables.task_done()
 
+    @trace_async_exceptions
+    async def _startup_sends_task(self):
+        """Before a connection is established, we queue up sends for later."""
+        await self.is_running.wait()
+        for (header, data) in self._startup_sends:
+            self._isend(header, data)
+
     def _isend(self, header: Headers, data: Optional[List] = None) -> asyncio.Future:
         """
         Asynchronously send a signal to the inference coordinator.
@@ -174,6 +184,13 @@ class InferenceClient:
             header (Headers): The signal header to send.
             data (Optional[List]): The data payload to send.
         """
+        # If we have not connected yet, wait on sends.
+        if not self.is_running.is_set():
+            if header not in [Headers.ENGINE_CONNECT, Headers.CLIENT_CONNECT]:
+                self._startup_sends.append((header, data))
+                return
+
+        # Once we are connected, we do an atomic send and await its completion later.
         to_send = [header.value.to_bytes()]
         if data is not None:
             to_send.append(msgpack.packb(data, use_bin_type=True))
