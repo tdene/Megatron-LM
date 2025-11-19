@@ -67,7 +67,8 @@ async def main(
                 # These add-request calls will queue up the request on a zmq socket and return
                 # instantaneously. They will return an asyncio future which can be awaited for
                 # request completion.
-                futures.append(client.add_request(request.prompt_text, request.sampling_params))
+                request_id = client.add_request(request.prompt_text, request.sampling_params)
+                futures.append(client.get_response(request_id))
                 num_requests_added += 1
                 #tbar.update(1)
             if num_requests_added == num_requests_total:

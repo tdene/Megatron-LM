@@ -196,8 +196,8 @@ class TestCoordinator:
                     for request in tqdm(env.requests, "add_requests"):
                         prompt, sampling_params, arrival_delta = request
                         await asyncio.sleep(arrival_delta)
-                        fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
-                        futures.append(fut)
+                        req_id = client.add_request(prompt=prompt, sampling_params=sampling_params)
+                        futures.append(client.get_response(req_id))
                     results: List[DynamicInferenceRequestRecord] = await asyncio.gather(*futures)
                     all_results.append(results)
                 env.timing_data["done_time"] = time.time()

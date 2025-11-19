@@ -4,11 +4,11 @@ import asyncio
 import logging
 import os
 import time
-from typing import List, Union
+from typing import Dict, List, Union
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
+from megatron.core.utils import trace_async_exceptions
 
 from .headers import Headers
 
@@ -74,13 +74,14 @@ class InferenceClient:
         socket.connect(f"tcp://{inference_coordinator_address}:{inference_coordinator_port}")
 
         self.socket = socket
-        self.completion_futures = {}
+        self.completed_request_events: Dict[int, asyncio.Event] = {}
+        self.completed_request_pool: Dict[int, DynamicInferenceRequest] = {}
         self.request_submission_times = {}
         self.next_request_id = 0
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
-    ) -> asyncio.Future:
+    ) -> int:
         """
         Submits a new inference request to the coordinator.
 
@@ -95,18 +96,35 @@ class InferenceClient:
                 `serializable()` method.
 
         Returns:
-            asyncio.Future: A future that will be resolved with a
-            `DynamicInferenceRequest` object containing the completed result.
+            request_id (int): The request id of the scheduled request
         """
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serializable()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
         self.socket.send(payload_serialized)
-        assert request_id not in self.completion_futures
-        self.completion_futures[request_id] = get_asyncio_loop().create_future()
+        assert request_id not in self.completed_request_pool
+        self.completed_request_events[request_id] = asyncio.Event()
         self.request_submission_times[request_id] = time.perf_counter()
-        return self.completion_futures[request_id]
+        return request_id
+
+    @trace_async_exceptions
+    async def get_response(self, request_id: int) -> DynamicInferenceRequest:
+        """Returns the response to a request.
+
+        The scheduler could `set_result` to a raw Future, or set an Event to trigger this.
+        Consider, however, the case where multiple consumers await a response for the same request.
+        If the scheduler tracks completion through a raw Future, it can only be awaited once.
+        Hence, the choice is made to await Events.
+
+        Args:
+            request_id (int): The request id of the request
+
+        Returns:
+            response (DynamicInferenceRequest): The completed request
+        """
+        await self.completed_request_events[request_id].wait()
+        return self.completed_request_pool[request_id]
 
     @trace_async_exceptions
     async def _listen_for_completed_requests(self):
@@ -125,8 +143,8 @@ class InferenceClient:
                 reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
                     request_id
                 )
-                completion_future = self.completion_futures.pop(request_id)
-                completion_future.set_result(DynamicInferenceRequest.deserialize(reply))
+                self.completed_request_pool[request_id] = DynamicInferenceRequest.deserialize(reply)
+                self.completed_request_events[request_id].set()
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
