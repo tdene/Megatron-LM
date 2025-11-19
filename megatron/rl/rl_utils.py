@@ -2303,8 +2303,9 @@ def megatron_rl_inference_mode(
             with nvtx_range("build-cuda-graphs"):
                 inference_interface._inference_engine.create_cuda_graphs(reset_context=False)
 
-        inference_interface.resume()
+        #loop.run_until_complete(inference_interface.resume())
 
+        print(f"[{dist.get_rank()}:DP] Entered inference mode")
         yield inference_interface
 
         with nvtx_range("suspend-engine"):

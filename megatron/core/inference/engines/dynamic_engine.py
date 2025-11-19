@@ -294,6 +294,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.capture_stats = capture_stats
 
+    @trace_async_exceptions
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int,
@@ -443,6 +444,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop
         loop = get_asyncio_loop(loop)
+        logging.info(f"Creating engine loop task on loop {id(loop)} on rank {torch.distributed.get_rank()}")
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
     @trace_async_exceptions
@@ -1045,6 +1047,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 self.add_request(request_id, prompt, sampling_params)
+                logging.info(f"Added request {request_id} on rank {torch.distributed.get_rank()}")
             elif header == Headers.PAUSE:
                 # Pause thyself.
                 self.microbatch_suspend = True
@@ -1072,9 +1075,6 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.UNPAUSE:
                 self.paused.clear()
                 self.running.set()
-
-        if cnt > 0:
-            logging.info(f"Drained {cnt} messages from coordinator on rank {torch.distributed.get_rank()}")
 
         return cnt
 
@@ -1137,6 +1137,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
                 if self.microbatch_suspend or self.microbatch_shutdown:
+                    logging.info(f"Suspending engine on rank {torch.distributed.get_rank()}")
                     await asyncio.sleep(0.02)
                     continue
 
@@ -1144,10 +1145,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.get_active_request_count() == 0
                     and len(self.waiting_request_ids) == 0
                 ):
+                    logging.info(f"No requests to process on rank {torch.distributed.get_rank()}")
                     await asyncio.sleep(0.02)
                     continue
 
-                engine_output = await self.async_step(verbose=verbose)
+                logging.info(f"Processing requests on rank {torch.distributed.get_rank()}")
+                logging.info(f"Active requests: {self.context.get_active_request_count()}")
+                logging.info(f"Waiting requests: {len(self.waiting_request_ids)}")
+                engine_output = await self.async_step(verbose=True)
 
                 if (
                     self.is_mp_coordinator
