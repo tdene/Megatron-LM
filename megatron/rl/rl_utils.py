@@ -2294,7 +2294,7 @@ def megatron_rl_inference_mode(
                 if inference_interface._inference_engine.context.memory_buffer is None:
                     inference_interface._inference_engine.context.build_memory_buffer()
 
-        if enable_cuda_graph and len(_CudagraphGlobalRecord.cudagraph_inference_record):
+        if enable_cuda_graph and len(_CudagraphGlobalRecord.cudagraph_inference_record) == 0:
             with nvtx_range("wait-for-decode-only"):
                 while not inference_interface._inference_engine.context.is_decode_only():
                     active_requests, finished_requests, step_time = loop.run_until_complete(
