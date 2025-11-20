@@ -5,6 +5,7 @@ import concurrent
 import copy
 import functools
 import inspect
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -35,7 +36,12 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
-from megatron.core.utils import get_asyncio_loop, get_model_config, unwrap_model
+from megatron.core.utils import (
+    get_asyncio_loop,
+    get_model_config,
+    trace_async_exceptions,
+    unwrap_model
+)
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -767,6 +773,7 @@ class TextGenerationController:
         }
 
     @torch.inference_mode()
+    @trace_async_exceptions(verbose=True)
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
@@ -784,6 +791,7 @@ class TextGenerationController:
                 log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
                 cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
         """
+        start_time = time.time()
         context = self.inference_wrapped_model.inference_context
         materialize_only_last_token_logits = context.materialize_only_last_token_logits
 
@@ -794,12 +802,16 @@ class TextGenerationController:
             return None
 
         input_ids, position_ids = self._dynamic_step_context_init()
+        post_init_time = time.time()
+        print(f"Context init took {post_init_time - start_time:.6f} seconds")
 
         cuda_graph_request_count = (
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        post_forward_time = time.time()
+        print(f"Forward pass took {post_forward_time - post_init_time:.6f} seconds")
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -809,20 +821,32 @@ class TextGenerationController:
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
+        sleep_time = time.time()
+        print(f"Async sleep took {sleep_time - post_forward_time:.6f} seconds")
 
         self._dynamic_step_sample_bookkeeping()
+        sample_bookkeeping_time = time.time()
+        print(f"Sample bookkeeping took {sample_bookkeeping_time - sleep_time:.6f} seconds")
         new_sample = self._dynamic_step_sample_logits(logits)
+        post_sampling_time = time.time()
+        print(f"Sampling took {post_sampling_time - sample_bookkeeping_time:.6f} seconds")
 
         return_log_probs = self._dynamic_step_log_probs_bookkeeping()
+        post_logprob_bookkeeping_time = time.time()
+        print(f"Logprob bookkeeping took {post_logprob_bookkeeping_time - post_sampling_time:.6f} seconds")
         if return_log_probs:
             log_probs = self._dynamic_step_calculate_log_probs(logits)
         else:
             log_probs = None
+        post_logprob_time = time.time()
+        print(f"Logprob calculation took {post_logprob_time - post_logprob_bookkeeping_time:.6f} seconds")
 
         if skip_bookkeeping:
             request_bookkeeping = {}
         else:
             request_bookkeeping = self._dynamic_step_context_bookkeeping(new_sample)
+        post_bookkeeping_time = time.time()
+        print(f"Context bookkeeping took {post_bookkeeping_time - post_logprob_time:.6f} seconds")
 
         ret = {
             "sample": new_sample,
