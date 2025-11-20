@@ -144,8 +144,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.running = asyncio.Event()
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.microbatch_suspend: bool = False
-        self.microbatch_shutdown: bool = False
+        self.received_pause: bool = False
+        self.received_stop: bool = False
         self.enable_chunked_prefill = enable_chunked_prefill
         self.rank = torch.distributed.get_rank()
 
@@ -1034,19 +1034,10 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
 
-            if self.microbatch_suspend:
-                assert (
-                    header == Headers.PAUSE_ACK
-                ), f"Engine is waiting for PAUSE_ACK. No other messages allowed. (Rx'd {header})"
-            if self.microbatch_shutdown:
+            if self.received_stop:
                 assert (
                     header == Headers.STOP_ACK
                 ), f"Engine is shutting down. No other messages allowed except STOP_ACK. (Rx'd {header})"
-            if self.paused.is_set():
-                assert (
-                    header == Headers.UNPAUSE
-                ), f"Engine is paused. No other messages allowed except UNPAUSE. (Rx'd {header})"
-
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
@@ -1054,25 +1045,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 logging.info(f"Added request {request_id} on rank {torch.distributed.get_rank()}")
             elif header == Headers.PAUSE:
                 # Pause thyself.
-                self.microbatch_suspend = True
+                self.received_pause = True
                 self.running.clear()
                 # Send PAUSE_ACK back to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
-                break
             elif header == Headers.STOP:
                 # Stop thyself.
-                self.microbatch_shutdown = True
+                self.received_stop = True
                 self.running.clear()
                 # Send STOP_ACK back to coordinator.
                 if self.is_mp_coordinator:
                     payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
                     self.socket_for_receiving_requests.send(payload)
-                break
             elif header == Headers.PAUSE_ACK:
                 self.paused.set()
-                self.microbatch_suspend = False
+                self.received_pause = False
             elif header == Headers.STOP_ACK:
                 self.stopped.set()
                 self.stop()
@@ -1140,7 +1129,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # todo [Siddharth]: Can this hardcoded sleep be avoided
                 # with asyncio zmq sockets?
-                if self.microbatch_suspend or self.microbatch_shutdown:
+                if self.paused.is_set() or self.received_pause or self.received_stop:
                     logging.info(f"Suspending engine on rank {torch.distributed.get_rank()}")
                     await asyncio.sleep(0.02)
                     continue
