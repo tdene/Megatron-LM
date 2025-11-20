@@ -32,7 +32,7 @@ try:
 except Exception:
     HAVE_ZMQ = False
 
-IS_ZMQ_FLAKY = True
+IS_ZMQ_FLAKY = False
 
 
 class DummyContext:
@@ -60,8 +60,8 @@ class DummyEngine(DynamicInferenceEngine):
         self.paused = asyncio.Event()
         self.stopped = asyncio.Event()
         self.pending_microbatch = deque()
-        self.microbatch_suspend: bool = False
-        self.microbatch_shutdown: bool = False
+        self.microbatch_pause: bool = False
+        self.microbatch_stop: bool = False
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
