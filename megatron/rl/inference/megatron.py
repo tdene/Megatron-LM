@@ -236,7 +236,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
             client = InferenceClient(inference_coordinator_port=41521)
-            client.start()
+            await client.start()
         else:
             client = None
         launched_server = cls(**kwargs)
