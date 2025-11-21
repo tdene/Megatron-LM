@@ -189,10 +189,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             skip_prompt_log_probs=True,
             add_BOS=tokenizer.bos is not None,
         )
-        requests = [
+        records = [
             self._client.add_request(prompt=prompt, sampling_params=sampling_params)
             for prompt in request.prompt
         ]
+        requests = [record[-1] for record in records]
         responses = await asyncio.gather(
             *requests
         )
