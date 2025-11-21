@@ -236,7 +236,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             # TODO: We have to do this only on the rank 0 process, should be fixed in the future when we have support for multiple inference clients. !2278
             client = InferenceClient(inference_coordinator_port=41521)
-            await client.start()
+            client.start()
         else:
             client = None
         launched_server = cls(**kwargs)
@@ -252,12 +252,12 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def suspend(self):
         if dist.get_rank() == 0:
-            self._client.pause_engines()
-        #await self._inference_engine.paused.wait()
+            await self._client.pause_engines()
+        await self._inference_engine.paused.wait()
 
     async def resume(self):
         if dist.get_rank() == 0:
             self._client.unpause_engines()
-        #await self._inference_engine.running.wait()
+        await self._inference_engine.running.wait()
 
 class MegatronChatLocal(ChatInferenceInterface, MegatronLocal): ...
