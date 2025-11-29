@@ -313,7 +313,11 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        extras = {"core_hash": hash((sp.temperature, sp.top_k, sp.top_p))}
+        extras = {
+            "core_hash": hash((sp.temperature, sp.top_k, sp.top_p)),
+            "uses_top_k": sp.top_k > 0,
+            "uses_top_p": sp.top_k > 0.0,
+        }
         return [getattr(sp, field, extras.get(field)) for field, _, _ in self.get_metadata_types()]
 
     @staticmethod
@@ -336,6 +340,27 @@ class DynamicInferenceRequest(InferenceRequest):
             ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
             ("top_n_logprobs", torch.int32, False), # CPU for torch sampling
         ]
+
+    @staticmethod
+    def get_flashsampling_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
+        """Keeps track of all request metadata names, dtypes, and target device.
+
+        Returns:
+            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
+                name (str) - The name of the metadata field.
+                dtype (torch.dtype) - The datatype of the metadata.
+                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
+        """
+        ret = self.get_metadata_types()
+        ret[1] = ("temperature", torch.float32, True)
+        ret[2] = ("top_k", torch.int32, True)
+        ret[3] = ("top_p", torch.float32, True)
+        ret[7] = ("top_n_logprobs", torch.int32, True)
+        ret += ("uses_top_k", torch.bool, True)
+        ret += ("uses_top_p", torch.bool, True)
+        return ret
+
+    @staticmethod
 
     def add_event(self, type: DynamicInferenceEventType, payload: Optional[Any] = None) -> None:
         """Add event."""

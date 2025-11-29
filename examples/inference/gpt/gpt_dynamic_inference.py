@@ -35,6 +35,7 @@ from megatron.core.inference.contexts.attention_context.mamba_metadata import (
     MambaInferenceStateConfig,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
+from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -158,6 +159,11 @@ def get_inference_context(
     if args.inference_wandb_logging_step_interval > 0:
         metrics_writer = get_wandb_writer()
 
+    if args.sampling_backend == "torch":
+        request_metadata_types=DynamicInferenceRequest.get_metadata_types(),
+    elif args.sampling_backend == "flashinfer":
+        request_metadata_types=DynamicInferenceRequest.get_flashsampling_metadata_types(),
+
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -187,6 +193,7 @@ def get_inference_context(
         cuda_graph_max_tokens=args.inference_dynamic_batching_cuda_graph_max_tokens,
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,
         metrics_writer=metrics_writer,
+        request_metadata_types=DynamicInferenceRequest.get_flashsampling_metadata_types(),
     )
 
     return context
