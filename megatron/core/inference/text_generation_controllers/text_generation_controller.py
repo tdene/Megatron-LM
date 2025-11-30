@@ -635,13 +635,7 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        # Last token logits.
-        if self._materialize_only_last:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            last_token_logits = logits.squeeze(0)
-        else:
-            last_token_logits = context.last_token_logits(logits)
+        last_token_logits = context.last_token_logits(logits)
         # Copy last_token_logits to contiguous buffer.
         self._sampling_logits_cuda[:self._active_request_count].copy_(last_token_logits, non_blocking=True)
 
