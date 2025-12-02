@@ -1391,16 +1391,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Last token logits.
         """
-
-        # todo: @lmcafee, remove these asserts?
-        assert logits.size(0) == 1, f"logits.size(0) ({tuple(logits.shape)}) != 1"
-        assert logits.size(1) == self.padded_active_token_count, (
-            f"logits.size(1) ({tuple(logits.shape)}) != "
-            f"padded_active_token_count ({self.padded_active_token_count})."
-        )
-
-        # Last token logits.
         logits = logits.squeeze(0)
+        if self.materialize_only_last_token_logits or self.is_decode_only():
+            return logits
+
         last_token_idxs = (
             torch.cumsum(
                 self.request_query_lengths[self.paused_request_count : self.total_request_count],
@@ -1925,34 +1919,37 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return newly_paused_request_ids
 
-    def calculate_log_probs(
-        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
-    ) -> Tuple[List[List[float]], Tensor]:
-        """Calculate log probs for all active requests and return them.
+    def select_log_prob_indices(self, request_indices: Tensor = None) -> List[List[float]]:
+        """Helper method for the log_prob calculation.
 
-        TODO: @wdykas support top-n log probs.
+        This method selects the logits that are relevant for the log_prob calculation,
+        and returns all indices necessary for the tensorized log_prob calculation.
 
         Args:
-            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
-            new_tokens (Tensor): The newly sampled tokens.
-            only_last_token_logits (bool): If set, the logits are from only the last token in each request
+            request_indices (Tensor): A boolean map indicating which requests to include.
 
         Returns:
-            List of lists where each inner list contains log probs for a request in the
-            same order as the active requests (from paused_request_count to total_request_count).
-            log_probs (Tensor): Used to compute top n logprobs later if required.
+            logit_indices (Tensor): Indices of logits corresponding to active requests,
+                masked by request_indices if provided.
+            active_lengths (Tensor): Number of active tokens per request,
+                masked by request_indices if provided.
+            active_ends (Tensor): End indices of active tokens per request,
+                masked by request_indices if provided.
+            active_tokens (Tensor): Sampled token ID for all active tokens,
+                masked by request_indices if provided.
+                Note that this only provides real data for prefill requests. That is because
+                the final index of each request in this Tensor is dummy data: since sampling
+                has not yet taken place, there is no way to get the real token ID.
+                This is a 1D flattened tensor in the same manner as logit_indices.
         """
 
-        # Calculate log_probs (sequence_length x vocab_size)
-        logits_squeezed = logits.squeeze(0).float()
-
-        if only_last_token_logits or self.is_decode_only():
-            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
-            log_probs = F.log_softmax(logits_squeezed[seq_idx], dim=-1)
-            selected_log_probs = log_probs[seq_idx, new_tokens]
-            return [[lp] for lp in selected_log_probs.tolist()], log_probs
-
-        log_probs = F.log_softmax(logits_squeezed, dim=-1)
+        if self.materialize_only_last_token_logits or self.is_decode_only():
+            return (
+                request_indices,
+                torch.ones_like(request_indices),
+                torch.arange(request_indices.size(0)),
+                torch.empty_like(request_indices),
+            )
         # Get the selected token ids for all tokens.
         # We shift the active token window left by one to remove the first prompt token for
         # prefill requests and then set the token ids explicitly for the newly generated tokens.
@@ -1964,7 +1961,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         #   new_tokens          : [ 52 | 12 | 3 | 86 ]
         #
-        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
+        #   request_indices     : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
         #
         #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
         #
@@ -1981,14 +1978,74 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count : self.total_request_count
         ]
         new_token_idx = active_query_lengths.cumsum(0) - 1
-        active_token_ids[new_token_idx] = new_tokens
 
-        # Extract the log probs for only the selected tokens.
-        # (sequence_length x vocab_size) -> (sequence_length)
-        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        masked_lengths = active_query_lengths[request_indices]
+        masked_ends = new_token_idx[request_indices]
+        masked_starts = masked_ends - (masked_lengths - 1)
+
+        batch_size = request_indices.size(0)
+        offsets = torch.cumsum(F.pad(masked_lengths, (1, 0)), dim=0)[:-1]
+        logit_segment_ids = torch.arange(batch_size, dtype=torch.long)
+        logit_segments = torch.repeat_interleave(logit_segment_ids, masked_lengths)
+
+        logit_indices_range = torch.cumsum(torch.ones_like(logit_segments), dim=0) - 1
+        logit_indices_relative = logit_indices_relative - torch.repeat_interleave(
+            offsets, masked_lengths
+        )
+        logit_indices_absolute = masked_starts[logit_segments] + logit_indices_relative
+
+        return (
+            logit_indices_absolute,
+            masked_lengths,
+            masked_ends,
+            active_token_ids[logit_indices_absolute],
+        )
+
+    def calculate_log_probs(
+        self,
+        logits: Tensor,
+        new_tokens: Tensor,
+        request_indices: Optional[Tensor],
+        log_probs: Optional[Tensor],
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs for all active requests and return them.
+
+        Args:
+            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
+            new_tokens (Tensor): The newly sampled tokens.
+            request_indices (Optional[Tensor]): A boolean map indicating which requests to include.
+            log_probs (Optional[Tensor]): A tensor in which to store the result.
+
+        Returns:
+            List of lists where each inner list contains log probs for a request in the
+            same order as the active requests (from paused_request_count to total_request_count).
+            log_probs (Tensor): Used to compute top n logprobs later if required.
+        """
+        if request_indices is None:
+            request_indices = torch.ones(
+                self.total_request_count - self.paused_request_count,
+                dtype=torch.bool,
+            )
+        if log_probs is None:
+            log_probs = torch.empty(
+                (logits.size(1), logits.size(2)),
+                device=logits.device,
+                dtype=torch.float32,
+            )
+
+        (
+            logit_indices,
+            active_lengths,
+            active_ends,
+            active_tokens,
+        ) = self.select_log_prob_indices(logits, request_indices)
+
+        active_tokens[active_ends] = new_tokens
+        selected_logits_squeezed = logits.squeeze(0)[logit_indices, :].float()
+        log_probs[:, active_tokens] = F.log_softmax(selected_logits_squeezed, dim=-1)
 
         # Split the log probs across request boundaries
+        selected_log_probs = log_probs[request_indices, active_tokens]
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )

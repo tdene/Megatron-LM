@@ -97,6 +97,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         self._materialize_only_last = context.materialize_only_last_token_logits
         max_requests = context.max_total_requests
+        if self._materialize_only_last:
+            max_logits = max_requests
+        else:
+            max_logits = context.max_tokens
 
         model_config = get_model_config(self.inference_wrapped_model.model)
         self._sampling_backend = model_config.sampling_backend
@@ -111,10 +115,15 @@ class TextGenerationController:
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Keep track of request metadata.
-        self._active_request_count = None
+        self._active_request_count: int = None
+        self._active_token_count: int = None
+        self._logits_seq_length: int = None
         self._request_metadata: Dict[str, Tensor] = {}
 
         # Initialize bookkeeping tensors.
+        self._all_logits_cuda = torch.empty(
+            max_logits, vocab_size, dtype=logits_dtype, device=device
+        )
         self._sampling_logits_cuda = torch.empty(
             max_requests, vocab_size, dtype=logits_dtype, device=device
         )
@@ -593,12 +602,19 @@ class TextGenerationController:
         # Get flat tokens, position ids.
         if construct_graph_dimensions is not None:
             self._recording_graph = True
-            return context.current_input_and_position_ids(
+            self._active_token_count = construct_graph_dimensions.token_count
+            ret = context.current_input_and_position_ids(
                 num_warmup_tokens=construct_graph_dimensions.token_count
             )
         else:
             self._recording_graph = False
-            return context.current_input_and_position_ids()
+            self._active_token_count = context.padded_active_token_count
+            ret = context.current_input_and_position_ids()
+
+        self._logits_seq_len = (
+            self._active_request_count if self._materialize_only_last else self._active_token_count
+        )
+        return ret
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
         """Forward step the model to get logits for dynamic batching.
@@ -610,6 +626,7 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         inference_wrapper_config = self.inference_wrapped_model.inference_wrapper_config
+        vocab_size = inference_wrapper_config.padded_vocab_size
 
         context = self.inference_wrapped_model.inference_context
 
@@ -619,11 +636,7 @@ class TextGenerationController:
             )
 
         if self.model_is_pipeline_parallel:
-            logits_seq_len = (
-                self._active_request_count if self._materialize_only_last else input_ids.shape[1]
-            )
-            vocab_size = inference_wrapper_config.padded_vocab_size
-            logits_shape = [1, logits_seq_len, vocab_size]
+            logits_shape = [1, self._logits_seq_len, vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
@@ -635,15 +648,10 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        # Last token logits.
-        if self._materialize_only_last:
-            # When materialize_only_last_token_logits is true, last_token_logits is
-            # already called in the forward pass of GPT.
-            last_token_logits = logits.squeeze(0)
-        else:
-            last_token_logits = context.last_token_logits(logits)
-        # Copy last_token_logits to contiguous buffer.
-        self._sampling_logits_cuda[:self._active_request_count].copy_(last_token_logits, non_blocking=True)
+        last_token_logits = context.last_token_logits(logits)
+        # Copy logits to contiguous buffer.
+        self._all_logits_cuda[:self._logits_seq_len, :].copy_(logits, non_blocking=True)
+        self._sampling_logits_cuda[:self._active_request_count, :].copy_(last_token_logits, non_blocking=True)
 
         return logits
 
@@ -739,23 +747,22 @@ class TextGenerationController:
 
         return return_log_probs.any(), top_n_log_probs.any()
 
-    def _dynamic_step_calculate_log_probs(self, logits: Tensor) -> Optional[Tensor]:
+    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
         """Calculate log probs from logits."""
         context = self.inference_wrapped_model.inference_context
 
         return context.calculate_log_probs(
-            logits,
+            self._all_logits_cuda[: self._logits_seq_len, :],
             self._sampled_tokens_cuda[:self._active_request_count],
             only_last_token_logits=self._materialize_only_last,
         )
 
     def _dynamic_step_calculate_top_n_logprobs(
-        self, logits: Tensor, log_probs_tensor: Optional[Tensor] = None
+        self, log_probs_tensor: Optional[Tensor] = None
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """Calculate top-n log probs from logits for dynamic batching.
 
         Args:
-            logits (Tensor): The logits to compute top-n log probs from.
             log_probs_tensor (Optional[Tensor]): Pre-computed log probabilities tensor.
                 If provided, avoids recomputing log_softmax. Should be the tensor
                 returned by calculate_log_probs.
@@ -898,7 +905,7 @@ class TextGenerationController:
             context.padded_active_request_count if context.is_decode_only() else None
         )
 
-        logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+        self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -917,11 +924,9 @@ class TextGenerationController:
         log_probs = None
         top_n_logprobs = None
         if return_log_probs or return_top_n_logprobs:
-            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(logits)
+            log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
             if return_top_n_logprobs:
-                top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
-                    logits, log_probs_tensor
-                )
+                top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
 
         if skip_bookkeeping:
             request_bookkeeping = {}
