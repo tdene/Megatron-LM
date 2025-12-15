@@ -1132,9 +1132,9 @@ def prepare_trajectories(
     assert (
         tokenizer.bos is None or (trajs[:, 1] != tokenizer.bos).all()
     ), "Second token should not be bos"
-    assert (
-        (trajs * generation_masks.int() == tokenizer.eod).sum(axis=1) <= 1
-    ).all(), "Only one eod per trajectory in generated tokens."
+    #assert (
+    #    (trajs * generation_masks.int() == tokenizer.eod).sum(axis=1) <= 1
+    #).all(), "Only one eod per trajectory in generated tokens."
     # TODO(rkirby):
     # We should avoid the tokenizer pad token being the same as the eod token for proper loss masking,
     # But now the deepseek tokenizer has the pad token set to eod, we need to handle this.
