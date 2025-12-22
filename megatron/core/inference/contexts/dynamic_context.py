@@ -1288,15 +1288,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         return self.total_request_count - self.paused_request_count - self.num_prefill_requests
 
-    def initialize_attention_state(
+    def initialize_cuda_graph_state(
         self, *, construct_graph_dimensions: Optional[InferenceBatchDimensions] = None
-    ) -> None:
-        """Initialize attention state so that every layer can use it.
+    ):
+        """Initialize cuda graph state for this inference step.
 
         Args:
-            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config to use for constructing the cuda graphs.
-        Return:
-            None.
+            construct_graph_dimensions (Optional[InferenceBatchDimensions]): The graph config
+                to use for constructing the cuda graphs.
         """
         # if in recording mode, add dummy requests for cuda graph capture
         if construct_graph_dimensions is not None:
@@ -1350,7 +1349,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prefill_req_count=adjusted_prefill_req_count,
                     decode_req_count=adjusted_decode_req_count,
                 )
+        return batch_dimensions, attn_dimensions, padded_batch_dimensions, best_graph
 
+    def initialize_attention_state_cpu(
+        self,
+        batch_dimensions: InferenceBatchDimensions,
+        attn_dimensions: InferenceBatchDimensions,
+        padded_batch_dimensions: InferenceBatchDimensions,
+        best_graph: Optional[InferenceBatchDimensions],
+    ) -> None:
+        """Initialize attention state so that every layer can use it."""
         # The CPU has finished computing batch metadata and is ready to write it into state.
         # We may need to await GPU stream completion here in the future.
         self._using_cuda_graph_this_step = best_graph is not None
@@ -1364,9 +1372,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             else self.non_graph_attn_metadata
         )
 
+    def initialize_attention_state_gpu(self, *, skip_graphables = False) -> None:
         # Once the request order changes to active -> paused -> finished,
         # this can be CG'd, allowing the CPU to enqueue the subsequent padding ops in parallel.
-        self.build_active_slices(self.padded_active_request_count)
+        if not skip_graphables:
+            self.build_active_slices(self.padded_active_request_count)
 
         # Correctly pad to padded active token count.
         padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
@@ -1439,23 +1449,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def current_input_and_position_ids(
-        self, *, num_warmup_tokens: Optional[int] = None
-    ) -> Tuple[Tensor, Tensor]:
+    def current_input_and_position_ids(self) -> Tuple[Tensor, Tensor]:
         """Flattened input and position IDs for forward pass.
-
-        Args:
-            num_warmup_tokens (Optional[int]): Number of tokens to return for
-                warming up cuda graphs. Must be less than or equal to
-                `max_tokens`.
 
         Return:
             (Tuple[Tensor, Tensor]) Flattened active input and position IDs.
         """
-        num_tokens = num_warmup_tokens or self.padded_active_token_count
         return (
-            self.token_to_input_ids[:num_tokens].unsqueeze(0),
-            self.token_to_pos_ids[:num_tokens].unsqueeze(0),
+            self.token_to_input_ids[:self.padded_active_token_count].unsqueeze(0),
+            self.token_to_pos_ids[:self.padded_active_token_count].unsqueeze(0),
         )
 
     def last_token_logits(self, logits: Tensor) -> Tensor:

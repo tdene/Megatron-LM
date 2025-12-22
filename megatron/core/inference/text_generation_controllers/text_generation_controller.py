@@ -496,8 +496,17 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Initialize attention state.
-        context.initialize_attention_state(construct_graph_dimensions=construct_graph_dimensions)
+        batch_dimension_data = context.initialize_cuda_graph_state(
+            construct_graph_dimensions=construct_graph_dimensions
+        )
+
+        context.initialize_attention_state_cpu(*batch_dimension_data)
+
+        batch_size = context.padded_active_request_count
+        input_ids, position_ids = context.current_input_and_position_ids()
+        context.build_active_slices(batch_size)
+
+        context.initialize_attention_state_gpu(skip_graphables=True)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -526,13 +535,7 @@ class TextGenerationController:
                 # Turn off symmetric all reduces for prefill
                 unwrapped_model.set_symmetric_ar(None)
 
-        # Get flat tokens, position ids.
-        if construct_graph_dimensions is not None:
-            return context.current_input_and_position_ids(
-                num_warmup_tokens=construct_graph_dimensions.token_count
-            )
-        else:
-            return context.current_input_and_position_ids()
+        return input_ids, position_ids
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor) -> Tensor:
         """Forward step the model to get logits for dynamic batching.
