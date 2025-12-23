@@ -3,8 +3,9 @@
 import asyncio
 import multiprocessing
 import sys
-
 import torch
+
+from contextlib import contextmanager
 
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
@@ -138,6 +139,46 @@ def tensor_swap(x, src_idxs, dst_idxs):
     """
     x[dst_idxs], x[src_idxs] = x[src_idxs], x[dst_idxs]
 
+
+@contextmanager
+def cuda_graph_wrapper(mode: str, graph_cache: dict, graph_key):
+    """Syntactic sugar to allow for easy recording and replaying of CUDA graphs.
+
+    Sample usage for capture:
+        with cuda_graph_record_or_replay("capture", graph_cache, key):
+            static_tensor.copy_(tensor) # record/replay happens after this code-block.
+            ... ops to capture ...
+
+    Replay (replay happens after the block so you can copy inputs inside it):
+        with cuda_graph_record_or_replay("replay", cache, key):
+            static_in.copy_(new_in)
+        # graph has replayed; read static outputs now
+    """
+    mode = mode.lower()
+    if mode in ("capture", "record"):
+        assert key not in cache, f"Refusing to overwrite existing graph for key={key!r}"
+        g = torch.cuda.CUDAGraph()
+
+        # Blunt but simple: make sure there's no outstanding GPU work before starting capture.
+        torch.cuda.synchronize()
+
+        with torch.cuda.graph(g):
+            yield
+
+        cache[key] = g
+        return
+
+    if mode == "replay":
+        g = cache[key]
+        yield
+        g.replay()
+        return
+
+    raise ValueError(f"mode must be 'capture'/'record' or 'replay', got {mode!r}")
+
+
+async def async_torch_wait():
+    pass
 
 async def await_process_event(
     event: multiprocessing.Event, process: multiprocessing.Process, timeout: float = 1.0

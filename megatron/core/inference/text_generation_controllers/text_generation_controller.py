@@ -802,6 +802,7 @@ class TextGenerationController:
 
         # Request finished if termination_id or length >= max_sequence_length.
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
+        ## Graphable by req_count
         active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
             != context.active_request_metadata["termination_id"][:active_request_count]
