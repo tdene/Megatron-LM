@@ -1723,25 +1723,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
         # finished_request_count are requests that have reached the termination criterion
+        active_request_count_old = self.total_request_count - self.paused_request_count
+        active_request_count = active_request_count.item()
 
-        self.num_prefill_requests = 0  # all turns to decode
-        if self.chunked_prefill_request_id != -1:
-            active_requests_mask[-1] = (
-                1  # must keep this, next iteration will add a new chunk to it
-            )
+        if context.chunked_prefill_request_id != -1:
+            # must keep this, next iteration will add a new chunk to it
+            active_requests_mask[active_request_count_old + self.paused_request_count - 1] = 1
+            active_request_count += 1
 
-        active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
-        assert (
-            active_request_count + finished_request_count + self.paused_request_count
-            == self.total_request_count
-        )
-
-        # Reset attention state.
-        self.reset_attention_state()
+        finished_request_count = active_request_count_old - active_request_count
 
         # Update total_request_count.
         self.total_request_count = active_request_count + self.paused_request_count
+
+        ### NOTE: Make this static
+        finished_idxs = torch.nonzero_static(active_request_mask == 0, size=finished_request_count)) + context.paused_request_count
+        finished_request_ids = context.request_ids[finished_idxs]
+
+        # Reset attention state.
+        self.reset_attention_state()
 
         # 2. If no paused requests are present and no active requests we release memory and reset.
         if active_request_count + self.paused_request_count == 0:
@@ -1765,7 +1765,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Reset Mamba state.
             self.reset_mamba_state()
 
-            return
+            return None, finished_request_ids
 
         # 3. Concatenate the paused tokens to the active tokens if present.
         if self.paused_request_count != 0:
@@ -1989,7 +1989,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_block_offset[self.paused_request_count : self.total_request_count]
         )
 
-        return newly_paused_request_ids
+        return newly_paused_request_ids, finished_request_ids
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
