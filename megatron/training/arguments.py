@@ -1399,6 +1399,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+
+    kw_args['enable_routing_replay'] = True
     # Return config.
     return config_class(**kw_args)
 
@@ -1617,6 +1619,19 @@ def _add_inference_args(parser):
     group.add_argument("--inference-fuse-tp-communication", action="store_true", default=False,
                        help="Use the fused communication kernel for tensor parallelism during inference. This "
                        "kernel fuses reduce-scatter + residual-add + rms-norm + all-gather into one operation.")
+
+    ## Temporary arguments for router mask recording and replay
+    group.add_argument('--router-mask-record', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Enable router mask recording.')
+    group.add_argument('--router-mask-replay', action=argparse.BooleanOptionalAction,
+                       required=False, default=False, help='Enable router mask replay.')
+    group.add_argument('--router-mask-hot-expert-count', type=int, default=1,
+                       help='Number of hot experts to use for router mask replay.')
+    group.add_argument('--router-mask-cold-expert-tokens', type=int, default=0,
+                       help='Number of cold expert tokens to use for router mask replay.')
+    group.add_argument('--router-mask-log-dir', type=str, default='router_mask_info_dataset',
+                       help='Directory to save router mask information to.')
+
     return parser
 
 

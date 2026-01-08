@@ -712,6 +712,7 @@ def topk_routing_with_score_function(
             top_indices = router_replay.target_topk_idx
             # Ensure indices are on the correct device
             top_indices = top_indices.to(scores.device)
+            router_replay.record_indices(top_indices)
             # Gather the scores for the replayed indices to get the probabilities
             probs = scores.gather(1, top_indices)
             return probs, top_indices

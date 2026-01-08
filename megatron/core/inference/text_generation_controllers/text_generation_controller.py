@@ -884,6 +884,52 @@ class TextGenerationController:
         if context.active_token_count == 0:
             return None
 
+        ##########################
+        # Temporary code for router mask replay
+        ##########################
+
+        from megatron.core.transformer.moe.moe_utils import RouterReplay, RouterReplayAction
+        from megatron.training.global_vars import get_args
+        args = get_args()
+        return_router_mask = args.router_mask_record
+        force_router_mask = args.router_mask_replay
+        if force_router_mask and context.is_decode_only() and context.active_token_count == active_request_count:
+            top_k = 6 # Model Specific
+            num_experts = 128 # Model Specific
+            cold_expert_tokens = args.router_mask_cold_expert_tokens # How many tokens are assigned to the any expert (cold or hot)
+            hot_expert_count = args.router_mask_hot_expert_count # How many sets of topk experts get the remainder of the tokens (hot)
+            hot_expert_index = 0 # Index to cycle through the hot experts
+            cold_expert_index = (top_k*hot_expert_count)-1 # Index to cycle through all experts (starting at the first cold expert)
+            def get_hot_expert():
+                nonlocal hot_expert_index, top_k
+                # Cycle from 0 through top_k*hot_expert_count-1
+                hot_indices = [((hot_expert_index:=(hot_expert_index+1)%(top_k*hot_expert_count))) for _ in range(top_k)]
+                return torch.tensor(hot_indices)
+            def get_cold_expert():
+                nonlocal cold_expert_index, top_k
+                # Cycle from 0 through num_experts-1
+                cold_indices = [((cold_expert_index:=cold_expert_index+1)%num_experts) for _ in range(top_k)]
+                return torch.tensor(cold_indices)
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            router_masks = []
+            while len(router_masks) < active_request_count:
+                if len(router_masks) < cold_expert_tokens:
+                    router_masks.append(get_cold_expert().to(torch.cuda.current_device()))
+                else:
+                    router_masks.append(get_hot_expert().to(torch.cuda.current_device()))
+            import random
+            random.shuffle(router_masks)
+            from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+            RouterReplay.set_replay_data([
+                scatter_to_sequence_parallel_region(torch.stack(router_masks, dim=0)) for _ in RouterReplay.router_instances
+            ])
+        elif return_router_mask:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+        ##########################
+        # End of temporary code for router mask replay
+        ##########################
+
         input_ids, position_ids = self._dynamic_step_context_init()
 
         cuda_graph_request_count = (
@@ -891,6 +937,32 @@ class TextGenerationController:
         )
 
         logits = self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        ##########################
+        # Temporary code for router mask recording
+        ##########################
+
+        from megatron.core.transformer.moe.moe_utils import RouterReplay
+        router_masks = None
+        if return_router_mask:
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+            router_masks = RouterReplay.get_recorded_data()
+            router_masks = [
+                gather_from_sequence_parallel_region(router_mask)[:context.active_token_count]
+                for router_mask in router_masks
+            ]
+            active_request_slice = slice(context.paused_request_count, context.total_request_count)
+            active_request_count = context.total_request_count - context.paused_request_count
+            active_query_lengths = context.request_query_lengths[active_request_slice]
+            def _split_router_mask_by_request(router_mask: torch.Tensor) -> List[torch.Tensor]:
+                return router_mask.split(active_query_lengths.tolist(), dim=0)
+            router_masks = [_split_router_mask_by_request(router_mask) for router_mask in router_masks]
+            router_masks = zip(*router_masks)
+            RouterReplay.clear_global_indices()
+
+        ##########################
+        # End of temporary code for router mask recording
+        ##########################
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -921,6 +993,7 @@ class TextGenerationController:
 
         ret = {
             "sample": self._sampled_tokens_cuda[:active_request_count],
+            "router_masks": router_masks, # Temporary code for router mask recording
             "log_probs": log_probs,
             "top_n_logprobs": top_n_logprobs,
             "cuda_graph_request_count": cuda_graph_request_count,

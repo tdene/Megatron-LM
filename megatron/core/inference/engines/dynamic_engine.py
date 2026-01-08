@@ -801,6 +801,7 @@ class DynamicInferenceEngine(AbstractEngine):
         sample: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        router_masks: Optional[List[List[torch.Tensor]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -823,9 +824,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.finished_request_count += len(finished_request_ids)
 
         log_probs_iter = log_probs if log_probs else repeat(None)
+        router_masks_iter = router_masks if router_masks else repeat(None)
 
-        for req_idx, (request_id, token, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), log_probs_iter)
+        for req_idx, (request_id, token, request_log_probs, request_router_masks) in enumerate(
+            zip(request_ids.tolist(), sample.tolist(), log_probs_iter, router_masks_iter)
         ):
             request: DynamicInferenceRequest = self.get_request(request_id)
             if request_id != self.context.chunked_prefill_request_id:
@@ -904,6 +906,25 @@ class DynamicInferenceEngine(AbstractEngine):
                         else:
                             # All log probs go to generated
                             request.generated_log_probs.extend(request_log_probs)
+
+
+            ##########################
+            # Temporary code for router mask recording
+            ##########################
+
+            # Process router masks if available
+            if request_router_masks is not None:
+                if not request.router_masks:
+                    request.router_masks = [[] for _ in request_router_masks]
+                for layer_idx, layer_router_masks in enumerate(request_router_masks):
+                    if not request.router_masks[layer_idx]:
+                        request.router_masks[layer_idx] = []
+                    for token in layer_router_masks:
+                        request.router_masks[layer_idx].append(token.tolist())
+
+            ##########################
+            # End of temporary code for router mask recording
+            ##########################
 
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             if top_n_logprobs is not None and req_idx in top_n_logprobs:
@@ -1178,6 +1199,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids = step_result["finished_request_ids"]
             sample = step_result["sample"]
             log_probs = step_result["log_probs"]
+            router_masks = step_result["router_masks"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
@@ -1196,6 +1218,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 sample,
                 log_probs,
                 top_n_logprobs,
+                router_masks,
             )
 
         else:
@@ -1223,6 +1246,48 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.generated_text = self.controller.tokenizer.detokenize(
                     request.generated_tokens
                 )
+
+        ##########################
+        # Temporary code for router mask recording to file
+        ##########################
+
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import os
+        from megatron.training.global_vars import get_args
+        args = get_args()
+        
+        rows = []
+        for record in finished_request_records:
+            for request in record.requests:
+                if request.router_masks is not None:
+                    for layer_idx, layer_masks in enumerate(request.router_masks):
+                        for token_idx, token_masks in enumerate(layer_masks):
+                            for top_n_idx, expert_index in enumerate(token_masks):
+                                rows.append({
+                                    "request_id": request.request_id,
+                                    "token_idx": token_idx,
+                                    "generated": token_idx >= len(request.prompt_tokens),
+                                    "layer": layer_idx,
+                                    "top_n": top_n_idx,
+                                    "expert_index": expert_index,
+                                })
+        if rows:
+            # Write to a parquet dataset (directory) - handles concurrent writes well
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            pid = os.getpid()
+            router_mask_log_dir = args.router_mask_log_dir
+            table = pa.Table.from_pylist(rows)
+            pq.write_to_dataset(
+                table,
+                root_path=router_mask_log_dir,
+                basename_template=f'part_{timestamp}_{pid}_{{i}}.parquet',
+                existing_data_behavior='overwrite_or_ignore'
+            )
+
+        ##########################
+        # End of temporary code for router mask recording to file
+        ##########################
 
         # Handle necessary ZMQ DP coordinator communication.
         if self.use_coordinator and self.is_mp_coordinator and finished_request_records:

@@ -81,6 +81,7 @@ class InferenceRequest:
     generated_log_probs: Optional[torch.Tensor] = None
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
+    router_masks: Optional[List[List[torch.Tensor]]] = None
     generated_length: Optional[int] = None
     tpot: Optional[List[int]] = None
 
