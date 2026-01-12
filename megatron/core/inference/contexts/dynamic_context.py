@@ -1565,7 +1565,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             assert (
                 self.request_ids[current_id] == req.request_id
-            ), "Continuation current_id mismatch"
+            ), f"Continuation current_id mismatch {self.request_ids[current_id]} != {req.request_id}"
         else:
             current_id = self.total_request_count
 
@@ -1889,6 +1889,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids[evict_slice] = -1
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
+
+        self.request_ids[self.total_request_count:self.total_request_count+len(evict_request_ids)] = -1
 
         return evict_request_ids
 

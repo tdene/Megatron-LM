@@ -885,8 +885,8 @@ class TextGenerationController:
             return None
 
         from megatron.core.transformer.moe.moe_utils import RouterReplay, RouterReplayAction
-        return_router_mask = True
-        force_router_mask = True
+        return_router_mask = False
+        force_router_mask = False
         if force_router_mask and context.is_decode_only() and context.active_token_count == active_request_count:
             top_k = 6 # Model Specific
             num_experts = 128 # Model Specific

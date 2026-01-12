@@ -223,7 +223,7 @@ def forward_step_calc_loss(
         # fallback to parallel state
         cp_group_size = parallel_state.get_context_parallel_world_size()
         is_last_stage = parallel_state.is_pipeline_last_stage(
-            ignore_virtual=False, vp_stage=vp_stage
+            ignore_virtual=False, vp_stage=vp_stage 
         )
     else:
         assert (

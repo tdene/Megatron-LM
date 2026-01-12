@@ -1044,6 +1044,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                print(f"Scheduling request {req.request_id} with requests length {len(self.requests[req.request_id].record.requests)}")
+                #if len(self.requests[req.request_id].record.requests) > 1:
+                    #import time;
+                    #time.sleep(12000)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
                     self._loop.create_task, self._notify_cond_for_new_request()
@@ -1337,6 +1341,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 "* rank %d | step %d | %s ... time: %.3f%s ... "
                 "reqs: a %d/%d, p %d, w %d, f %d, e %d ... "
                 "blocks: a %d/%d, p %d/%d ... "
+                "tokens: a %d ... "
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
@@ -1365,6 +1370,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     context_state["total_active_block_count"],
                     context_state["total_paused_used_blocks"],
                     context_state["total_paused_block_count"],
+                    sum([
+                        len(self.requests[request_id].record.requests[-1].generated_tokens) for request_id in active_request_ids if self.requests[request_id].record.requests[-1].generated_tokens
+                    ] + 
+                    [
+                        len(self.requests[request_id].record.requests[-1].prompt_tokens) for request_id in active_request_ids if self.requests[request_id].record.requests[-1].prompt_tokens is not None
+                    ]),
                     mem["allocation.all.current"],
                     mem["allocated_bytes.all.current"] / (1024**3),
                     mem["reserved_bytes.all.current"] / (1024**3),
