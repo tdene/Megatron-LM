@@ -21,15 +21,38 @@ assert (
     MATHVERIFY_AVAILABLE
 ), "math_verify is not installed but now required. Install it using `pip install math-verify` to continue."
 
-NEGATIVE_REWARD = 0.0
-PARTIAL_END_REWARD = 0.75
-
 class MathAgent(RewardOnlyAgent):
-    def __init__(self, format_reward: float = 0.0, answer_format: str = "tagged", **kwargs):
+    def __init__(self,
+        format_reward: float = 0.0,
+        answer_format: str = "tagged",
+        assistant_suffix: str = "Assistant: Let me solve this step by step.\n<think>",
+        chat_mode: bool = False,
+        negative_reward: float = 0.0,
+        partial_end_reward: float = 0.0,
+        **kwargs):
+        """
+        Args:
+            format_reward (float): Reward given when the answer is in the expected format,
+                even if the answer is incorrect or is missing the end-of-text token.
+            answer_format (str): Which answer format is expected: "tagged" for <answer> tags,
+                or "boxed" for \boxed{} LaTeX formatting.
+            assistant_suffix (str): The suffix string included in the assistant's response, typically to
+                guide the assistant's output format and "persona". For example, "Let me solve this step by step."
+            chat_mode (bool): If True, agent operates in a chat (conversational) context.
+            negative_reward (float): Reward assigned for a clearly incorrect or unparseable answer.
+            partial_end_reward (float): Reward when the answer is correct but an expected end token is not matched exactly.
+            **kwargs: Additional arguments for the base RewardOnlyAgent.
+        """
         super().__init__(**kwargs)
+
         assert answer_format in ["tagged", "boxed"], "Invalid answer format"
+
         self.format_reward = format_reward
         self.answer_format = answer_format
+        self.assistant_suffix = assistant_suffix
+        self.chat_mode = chat_mode
+        self.negative_reward = negative_reward
+        self.partial_end_reward = partial_end_reward
 
     def compute_score(self, response: str, golden: dict, golden_key: str = "answer") -> float:
         """Take a response and a golden answer and return a score. Supports tagged or boxed answers.
@@ -54,7 +77,7 @@ class MathAgent(RewardOnlyAgent):
             except ValueError as e:
                 print("Failed to parse the answer.")
                 traceback.print_stack()
-                return NEGATIVE_REWARD
+                return self.negative_reward
 
             correct_answer = verify(str(golden[golden_key]), parsed_answer)
             if correct_answer:
@@ -65,7 +88,7 @@ class MathAgent(RewardOnlyAgent):
                 # If the end token is present later (extra text before it), give partial credit.
                 for token in end_tokens:
                     if token in after:
-                        return PARTIAL_END_REWARD
+                        return self.partial_end_reward
                 # If a correct answer but missing immediate end, give format reward (not NEGATIVE_REWARD).
                 return self.format_reward
             else:
@@ -84,7 +107,7 @@ class MathAgent(RewardOnlyAgent):
                 except ValueError as e:
                     print("Failed to parse the answer.")
                     traceback.print_stack()
-                    return NEGATIVE_REWARD
+                    return self.negative_reward
 
                 correct_answer = verify(str(golden[golden_key]), parsed_answer)
                 if correct_answer:
@@ -93,14 +116,14 @@ class MathAgent(RewardOnlyAgent):
                             return 1.0
                     for token in end_tokens:
                         if token in after:
-                            return PARTIAL_END_REWARD
+                            return self.partial_end_reward
                     return self.format_reward
                 else:
                     # Formatting is correct but the answer is incorrect
                     return self.format_reward
             else:
                 # Did not format the answer correctly
-                return NEGATIVE_REWARD
+                return self.negative_reward
 
     def make_prefix(self, problem_key: str = "problem", **kwargs) -> str:
         """Take a string math problem and return the prompt. Supports requesting tagged or boxed answers. Supports chat mode prompts."""
@@ -118,7 +141,5 @@ class MathAgent(RewardOnlyAgent):
     The question will be a word math problem. Show your work in <think> </think> tags. 
     {answer_format}
     User: {kwargs[problem_key]}
-    Assistant: """
-    # Assistant: Let me solve this step by step.
-    # <think>"""
+    {self.assistant_suffix}"""
         return prefix
