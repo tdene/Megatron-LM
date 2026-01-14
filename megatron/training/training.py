@@ -1371,6 +1371,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
+        # SOL tracking: wrap forward_backward to capture ops
+        sol_context = None
+        if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+            try:
+                from megatron.rl.sol_integration import get_sol_tracker
+                tracker = get_sol_tracker()
+                if tracker and tracker.initialized:
+                    sol_context = tracker.phase("rl_timing/train-step/forward-backward")
+                    sol_context.__enter__()
+            except Exception:
+                pass
+        
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1382,6 +1394,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
+        
+        if sol_context is not None:
+            try:
+                sol_context.__exit__(None, None, None)
+            except Exception:
+                pass
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
@@ -1398,6 +1416,19 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    
+    # SOL tracking: wrap optimizer step  
+    opt_sol_context = None
+    if has_rl_utils and getattr(args, 'rl_enable_sol_tracking', False):
+        try:
+            from megatron.rl.sol_integration import get_sol_tracker
+            tracker = get_sol_tracker()
+            if tracker and tracker.initialized:
+                opt_sol_context = tracker.phase("rl_timing/train-step/optimizer")
+                opt_sol_context.__enter__()
+        except Exception:
+            pass
+    
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -1405,6 +1436,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     log_max_attention_logit = 0
     if args.qk_clip or args.log_max_attention_logit:
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+    
+    if opt_sol_context is not None:
+        try:
+            opt_sol_context.__exit__(None, None, None)
+        except Exception:
+            pass
             
     timers('optimizer').stop()
 

@@ -78,6 +78,18 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 
+# SOL (Speed of Light) integration - moved to sol_integration.py
+from megatron.rl.sol_integration import (
+    get_sol_tracker,
+    sol_nvtx_range,
+    log_training_sol,
+    initialize_sol,
+    cleanup_sol,
+    clear_sol_captures,
+    is_sol_available,
+    SOL_ESTIMATOR_AVAILABLE,
+)
+
 logger = logging.getLogger(__name__)
 
 # Global variable to store packing context for forward_step
