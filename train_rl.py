@@ -117,9 +117,10 @@ def loss_func(
     loss_mask_flat = loss_mask.reshape(-1)
 
     total_tokens = loss_mask_flat.sum()
-    # Avoid division by zero for empty bins
-    if total_tokens == 0:
-        total_tokens = torch.tensor(1.0, device=loss_mask_flat.device)
+    # Note: empty (fully-masked) bins are expected with sequence packing padding.
+    # Keep `total_tokens == 0` so they contribute 0 to the global denominator.
+    # Megatron's pipeline schedule protects division by zero via:
+    #   output_tensor /= torch.clamp(num_tokens, min=1)
     loss = torch.cat([torch.sum(losses_flat * loss_mask_flat).view(1), total_tokens.view(1)])
 
     # Ensure all tensors are on the same device as losses
