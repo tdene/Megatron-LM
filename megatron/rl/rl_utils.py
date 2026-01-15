@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
 from megatron.core.datasets.megatron_tokenizer import MegatronLegacyTokenizer
+from megatron.core.distributed import offload_grad_data, onload_grad_data
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.optimizer import MegatronOptimizer
@@ -987,13 +988,7 @@ def prepare_data_for_update(
     nvtx_range = get_nvtx_range()
     runtime_state = get_rl_runtime_state()
 
-    # RL policy updates + logprob computations should run eagerly; only rollout generation
-    # (inference engine) should use CUDA graphs until training cuda-graphs MR goes in. 
-    # In the single-model case this is naturally handled by `megatron_rl_inference_mode` 
-    # toggling graphs on/off around inference. In the refit case (separate inference_model),
-    # we must explicitly keep the training model (this `model`) with CUDA graphs disabled,
-    # otherwise training/logprobs can get cudagraphed.
-    if args.cuda_graph_impl != "none":
+    if args.cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
         lang_module = (
             model[0].module.module if hasattr(model[0].module, "module") else model[0].module
         )
@@ -1108,6 +1103,11 @@ def prepare_data_for_update(
                 )
 
             def logprobs_forward_step(data_iterator, model):
+
+                # Avoid self.training checks which will trigger cudagraph capture; this path reuses
+                # the forward pass from training after it has been captured on the 1st iteration.
+                model.eval()
+
                 if args.rl_use_sequence_packing:
                     # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
                     bin_tensor = next(data_iterator)[0]
@@ -1123,7 +1123,7 @@ def prepare_data_for_update(
                 b_trajs = b_trajs.cuda()
                 b_posids = b_posids.cuda()
 
-                return (
+                logprobs = (
                     get_logprobs(
                         model,
                         b_trajs,
@@ -1134,6 +1134,9 @@ def prepare_data_for_update(
                     ),
                     None,
                 )
+
+                model.train()
+                return logprobs
 
             dtype = (
                 torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
@@ -1598,9 +1601,10 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
+                offload_states = offload_grad_data(model[0], optimizer)
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
         inference_interface = get_inference_interface(args, loop, model)
@@ -1649,7 +1653,7 @@ def megatron_rl_inference_mode(
                 inference_interface._inference_engine.context.memory_buffer = None
 
         # TODO: Remove this if statement once a change to `toggle_cuda_graphs` makes it safe to.
-        if cuda_graph_impl != "none":
+        if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none', reset_cuda_graphs=reset_cuda_graphs)
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they don't consume
@@ -1660,6 +1664,7 @@ def megatron_rl_inference_mode(
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
                 optimizer.restore_from_cpu()
+                onload_grad_data(model[0], offload_states, optimizer)
 
         lang_module.train()
 
