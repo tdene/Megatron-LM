@@ -925,6 +925,8 @@ class TextGenerationController:
             ])
         elif return_router_mask:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        else:
+            RouterReplay.set_global_router_replay_action(None)
 
         ##########################
         # End of temporary code for router mask replay

@@ -92,6 +92,11 @@ logger = logging.getLogger(__name__)
 _GLOBAL_PACKING_CONTEXT = None
 
 
+def log_memory_usage(stage: str):
+    import torch.cuda
+    mem_summary = torch.cuda.memory_stats()
+    logger.info(f"{stage} Memory usage: Allocated {mem_summary['allocated_bytes.all.current'] / 1024**2:.2f} MB, Reserved {mem_summary['reserved_bytes.all.current'] / 1024**2:.2f} MB")
+
 def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool) -> None:
     """Prefetch RL *separate inference model* weights to CPU/GPU (UVM-only path).
 
@@ -1598,6 +1603,7 @@ def megatron_rl_inference_mode(
 
     with torch.no_grad():
 
+        log_memory_usage("Before offloading optimizer")
         if offload_optimizer_during_inference:
             with nvtx_range("offload-optimizer-before-inference"):
                 optimizer.offload_to_cpu()
@@ -1607,6 +1613,7 @@ def megatron_rl_inference_mode(
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, cuda_graph_impl, reset_cuda_graphs=reset_cuda_graphs)
 
+        log_memory_usage("Before building inference interface")
         inference_interface = get_inference_interface(args, loop, model)
 
         with nvtx_range("onload-kv-cache-before-inference"):
@@ -1639,6 +1646,7 @@ def megatron_rl_inference_mode(
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
         yield inference_interface
 
+        log_memory_usage("Before suspending engine")
         with nvtx_range("suspend-engine"):
             loop.run_until_complete(inference_interface.suspend())
 
@@ -1661,6 +1669,7 @@ def megatron_rl_inference_mode(
         with nvtx_range("prefetch-inference-model-weights-to-cpu"):
             _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=True)
 
+        log_memory_usage("Before onload optimizer")
         if offload_optimizer_during_inference:
             with nvtx_range("onload-optimizer-after-inference"):
                 optimizer.restore_from_cpu()

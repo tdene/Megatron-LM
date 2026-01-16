@@ -527,7 +527,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
                 tp_size=tp_size,
                 num_cuda_graphs=num_cuda_graphs,
-                cuda_graph_max_tokens=self.max_requests,
+                cuda_graph_max_tokens=self.max_tokens,
                 cuda_graph_mixed_prefill_count=cuda_graph_mixed_prefill_count,
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
