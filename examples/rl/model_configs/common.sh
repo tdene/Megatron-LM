@@ -17,13 +17,14 @@ COMMON_OPTIONS="\
     --${PRECISION:-bf16} \
     --te-rng-tracker \
     --rl-offload-optimizer-during-inference \
-    --inference-dynamic-batching-buffer-size-gb 20 \
+    --rl-partial-rollouts \
+    --inference-dynamic-batching-buffer-size-gb 40 \
     --data-parallel-random-init \
     --attention-backend flash \
     --timing-log-level 1 \
     --log-timers-to-tensorboard \
     --save-retain-interval 120 \
-    --inference-dynamic-batching-num-cuda-graphs 1 \
+    --inference-dynamic-batching-num-cuda-graphs 2 \
     --inference-dynamic-batching-unified-memory-level 1 \
     --adam-beta1 0.9 \
     --adam-beta2 ${ADAM_BETA2:-0.95} \
