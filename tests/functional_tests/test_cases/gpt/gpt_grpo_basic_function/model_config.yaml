@@ -8,63 +8,76 @@ TEST_TYPE: frozen-start
 MODE: rl
 MODEL_ARGS:
   --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 4
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 4
+  --expert-tensor-parallel-size: 1
+  --sequence-parallel: true
   --rl-inference-tensor-model-parallel-size: 1
-  --rl-inference-pipeline-model-parallel-size: 2
+  --rl-inference-expert-model-parallel-size: 2
+  --rl-inference-expert-tensor-parallel-size: 1
   --refit-method: gloo
-  --inference-dynamic-batching-num-cuda-graphs: 1
-  --inference-dynamic-batching-unified-memory-level: 1
+  --inference-dynamic-batching-num-cuda-graphs: 4
   --inference-dynamic-batching-buffer-size-gb: 20
   --ckpt-format: torch_dist
-  --seq-length: 1024
-  --inference-max-seq-length: 1024
-  --load: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --seq-length: 256
+  --inference-max-seq-length: 256
+  --load: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/checkpoints
   --untie-embeddings-and-output-weights: true
-  --num-layers: 36
-  --hidden-size: 4096
-  --ffn-hidden-size: 12288
-  --num-attention-heads: 32
+  --num-layers: 27
+  --hidden-size: 2048
+  --ffn-hidden-size: 10944
+  --moe-ffn-hidden-size: 1408
+  --moe-shared-expert-intermediate-size: 2816
+  --num-attention-heads: 16
   --kv-channels: 128
-  --max-position-embeddings: 1024
-  --group-query-attention: true
-  --num-query-groups: 8
+  --max-position-embeddings: 256
   --normalization: RMSNorm
-  --norm-epsilon: 0.000001
-  --qk-layernorm: true
+  --init-method-std: 0.014
   --position-embedding-type: rope
   --rotary-percent: 1.0
   --rotary-base: 1000000
-  --use-rotary-position-embeddings: true
   --swiglu: true
   --disable-bias-linear: true
   --attention-dropout: 0.0
   --hidden-dropout: 0.0
-  --no-masked-softmax-fusion: true
-  --attention-softmax-in-fp32: true
-  --tokenizer-type: HuggingFaceTokenizer
-  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
-  --langrl-inference-server-type: inplace_megatron_chat
-  --langrl-inference-server-conversation-template: ${CHECKPOINT_LOAD_PATH}/model/qwen3-8b-dist/tokenizer
-  --vocab-size: 151936
-  --make-vocab-size-divisible-by: 128
+  --num-experts: 64
+  --moe-router-topk: 6
+  --moe-z-loss-coeff: 0
+  --moe-router-load-balancing-type: seq_aux_loss
+  --moe-aux-loss-coeff: 1e-3
+  --moe-router-score-function: sigmoid
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/deepseek_16b_pyt/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --langrl-inference-server-type: inplace_megatron
   --optimizer: adam
   --adam-beta1: 0.9
   --adam-beta2: 0.999
   --adam-eps: 0.00000001
   --lr: 0.000001
-  --min-lr: 0.0000001
   --lr-warmup-samples: 0
   --clip-grad: 1.0
   --weight-decay: 0.01
   --use-mcore-models: true
   --bf16: true
+  --distributed-backend: nccl
+  --transformer-impl: transformer_engine
+  --attention-backend: flash
+  --mock-data: true
+  --no-load-optim: true
+  --no-create-attention-mask-in-dataloader: true
   --log-memory-to-tensorboard: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
   --timing-log-option: minmax
   --log-throughput: true
-  --no-create-attention-mask-in-dataloader: true
   --straggler-minmax-count: 16
   --tensorboard-log-interval: 1
   --log-interval: 1
@@ -88,6 +101,10 @@ MODEL_ARGS:
   --grpo-entropy-term-weight: 0.0
   --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_basic_function/env_config.yaml
   --rl-partial-rollouts: true
+  --moe-pad-experts-for-cuda-graph-inference: true
+  --rl-inference-model-unified-memory-level: 1
+  --rl-offload-inference-model-weights-when-idle: true
+  --max-tokens-to-oom: 3600000
   --use-checkpoint-args: true
   --dist-ckpt-strictness: log_unexpected
   --perform-rl-step: true
