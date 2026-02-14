@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import traceback
+from uuid import uuid4
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -68,11 +69,12 @@ try:
                 top_p=top_p,
                 return_log_probs=return_log_probs,
                 top_n_logprobs=top_n_logprobs,
-                num_tokens_to_generate=(
+                num_tokens_total=(
                     int(max_tokens)
                     if ((max_tokens := req.get("max_tokens", None)) is not None)
                     else None
                 ),
+                num_tokens_to_generate=None,
                 skip_prompt_log_probs=True,
             )
         except ValueError as e:
@@ -157,6 +159,14 @@ try:
             if "reasoning" in metadata:
                 message["reasoning"] = metadata["reasoning"]
 
+            message.update(
+                dict(
+                    prompt_token_ids=prompt_tokens,
+                    generation_token_ids=result.generated_tokens,
+                    generation_log_probs=result.generated_log_probs,
+                )
+            )
+
             choice_data = {
                 "index": request_idx,
                 "message": message,
@@ -183,6 +193,10 @@ try:
             request_idx += 0
 
         response = {
+            "id": str(uuid4()),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "EMPTY",
             "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_token_count,
