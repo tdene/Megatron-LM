@@ -32,6 +32,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     port: int
 
     _server_task: asyncio.Task = PrivateAttr(None)
+    _shutdown_event: asyncio.Event = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
@@ -97,20 +98,24 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             loop = asyncio.get_event_loop()
             client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
+            shutdown_event = asyncio.Event()
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
                 flask_port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
+                shutdown_event=shutdown_event,
             ))
         else:
             client = None
             server_task = None
-            
+            shutdown_event = None
+
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._server_task = server_task
+        launched_server._shutdown_event = shutdown_event
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
@@ -123,9 +128,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             await self._client.pause_engines()
         await self._inference_engine.paused.wait()
-        # Step 2: Stop (DP all-reduce among all ranks)
+        # Step 2: Shut down Flask server (drain HTTP connections, clean up executor)
+        if dist.get_rank() == 0:
+            self._shutdown_event.set()
+            await self._server_task
+        # Step 3: Stop engines (DP all-reduce among all ranks)
         if dist.get_rank() == 0:
             self._client.stop_engines()
+            self._client.stop()
         await self._inference_engine.stopped.wait()
         # Step 3: Cleanup — engine loop's finally already closed sockets.
         # Join the coordinator process and close the client.
