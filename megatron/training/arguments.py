@@ -2078,6 +2078,11 @@ def _add_rl_args(parser):
                             'If False, CUDA graphs are deleted on suspend and re-captured on resume.')
     group.add_argument('--rl-partial-rollouts', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, use partial rollouts.')
+    group.add_argument('--rl-pipeline-depth', type=int, default=0,
+                       help='Pipelined rollout buffer depth. When > 0, rollouts are collected '
+                            'into a FIFO of this depth and training uses the oldest batch, '
+                            'giving a deterministic off-policy staleness of L steps. '
+                            '0 (default) recovers the standard synchronous behavior.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,

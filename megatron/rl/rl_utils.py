@@ -10,7 +10,7 @@ import math
 import logging
 import json
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -293,6 +293,10 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
+        self.data_iterator = None
+        self.start_iteration = None
+        # Pipelined rollout buffer state.
+        self.pipeline_buffer = None
 
     def reset_iteration_counters(self, iteration):
         """Reset per-iteration counters."""
@@ -1554,53 +1558,74 @@ def get_grpo_data_iterator(
     global_batch_size: int,
     sequence_packing: bool,
     is_correction: bool,
-    buffered_rollouts: RerunDataIterator | None = None,
 ) -> RerunDataIterator:
-    """
-    Get the data iterator for GRPO training.
+    """Get the data iterator for GRPO training.
 
-    Depending on the sampling parameters either performs data collections or returns
-    the buffered_rollouts as is.
-
-    Args:
-        model: The language model
-        optimizer: The Megatron optimizer
-        iteration: Current training iteration
-        ref_state_dict: Reference model state dict for GRPO
-        grpo_iterations: How many steps we reuse the sampled data for.
-        grpo_prompts_per_step: How many prompts we sample per data collection.
-        grpo_group_size: How many samples we do per prompt.
-        global_batch_size: Global batch size.
-        sequence_packing: Use sequence packing if True.
-        is_correction: Use IS correction if True.
-        buffered_rollouts: Previously collected rollouts (if any)
+    Unified path for both buffered and pipelined rollout collection.
+    When ``rl_pipeline_depth > 0``, maintains a FIFO of raw rollout batches
+    that introduces controlled staleness. Otherwise collects fresh rollouts
+    and reuses them for ``grpo_iterations`` steps.
 
     Returns:
-        RerunDataIterator for the current training step
+        RerunDataIterator for the current training step.
     """
-    runtime_state = get_rl_runtime_state()
+    state = get_rl_runtime_state()
+    args = get_args()
+    pipeline_depth = getattr(args, 'rl_pipeline_depth', 0)
 
-    # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
-    global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size 
-    if (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration + 
-        (grpo_iterations * global_batches_per_collection)
-    ):
+    # Initialization.
+    if state.start_iteration is None:
+        state.start_iteration = iteration
+        if pipeline_depth > 0:
+            state.pipeline_buffer = deque()
+            for _ in range(pipeline_depth):
+                state.pipeline_buffer.append(
+                    get_environment_rollouts(
+                        model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+                    )
+                )
 
-        buffered_rollouts = get_environment_rollouts(
-            model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
-        )
-        buffered_rollouts = prepare_data_for_update(model=model, 
-            ref_state_dict=ref_state_dict, 
-            rollouts=buffered_rollouts,
-            tokenizer=get_tokenizer(),
-            sequence_packing=sequence_packing,
-            is_correction=is_correction,
+    # 2. Pipelined warmup: return warmup data until pipeline has filled.
+    if pipeline_depth > 0 and state.data_iterator is not None:
+        steps_since_start = iteration - state.start_iteration
+        if steps_since_start < pipeline_depth:
+            return state.data_iterator
+
+    # 3. Check if fresh training data is needed (shared reuse timing).
+    global_batches_per_collection = (
+        (grpo_prompts_per_step * grpo_group_size) // global_batch_size
+    )
+    need_fresh = (
+        state.data_iterator is None
+        or iteration >= state.last_collection_iteration
+           + (grpo_iterations * global_batches_per_collection)
+    )
+
+    if not need_fresh:
+        return state.data_iterator
+
+    # 4. Get rollouts.
+    if pipeline_depth > 0:
+        # Collect one new batch, pop the oldest.
+        state.pipeline_buffer.append(
+            get_environment_rollouts(
+                model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
             )
-        runtime_state.reset_iteration_counters(iteration)
+        )
+        rollouts = state.pipeline_buffer.popleft()
+    else:
+        rollouts = get_environment_rollouts(
+                model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size
+            )
 
-    return buffered_rollouts
+    # 5. Prepare and store.
+    state.data_iterator = prepare_data_for_update(
+        model=model, ref_state_dict=ref_state_dict,
+        rollouts=rollouts, tokenizer=get_tokenizer(),
+        sequence_packing=sequence_packing, is_correction=is_correction,
+    )
+    state.reset_iteration_counters(iteration)
+    return state.data_iterator
 
 
 def evaluate_and_print_results_rl(
