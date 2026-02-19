@@ -275,6 +275,13 @@ class RolloutStats:
     min_inf_prob: None | float
     max_inf_prob: None | float
     mean_inf_prob: None | float
+    # Per-rollout max staleness, grouped like rewards. Defaults to 0 when unavailable.
+    policy_staleness: list[list[int]]
+    kv_cache_staleness: list[list[int]]
+    # Raw completed_at_step per rollout, grouped. Gap computed at log time.
+    completed_at_steps: list[list[int]]
+    # Per-rollout eviction count, grouped like rewards.
+    num_evictions: list[list[int]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -744,11 +751,19 @@ def compute_group_stats(
     env_ids = []
     group_reward_ids = []
     num_turns = [] # num_turns per traj
+    all_policy_staleness = []
+    all_kv_cache_staleness = []
+    all_completed_at_steps = []
+    all_num_evictions = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
         group_turn_lengths = []
         group_num_turns = []
+        group_policy_staleness = []
+        group_kv_staleness = []
+        group_completed_at_steps = []
+        group_num_evictions = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -769,6 +784,14 @@ def compute_group_stats(
             roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
+            group_policy_staleness.append(max(rollout.policy_staleness) if rollout.policy_staleness is not None else 0)
+            group_kv_staleness.append(max(rollout.kv_cache_staleness) if rollout.kv_cache_staleness is not None else 0)
+            group_completed_at_steps.append(rollout.completed_at_step if rollout.completed_at_step is not None else 0)
+            group_num_evictions.append(rollout.num_evictions if rollout.num_evictions is not None else 0)
+        all_policy_staleness.append(group_policy_staleness)
+        all_kv_cache_staleness.append(group_kv_staleness)
+        all_completed_at_steps.append(group_completed_at_steps)
+        all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -796,6 +819,10 @@ def compute_group_stats(
         min_inf_prob=None,
         max_inf_prob=None,
         mean_inf_prob=None,
+        policy_staleness=all_policy_staleness,
+        kv_cache_staleness=all_kv_cache_staleness,
+        completed_at_steps=all_completed_at_steps,
+        num_evictions=all_num_evictions,
     )
     return stats
 
@@ -808,7 +835,10 @@ def prep_wandb_metrics(
         num_turns: List[List[int]],
         advantages: List[float],
         example_group: list[TokenRollout | Rollout] | None = None,
-        tokenizer: MegatronTokenizer | None = None
+        tokenizer: MegatronTokenizer | None = None,
+        policy_staleness: List[List[int]] = (),
+        kv_cache_staleness: List[List[int]] = (),
+        num_evictions: List[List[int]] = (),
     ):
 
     """Make a wandb-parseable dictionary of metrics for logging.
@@ -822,6 +852,8 @@ def prep_wandb_metrics(
         advantages: Flattened list of advantages.
         tokenizer: Tokenizer to untokenize trajectories for logging.
         example_groups: A list of rollouts of one group to log examples of trajectories.
+        policy_staleness: Grouped list of per-rollout max policy staleness.
+        kv_cache_staleness: Grouped list of per-rollout max KV cache staleness.
     """
 
     group_table = wandb_writer.Table(
@@ -864,6 +896,53 @@ def prep_wandb_metrics(
             'nonzero_groups_ratio': np.count_nonzero(advantages)
             / len(advantages),
     }
+    flat_policy = [s for g in policy_staleness for s in g]
+    flat_kv = [s for g in kv_cache_staleness for s in g]
+    flat_rewards = [r for g in rewards for r in g]
+    flat_traj_lens_list = [l for g in traj_lens for l in g]
+    # Scalars
+    metrics['mean_policy_staleness'] = np.mean(flat_policy)
+    metrics['max_policy_staleness'] = max(flat_policy)
+    metrics['min_policy_staleness'] = min(flat_policy)
+    metrics['mean_kv_cache_staleness'] = np.mean(flat_kv)
+    metrics['max_kv_cache_staleness'] = max(flat_kv)
+    metrics['min_kv_cache_staleness'] = min(flat_kv)
+    # Histograms
+    metrics['policy_staleness_hist'] = wandb_writer.plot.histogram(
+        wandb_writer.Table(
+            columns=['policy_staleness'],
+            data=[[s] for s in flat_policy],
+        ),
+        'policy_staleness', 'Policy Staleness',
+    )
+    # Correlation tables
+    metrics['staleness_vs_reward'] = wandb_writer.Table(
+        columns=['policy_staleness', 'reward'],
+        data=list(zip(flat_policy, flat_rewards)),
+    )
+    metrics['staleness_vs_traj_length'] = wandb_writer.Table(
+        columns=['policy_staleness', 'traj_length'],
+        data=list(zip(flat_policy, flat_traj_lens_list)),
+    )
+    # Staleness vs advantage: repeat staleness per num_turns to align with flattened advantages.
+    flat_num_turns = [nt for g in num_turns for nt in g]
+    staleness_per_turn = [s for s, nt in zip(flat_policy, flat_num_turns) for _ in range(nt)]
+    metrics['staleness_vs_advantage'] = wandb_writer.Table(
+        columns=['policy_staleness', 'advantage'],
+        data=list(zip(staleness_per_turn, advantages)),
+    )
+    flat_evictions = [e for g in num_evictions for e in g]
+    metrics['mean_num_evictions'] = np.mean(flat_evictions)
+    metrics['max_num_evictions'] = max(flat_evictions)
+    nonzero_evictions = [e for e in flat_evictions if e > 0]
+    if nonzero_evictions:
+        metrics['num_evictions_hist'] = wandb_writer.plot.histogram(
+            wandb_writer.Table(
+                columns=['num_evictions'],
+                data=[[e] for e in nonzero_evictions],
+            ),
+            'num_evictions', 'Evictions (nonzero only)',
+        )
     if example_group:
         if tokenizer is None:
             raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
@@ -900,6 +979,17 @@ def maybe_log_training_metrics(
     tb_writer = get_tensorboard_writer()
     if tb_writer:
         tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+        flat_ps = [s for g in group_stats.policy_staleness for s in g]
+        flat_kvs = [s for g in group_stats.kv_cache_staleness for s in g]
+        tb_writer.add_scalar('mean_policy_staleness', np.mean(flat_ps), current_iteration)
+        tb_writer.add_scalar('max_policy_staleness', max(flat_ps), current_iteration)
+        tb_writer.add_scalar('mean_kv_cache_staleness', np.mean(flat_kvs), current_iteration)
+        tb_writer.add_scalar('max_kv_cache_staleness', max(flat_kvs), current_iteration)
+        flat_gaps = [current_iteration - s for g in group_stats.completed_at_steps for s in g]
+        tb_writer.add_scalar('mean_completion_gap', np.mean(flat_gaps), current_iteration)
+        flat_ev = [e for g in group_stats.num_evictions for e in g]
+        tb_writer.add_scalar('mean_num_evictions', np.mean(flat_ev), current_iteration)
+        tb_writer.add_scalar('max_num_evictions', max(flat_ev), current_iteration)
     if not wandb_writer:
         return
 
@@ -921,8 +1011,17 @@ def maybe_log_training_metrics(
     rewards = group_stats.rewards
     num_turns = group_stats.num_turns
     advantages = group_stats.advantages
-    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer, 
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages)  
+    policy_staleness = group_stats.policy_staleness
+    kv_cache_staleness = group_stats.kv_cache_staleness
+    num_evictions = group_stats.num_evictions
+
+    flat_gaps = [current_iteration - s for g in group_stats.completed_at_steps for s in g]
+    metrics['mean_completion_gap'] = np.mean(flat_gaps)
+
+    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
+        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
+        policy_staleness=policy_staleness, kv_cache_staleness=kv_cache_staleness,
+        num_evictions=num_evictions)
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -936,13 +1035,16 @@ def maybe_log_training_metrics(
             end = st + group_turn_counts[i]
             env_advantages.extend(advantages[st:end])
 
-        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx), 
-            turn_lens=env_stats(turn_lens, env_idx), 
+        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
+            turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
             advantages=env_advantages,
             example_group=example_groups[env_id],
             tokenizer=tokenizer,
+            policy_staleness=env_stats(policy_staleness, env_idx),
+            kv_cache_staleness=env_stats(kv_cache_staleness, env_idx),
+            num_evictions=env_stats(num_evictions, env_idx),
         )
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
