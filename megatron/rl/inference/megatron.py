@@ -8,6 +8,7 @@ from pydantic import PrivateAttr
 
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.headers import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import log_single_rank
@@ -124,11 +125,64 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         return launched_server
 
     async def kill(self):
-        # Step 1: Global pause (ACK/re-ACK through coordinator)
+        """Graceful shutdown from any engine state.
+
+        Navigates the state machine to PAUSED (the prerequisite for STOP),
+        shuts down the Flask server, then stops the engines.
+
+        State navigation:
+            RUNNING    → send PAUSE → wait for PAUSED
+            PAUSING    → wait for PAUSED (EP consensus in progress)
+            PAUSED     → ready for STOP
+            SUSPENDING → wait for SUSPENDED → send RESUME → wait for PAUSED
+            SUSPENDED  → send RESUME → wait for PAUSED
+            RESUMING   → wait for PAUSED (DP all-reduce in progress)
+            STOPPING   → wait for STOPPED (already shutting down)
+            STOPPED    → nothing to do
+        """
+        engine = self._inference_engine
+
+        if engine.state == EngineState.STOPPED:
+            return
+
         if dist.get_rank() == 0:
-            await self._client.pause_engines()
-        await self._inference_engine.paused.wait()
-        # Step 2: Shut down Flask server (drain HTTP connections, clean up executor)
+            # Navigate to PAUSED based on current state.
+            state = engine.state
+            if state == EngineState.RUNNING:
+                await self._client.pause_engines()
+            elif state == EngineState.SUSPENDED:
+                self._client.resume_engines()
+            elif state == EngineState.SUSPENDING:
+                await engine.suspended.wait()
+                self._client.resume_engines()
+            # PAUSING → will reach PAUSED after EP consensus
+            # RESUMING → will reach PAUSED after DP all-reduce
+            # PAUSED → already there
+            # STOPPING → will reach STOPPED
+
+            # Wait for a stable state we can act on.
+            while engine.state not in (EngineState.PAUSED, EngineState.STOPPED):
+                await asyncio.sleep(0.02)
+
+            if engine.state != EngineState.STOPPED:
+                # Shut down Flask server (drain HTTP connections, clean up executor).
+                self._shutdown_event.set()
+                await self._server_task
+                # Stop engines (DP all-reduce among all ranks).
+                self._client.stop_engines()
+                self._client.stop()
+
+        # All ranks: wait for engine loop to exit.
+        await engine.stopped.wait()
+
+    async def force_kill(self):
+        """Emergency cleanup when graceful shutdown fails.
+
+        Cancels tasks, terminates processes, and closes sockets directly
+        without coordinating through the state machine.
+        """
+        engine = self._inference_engine
+
         if dist.get_rank() == 0:
             self._shutdown_event.set()
             await self._server_task

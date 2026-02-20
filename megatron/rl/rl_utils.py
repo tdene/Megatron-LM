@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import atexit
 import gc
 
 import copy
@@ -434,6 +435,7 @@ def get_inference_interface(args, loop, model):
                 port=8294,
                 verbose=args.inference_flask_server_logging)
         )
+        atexit.register(rl_inference_interface_shutdown)
     return _INFERENCE_INTERFACE
 
 
@@ -1799,7 +1801,14 @@ def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()
-        loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+        try:
+            loop.run_until_complete(_INFERENCE_INTERFACE.kill())
+        except (KeyboardInterrupt, Exception) as e:
+            logger.warning(f"Graceful shutdown failed ({e}), forcing cleanup...")
+            try:
+                loop.run_until_complete(_INFERENCE_INTERFACE.force_kill())
+            except (KeyboardInterrupt, Exception):
+                logger.warning("Force cleanup also interrupted. Resources may leak.")
         _INFERENCE_INTERFACE = None
     else:
         logger.warning("No inference interface to shutdown. This should not happen.")
