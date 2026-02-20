@@ -1648,24 +1648,37 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids.clear()
         self.requests.clear()
 
-    def stop(self):
-        """
-        Stops the inference engine by terminating the inference coordinator process
-        if it exists, and destroys the model parallel state.
-        This method ensures that any running inference coordinator subprocess
-        is properly terminated, and cleans up resources associated with
-        model parallelism.
-        """
+    def close(self):
+        """Close this engine's ZMQ sockets. Idempotent.
 
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.join()
-        for socket in self.zmq_sockets:
+        Called by run_engine_with_coordinator's finally block to ensure
+        sockets are cleaned up on any exit path (clean STOP, cancellation,
+        or exception).  Does NOT terminate the singleton zmq context —
+        that is process-lifetime and shared across engines.
+        """
+        for socket in getattr(self, 'zmq_sockets', []):
             socket.close()
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "data_parallel_zmq_communicator"):
             self.data_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+
+    def stop(self):
+        """Full teardown: join/terminate coordinator process, close sockets.
+
+        Call this after the engine loop task has completed (or been cancelled)
+        to clean up the coordinator subprocess.  Sockets are closed
+        idempotently — safe to call even if the engine loop's finally
+        block already closed them.
+        """
+        if hasattr(self, "inference_coordinator_process"):
+            self.inference_coordinator_process.join(timeout=2.0)
+            if self.inference_coordinator_process.is_alive():
+                self.inference_coordinator_process.terminate()
+                self.inference_coordinator_process.join(timeout=2.0)
+        self.close()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1809,8 +1822,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.stopped.set()
                     if self.rank == 0:
                         logging.info("Stopping engine.")
-                    self.stop()
                     break
 
         except asyncio.CancelledError:
             pass
+        finally:
+            self.close()

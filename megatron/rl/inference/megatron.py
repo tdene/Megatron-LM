@@ -127,6 +127,11 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.stop_engines()
         await self._inference_engine.stopped.wait()
+        # Step 3: Cleanup — engine loop's finally already closed sockets.
+        # Join the coordinator process and close the client.
+        self._inference_engine.stop()
+        if dist.get_rank() == 0:
+            self._client.stop()
 
     async def suspend(self):
         # Step 1: Global pause (ACK/re-ACK through coordinator)

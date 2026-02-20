@@ -184,6 +184,13 @@ class DataParallelInferenceCoordinator:
         known_clients = set()
         while True:
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
+
+            # Empty payload = engine (re-)registration.
+            if serialized_payload == b"":
+                if sender_identity not in self.identities_of_data_parallel_ranks:
+                    self.identities_of_data_parallel_ranks.append(sender_identity)
+                continue
+
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
 
