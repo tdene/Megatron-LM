@@ -3,18 +3,16 @@
 import asyncio
 import logging
 import socket
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 try:
-    from flask import Flask
+    from quart import Quart
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
-    from hypercorn.middleware import AsyncioWSGIMiddleware
 
-    HAS_FLASK = True
+    HAS_QUART = True
 except ImportError as e:
-    HAS_FLASK = False
+    HAS_QUART = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
 from megatron.core.inference.inference_client import InferenceClient
@@ -36,16 +34,16 @@ def temp_log_level(level, logger=None):
 
 
 @trace_async_exceptions
-async def run_flask_server_on_client(
+async def run_server_on_client(
     client: InferenceClient,
     tokenizer,
-    flask_port: int,
+    port: int,
     parsers: list[str] = None,
     verbose: bool = False,
 ):
-    """Initializes and runs the async Flask server using the provided InferenceClient."""
-    if not HAS_FLASK:
-        raise RuntimeError(f"Flask not available")
+    """Initializes and runs the async Quart server using the provided InferenceClient."""
+    if not HAS_QUART:
+        raise RuntimeError("Quart not available")
 
     try:
         hostname = socket.gethostname()
@@ -53,7 +51,7 @@ async def run_flask_server_on_client(
         logger.warning(f"Could not get hostname: {e}")
         hostname = "0.0.0.0"
 
-    app = Flask(__name__)
+    app = Quart(__name__)
 
     # Store client and tokenizer in app config for Blueprints to use
     app.config['client'] = client
@@ -66,44 +64,45 @@ async def run_flask_server_on_client(
         app.register_blueprint(endpoint)
 
     @app.route('/')
-    def health_check():
+    async def health_check():
         return "Megatron Dynamic Inference Server is running."
 
-    loop = asyncio.get_event_loop()
-
     config = Config()
-    config.wsgi_max_body_size = 2**30  # 1 GB; needed for large prompts.
-    config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
-    config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
-    config.h2_max_concurrent_streams = 2**14  # Allow many concurrent streams for HTTP/2 clients.
-    config.bind = [f"0.0.0.0:{flask_port}"]
+    config.keep_alive_timeout = 30.0  # RL inference requests are long; avoid premature disconnects.
+    config.backlog = 2048  # Generous margin for burst starts of RL training steps.
+    config.h2_max_concurrent_streams = 1024  # Support high HTTP/2 concurrency from RL clients.
+    config.bind = [f"0.0.0.0:{port}"]
 
     # Force logging level to INFO to ensure that hostname is printed
     with temp_log_level(logging.INFO, logger):
-        logger.info(f"Starting Flask server on http://{hostname}:{flask_port}")
+        logger.info(f"Starting inference server on http://{hostname}:{port}")
         logger.info(f"Using tokenizer: {type(tokenizer)}")
         logger.info(f"Using parsers: {parsers}")
 
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=8192))
-    await serve(AsyncioWSGIMiddleware(app, max_body_size=config.wsgi_max_body_size), config)
+    await serve(app, config)
 
 
 @trace_async_exceptions
-async def run_flask_server(
+async def run_server(
     coordinator_addr: str,
     tokenizer,
     rank: int,
-    flask_port: int,
+    port: int,
     parsers: list[str] = None,
     verbose: bool = False,
 ):
-    """Initializes and runs the async Flask server
+    """Initializes and runs the async Quart server
     starting an InferenceClient with the provided coordinator address."""
     inference_client = InferenceClient(coordinator_addr)
     await inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
     try:
-        await run_flask_server_on_client(inference_client, tokenizer, flask_port, parsers, verbose)
+        await run_server_on_client(inference_client, tokenizer, port, parsers, verbose)
     finally:
         await inference_client.stop()
-        logger.info(f"Rank {rank}: Flask server and client shut down.")
+        logger.info(f"Rank {rank}: Inference server and client shut down.")
+
+
+# Backward-compatible aliases
+run_flask_server_on_client = run_server_on_client
+run_flask_server = run_server

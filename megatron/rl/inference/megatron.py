@@ -93,14 +93,14 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.quart_server import run_server_on_client
             loop = asyncio.get_event_loop()
             client = InferenceClient(inference_coordinator_address=dp_addr)
             await client.start()
-            server_task = loop.create_task(run_flask_server_on_client(
+            server_task = loop.create_task(run_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
-                flask_port=kwargs.get('port', 8294),
+                port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
             ))
