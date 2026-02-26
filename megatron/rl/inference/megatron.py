@@ -96,7 +96,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
             loop = asyncio.get_event_loop()
             client = InferenceClient(inference_coordinator_address=dp_addr)
-            await client.start()
+            client.start()
             server_task = loop.create_task(run_flask_server_on_client(
                 client=client,
                 tokenizer=inference_engine.controller.tokenizer,
@@ -120,17 +120,31 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
 
     async def kill(self):
         if dist.get_rank() == 0:
-            await self._client.stop_engines()
+            self._client.pause_engines()
+        await self._inference_engine.paused.wait()
+
+        if dist.get_rank() == 0:
+            self._client.stop_engines()
         await self._inference_engine.stopped.wait()
+
+        if dist.get_rank() == 0:
+            self._client.stop()
 
     async def suspend(self):
         if dist.get_rank() == 0:
-            self._client.suspend_engines()
+            self._client.pause_engines()
         await self._inference_engine.paused.wait()
-        self._inference_engine.suspend()
+
+        if dist.get_rank() == 0:
+            self._client.suspend_engines()
+        await self._inference_engine.suspended.wait()
 
     async def resume(self):
+        if self._inference_engine.running.is_set():
+            return
+
         if dist.get_rank() == 0:
             self._client.resume_engines()
+            self._client.unpause_engines()
+
         await self._inference_engine.running.wait()
-        self._inference_engine.resume()

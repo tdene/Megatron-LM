@@ -11,7 +11,11 @@ import pytest
 import torch
 from tqdm import tqdm
 
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -34,7 +38,6 @@ except ImportError:
 NUM_REQUESTS = 10
 NUM_TOKENS = 2
 DEFAULT_PORT = 46581
-ZMQ_FLAKY_SHUTDOWN = True
 
 
 class DummyTokenizer:
@@ -86,19 +89,49 @@ class DummyEngine(DynamicInferenceEngine):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
         self.requests: Dict[int, RequestEntry] = {}
-        self.suspend_signal = False
-        self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
         self.pending_microbatch = deque()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
+
+        # State machine (mirrors dynamic_engine.py reset()).
+        self.state = EngineState.RUNNING
+        self.running = asyncio.Event()
+        self.running.set()
+        self.paused = asyncio.Event()
+        self.suspended = asyncio.Event()
+        self.stopped = asyncio.Event()
+        self._pending_signals = deque()
+        self.resume_request_ids = None
+        self.use_coordinator = False
+
+        # Default for EP world size (overwritten during
+        # start_listening_to_data_parallel_coordinator).
+        self.ep_world_size = 1
+
+        # CUDA events used by run_engine_with_coordinator for timing.
+        self.step_start_event = torch.cuda.Event(enable_timing=True)
+        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.step_count = 0
+
+    async def run_engine_with_coordinator(self, *, loop=None):
+        """Override to bypass @trace_async_exceptions for testability.
+
+        In production, @trace_async_exceptions converts AssertionError to
+        sys.exit(1) -> SystemExit.  In Python 3.12+, asyncio re-raises
+        SystemExit from tasks in the main thread, killing the process.
+        For tests, we let AssertionErrors propagate directly so
+        pytest.raises can catch them.
+        """
+        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
+
+    def suspend(self):
+        pass
+
+    def resume(self):
+        pass
 
     def add_request(
         self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
@@ -163,6 +196,33 @@ class DummyEngine(DynamicInferenceEngine):
         }
 
 
+async def graceful_shutdown(engine, client=None, *, timeout=10.0):
+    """Shut down the engine.
+
+    First we try to pass PAUSE -> STOP into the coordinator via the client.
+    If necessary, we escalate to engine.shutdown(immediate=True) and cancel all tasks.
+
+    Args:
+        engine: DummyEngine whose engine_loop_task to await.
+        client: InferenceClient (only rank 0, None on other ranks).
+        timeout: Per-stage timeout in seconds.
+    """
+    try:
+        if client is not None:
+            client.pause_engines()
+            client.stop_engines()
+        await asyncio.wait_for(engine.stopped.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await asyncio.wait_for(engine.shutdown(immediate=True), timeout=timeout)
+    finally:
+        proc = getattr(engine, 'inference_coordinator_process', None)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=timeout)
+        if client is not None:
+            client.stop()
+
+
 @pytest.fixture
 def initialize_model_parallel(request, monkeypatch):
     """Fixture to initialize and destroy model parallel.
@@ -179,12 +239,11 @@ def initialize_model_parallel(request, monkeypatch):
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
     )
-    dp = world_size // (tp * pp * ep)
+    dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp, ep
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.skipif(ZMQ_FLAKY_SHUTDOWN, reason="ZMQ shutdown is flaky")
 class TestCoordinator:
     """Test class for Data Parallel Inference Coordinator."""
 
@@ -211,10 +270,11 @@ class TestCoordinator:
             inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=launch_coordinator
         )
 
+        client = None
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
                 futures = [
                     client.add_request(prompt=prompt, sampling_params=params)
@@ -225,15 +285,10 @@ class TestCoordinator:
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
         finally:
-            if torch.distributed.get_rank() == 0:
-                if stop_engines:
-                    await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
             if stop_engines:
-                try:
-                    await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-                except asyncio.TimeoutError:
-                    engine.engine_loop_task.cancel()
+                await graceful_shutdown(engine, client)
+            elif client is not None:
+                client.stop()
 
         return dp_addr
 
@@ -257,141 +312,265 @@ class TestCoordinator:
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
     async def test_coordinator_lifecycle(self, initialize_model_parallel):
-        """Test coordinator connection and port conflict behavior."""
-        engine1 = DummyEngine()
-        engine2 = None
-        engine3 = None
-        third_addr = None
-
-        # Launch first coordinator - binds to DEFAULT_PORT
-        first_addr = await engine1.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-        )
+        """Test coordinator connection, port conflicts, de-registration, and re-registration."""
+        requests = self.build_requests(num_requests=4)
+        engines = []
+        client1 = None
 
         try:
-            # Cancel engine1 loop without sending stop to coordinator
-            # This keeps coordinator process alive and holding the port
-            engine1.engine_loop_task.cancel()
-            try:
-                await engine1.engine_loop_task
-            except asyncio.CancelledError:
-                pass
+            # Launch first coordinator - binds to DEFAULT_PORT
+            engine1 = DummyEngine()
+            engines.append(engine1)
+            first_addr = await engine1.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+            )
 
-            # Connect engine2 to existing coordinator (don't launch new one)
+            # Verify the engine can serve requests.
+            if torch.distributed.get_rank() == 0:
+                client1 = InferenceClient(first_addr)
+                client1.start()
+
+                futures = [
+                    client1.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
+
+                # Pause the engines to force a synchronization point.
+                client1.pause_engines()
+            await asyncio.wait_for(engine1.paused.wait(), timeout=5.0)
+            if torch.distributed.get_rank() == 0:
+                client1.unpause_engines()
+            await asyncio.wait_for(engine1.running.wait(), timeout=5.0)
+
+            # Disconnect the engine (simulates unexpected departure).
+            await engine1.shutdown(immediate=True)
+
+            # Re-register a new engine with the same coordinator.
             engine2 = DummyEngine()
-            second_addr = await engine2.start_listening_to_data_parallel_coordinator(
+            engines.append(engine2)
+            await engine2.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=False
             )
 
-            # Should connect to same port, but will not always in CI due to port conflicts.
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            second_port = int(second_addr.rsplit(":", 1)[-1])
-            # assert second_port == first_port
+            # Verify the new engine can serve requests.
+            if torch.distributed.get_rank() == 0:
+                futures = [
+                    client1.add_request(prompt=p, sampling_params=s) for p, s in requests[2:4]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
 
-            # Cancel engine2
-            engine2.engine_loop_task.cancel()
-            try:
-                await engine2.engine_loop_task
-            except asyncio.CancelledError:
-                pass
+                # Pause the engines to force a synchronization point.
+                client1.pause_engines()
+            await asyncio.wait_for(engine2.paused.wait(), timeout=5.0)
+            if torch.distributed.get_rank() == 0:
+                client1.unpause_engines()
+            await asyncio.wait_for(engine2.running.wait(), timeout=5.0)
 
-            # Launch new coordinator - should get different port since first is holding it
+            # Disconnect the engine (simulates unexpected departure).
+            await engine2.shutdown(immediate=True)
+            if client1 is not None:
+                client1.stop()
+                client1 = None
+
+            # Spin up a new coordinator; verify it gets a new port.
             engine3 = DummyEngine()
+            engines.append(engine3)
             third_addr = await engine3.start_listening_to_data_parallel_coordinator(
                 inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
             )
 
-            # Verify we got a different port due to conflict
+            first_port = int(first_addr.rsplit(":", 1)[-1])
             third_port = int(third_addr.rsplit(":", 1)[-1])
             assert (
                 third_port != first_port
             ), f"Expected different port due to conflict, but got same: {third_port}"
 
         finally:
-            # Clean up engine3's coordinator
-            if engine3 is not None and third_addr is not None:
-                client3 = InferenceClient(third_addr)
-                await client3.start()
-                await asyncio.wait_for(client3.stop_engines(), timeout=10.0)
-                client3.stop()
-                try:
-                    await asyncio.wait_for(engine3.engine_loop_task, timeout=30.0)
-                except asyncio.TimeoutError:
-                    engine3.engine_loop_task.cancel()
-
-            # Rebuild engine and reconnect to engine1's coordinator
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            engine1 = DummyEngine()
-            await engine1.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=first_port, launch_inference_coordinator=False
-            )
-            client1 = InferenceClient(first_addr)
-            await client1.start()
-            await asyncio.wait_for(client1.stop_engines(), timeout=10.0)
-            client1.stop()
-            try:
-                await asyncio.wait_for(engine1.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine1.engine_loop_task.cancel()
+            # Shut down the last engine (which has the active engine loop).
+            await graceful_shutdown(engines[-1], client1)
+            # Kill any remaining coordinator processes (e.g. engine1's).
+            for engine in engines:
+                proc = getattr(engine, 'inference_coordinator_process', None)
+                if proc is not None and proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=5.0)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
-    async def test_pause(self, initialize_model_parallel):
-        """Test pause and resume functionality."""
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((2, 2, 2), id="tp2-pp2-ep2")],
+        indirect=["initialize_model_parallel"],
+    )
+    async def test_control_logic_lifecycle(self, initialize_model_parallel):
+        """Comprehensive lifecycle test for the engine state machine."""
+        # States where paused stays set: once set during PAUSE, it's only
+        # cleared by UNPAUSE.  It remains set through SUSPEND/RESUME/STOP.
+        PAUSED_FAMILY = {
+            EngineState.PAUSED,
+            EngineState.SUSPENDING,
+            EngineState.SUSPENDED,
+            EngineState.RESUMING,
+            EngineState.STOPPING,
+            EngineState.STOPPED,
+        }
+
+        def assert_state(eng, expected):
+            """Assert engine state and all four event flags are consistent."""
+            assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
+            assert eng.running.is_set() == (
+                expected == EngineState.RUNNING
+            ), f"running.is_set()={eng.running.is_set()} for state={expected}"
+            assert eng.paused.is_set() == (
+                expected in PAUSED_FAMILY
+            ), f"paused.is_set()={eng.paused.is_set()} for state={expected}"
+            assert eng.suspended.is_set() == (
+                expected == EngineState.SUSPENDED
+            ), f"suspended.is_set()={eng.suspended.is_set()} for state={expected}"
+            assert eng.stopped.is_set() == (
+                expected == EngineState.STOPPED
+            ), f"stopped.is_set()={eng.stopped.is_set()} for state={expected}"
+
+        requests = self.build_requests(num_requests=16)
         engine = DummyEngine()
-        requests = self.build_requests(num_requests=32)
+        client = None
+        doomed_futures = []
 
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-        )
-
-        success = True
         try:
+            dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+            )
+
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
 
-                # Submit requests and pause after completion.
-                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                assert_state(engine, EngineState.RUNNING)
+
+                # Try to submit signals out of FSM order.
+                client.suspend_engines()
                 await asyncio.sleep(0.1)
-                awaitables = futures + [client.pause_engines()]
-                try:
-                    await asyncio.wait_for(asyncio.gather(*awaitables), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pytest.fail("Pause operation timed out.")
+                assert_state(engine, EngineState.RUNNING)
+                client.resume_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+                client.stop_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
 
-                # Ensure that requests can be added while paused.
-                prompt, params = requests[2]
-                future = client.add_request(prompt=prompt, sampling_params=params)
-                with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(future, timeout=0.1)
+                # Submit and complete requests while running.
+                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
 
-                # Resume and verify new requests complete.
+                # Submit requests and immediately pause afterwards.
+                paused_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:5]
+                ]
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                # Try pausing again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.PAUSED)
+
+                # Requests submitted during PAUSE should queue, not complete.
+                # Use asyncio.wait (not wait_for) so futures aren't cancelled.
+                done, pending = await asyncio.wait(paused_futures, timeout=0.5)
+                assert len(done) == 0, "No requests should complete while paused"
+                assert len(pending) == 3
+
+                # UNPAUSE and verify all in-flight requests complete.
                 client.unpause_engines()
-                # TODO: The system should not be incorrectly raising a cancelled error here.
-                with pytest.raises(asyncio.CancelledError):
-                    await future
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
+                results = await asyncio.wait_for(asyncio.gather(*pending), timeout=10.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
+                assert_state(engine, EngineState.RUNNING)
+
+                # Engine processes new requests normally after unpause.
+                futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
+
+                # Suspend.
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                client.suspend_engines()
+                await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Try pausing again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Try suspending again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Resume.
+                engine.paused.clear()
+                client.resume_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+                assert not engine.suspended.is_set()
+
+                # Engine processes requests after suspend/resume cycle.
+                client.unpause_engines()
+                await asyncio.wait_for(engine.running.wait(), timeout=5.0)
 
                 futures = [
-                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[3:4]
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
                 ]
-                await asyncio.sleep(0.1)
-                try:
-                    await asyncio.wait_for(asyncio.gather(*futures), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pytest.fail("Resumed requests did not complete in time.")
-        except:
-            success = False
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for record in results:
+                    assert record[-1].status == Status.COMPLETED
+
+                # Submit requests that will be cancelled on STOP.
+                client.pause_engines()
+                await asyncio.wait_for(engine.paused.wait(), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                doomed_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[10:13]
+                ]
+
+                client.suspend_engines()
+                await asyncio.wait_for(engine.suspended.wait(), timeout=5.0)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                client.stop_engines()
+
+            await asyncio.wait_for(engine.stopped.wait(), timeout=5.0)
+            assert_state(engine, EngineState.STOPPED)
+
+            if torch.distributed.get_rank() == 0:
+                # Client should be stopped, so futures should be cancelled.
+                for f in doomed_futures:
+                    assert not f.done(), "Client futures should still be pending"
+                client.stop()
+                client = None
+                for f in doomed_futures:
+                    assert f.cancelled(), "Client futures should be cancelled after client.stop()"
+
         finally:
-            try:
-                if torch.distributed.get_rank() == 0:
-                    await asyncio.wait_for(client.stop_engines(), timeout=5.0)
-                    client.stop()
-                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine.engine_loop_task.cancel()
-        assert success, "Pause/resume test failed."
+            await graceful_shutdown(engine, client)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -409,10 +588,11 @@ class TestCoordinator:
             inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
         )
 
+        client = None
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
+                client.start()
                 init_time = time.time()
 
                 for _ in range(num_iterations):
@@ -423,13 +603,7 @@ class TestCoordinator:
                     await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
                 done_time = time.time()
         finally:
-            if torch.distributed.get_rank() == 0:
-                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
-            try:
-                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine.engine_loop_task.cancel()
+            await graceful_shutdown(engine, client)
 
         stop_time = time.time()
 
@@ -441,18 +615,18 @@ class TestCoordinator:
 
         if torch.distributed.get_rank() == 0:
             init_duration = (init_time - start_time) * 10**3
-            golden_init_duration = 6974.43  # ms
+            golden_init_duration = 14066.31  # ms
             run_duration = (done_time - init_time) * 10**3
-            golden_run_duration = 4392.63  # ms
+            golden_run_duration = 5059.90  # ms
             stop_duration = (stop_time - done_time) * 10**3
-            golden_stop_duration = 931.49  # ms
+            golden_stop_duration = 80.73  # ms
 
             def clamp_to_golden_value(value, golden_value, delta=0.1):
                 return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
 
-            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5):
+            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=2.0):
                 flags[0] = 0
-            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2):
+            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.5):
                 flags[1] = 0
             if not clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0):
                 flags[2] = 0

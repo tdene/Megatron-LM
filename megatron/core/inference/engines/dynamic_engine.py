@@ -12,6 +12,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum, auto
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -103,6 +104,19 @@ DEPRECATED_ARGS = [
     "inference_logging_step_interval",
     "pg_collection",
 ]
+
+
+class EngineState(Enum):
+    """State machine for the inference engine."""
+
+    RUNNING = auto()  # Processing requests
+    PAUSING = auto()  # PAUSE received; waiting for EP consensus + world barrier
+    PAUSED = auto()  # Globally confirmed idle
+    SUSPENDING = auto()  # SUSPEND received; offloading GPU; waiting for world barrier
+    SUSPENDED = auto()  # GPU offloaded, all ranks confirmed
+    RESUMING = auto()  # RESUME received; onloading GPU; waiting for world barrier
+    STOPPING = auto()  # STOP received; futures cancelled; waiting for world barrier
+    STOPPED = auto()  # All ranks confirmed; teardown complete
 
 
 class EngineSuspendedError(Exception):
@@ -248,12 +262,13 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self.running = asyncio.Event()
+        self.running.set()
         self.paused = asyncio.Event()
+        self.suspended = asyncio.Event()
         self.stopped = asyncio.Event()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
-        self.suspend_signal = False
-        self.is_suspended = False
+        self.state = EngineState.RUNNING
+        self._pending_signals = deque()
+
         self.resume_request_ids = None
 
         # Coordinator state.
@@ -399,7 +414,7 @@ class DynamicInferenceEngine(AbstractEngine):
             "pip install msgpack"
         )
 
-        self.zmq_context = zmq.Context().instance()
+        self.zmq_context = zmq.Context()
         self.zmq_sockets = []  # keep track of all sockets created by this engine
 
         # Get world info.
@@ -521,6 +536,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.zmq_context, process_group=self.pg_collection.ep
             )
 
+        # initialize zmq-based world communicator for consensus barriers
+        total_world_size = torch.distributed.get_world_size()
+        if total_world_size > 1:
+            world_group = torch.distributed.new_group()
+            self.world_zmq_communicator = AsyncZMQCommunicator(
+                self.zmq_context, process_group=world_group
+            )
+
         if launch_inference_coordinator and self.is_dp_coordinator:
             await await_process_call(
                 coordinator_ready_event.wait, self.inference_coordinator_process
@@ -600,11 +623,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
 
-        # Skip if already suspended, which can happen when using the inference
-        # coordinator.
-        if self.is_suspended:
+        # Skip if already suspended or in the process of suspending.
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = True
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -634,14 +655,16 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id in recompute_active_ids:
             self.requests[request_id].record.checkpoint()
 
+        # In the coordinator path, the state is already handled.
+        if not self.use_coordinator:
+            self.state = EngineState.SUSPENDED
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        # Skip if not suspended, which can happen when using the inference
-        # coordinator.
-        if not self.is_suspended:
+        # Skip if not suspended or in the process of suspending.
+        if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
-        self.is_suspended = False
 
         # Resume.
         with self.__class__.suspend_resume_ctx(
@@ -682,6 +705,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             )
         )
+
+        # In the coordinator path, the state is already handled.
+        if not self.use_coordinator:
+            self.state = EngineState.RUNNING
 
         # Notify event loop.
         self._loop.call_soon_threadsafe(asyncio.create_task, self._notify_cond_for_new_request())
@@ -1214,7 +1241,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
 
         # If suspended, no stepping.
-        if self.is_suspended:
+        if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.step_count)
 
         # schedule requests
@@ -1583,14 +1610,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 all_messages = []
 
         range_pop()
-        for message in all_messages:
+        # We need to put the messages in a queue so that we can break after control signals.
+        self._pending_signals.extend(all_messages)
+
+        while self._pending_signals:
+            message = self._pending_signals.popleft()
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
-
-            if self.received_stop:
-                assert (
-                    header == Headers.STOP_ACK
-                ), "Engine is shutting down. No other messages allowed except STOP_ACK."
 
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
@@ -1598,62 +1624,126 @@ class DynamicInferenceEngine(AbstractEngine):
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
+
             elif header == Headers.PAUSE:
-                # Pause thyself.
-                self.received_pause = True
-                self.running.clear()
-                # Send PAUSE_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.PAUSE_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.STOP:
-                # Stop thyself.
-                self.received_stop = True
-                self.running.clear()
-                # Send STOP_ACK back to coordinator.
-                if self.is_mp_coordinator:
-                    payload = msgpack.packb([Headers.STOP_ACK.value], use_bin_type=True)
-                    self.socket_for_receiving_requests.send(payload)
-            elif header == Headers.PAUSE_ACK:
-                self.paused.set()
-                self.received_pause = False
-            elif header == Headers.STOP_ACK:
-                self.stopped.set()
-                self.received_stop = False
+                if self.state == EngineState.RUNNING:
+                    self.state = EngineState.PAUSING
+                    self.running.clear()
+                # Any other state can safely ignore PAUSE.
+                break
+
             elif header == Headers.UNPAUSE:
+                assert self.state == EngineState.PAUSED, f"Received UNPAUSE in state {self.state}"
+                self.state = EngineState.RUNNING
                 self.paused.clear()
                 self.running.set()
+                break
+
             elif header == Headers.SUSPEND:
-                self.suspend_signal = True
+                assert self.state == EngineState.PAUSED, f"Received SUSPEND in state {self.state}"
+                self.suspend()
+                self.state = EngineState.SUSPENDING
+                break
+
             elif header == Headers.RESUME:
-                self.suspend_signal = False
+                assert self.state == EngineState.SUSPENDED, f"Received RESUME in state {self.state}"
+                self.suspended.clear()
+                self.resume()
+                self.state = EngineState.RESUMING
+                break
+
             elif header == Headers.INCREMENT_STALENESS:
                 waiting = set(self.waiting_request_ids)
                 for request_id, entry in self.requests.items():
                     entry.record.increment_staleness(policy_only=request_id in waiting)
+
             elif header == Headers.STOP:
-                self.received_stop = True
+                assert self.state in (
+                    EngineState.PAUSED,
+                    EngineState.SUSPENDED,
+                ), f"Received STOP in state {self.state}"
+                if self.state == EngineState.SUSPENDED:
+                    self.suspended.clear()
+                self.state = EngineState.STOPPING
+                break
+
             else:
                 raise UnknownHeaderError(header)
 
         return len(all_messages)
 
-    def stop(self):
-        """
-        Stops the inference engine by terminating the inference coordinator process
-        if it exists, and destroys the model parallel state.
-        This method ensures that any running inference coordinator subprocess
-        is properly terminated, and cleans up resources associated with
-        model parallelism.
-        """
+    async def shutdown(self, immediate: bool = False):
+        """Shut down the engine and clean up ZMQ resources.
 
-        if hasattr(self, "inference_coordinator_process"):
-            self.inference_coordinator_process.join()
-        for socket in self.zmq_sockets:
-            socket.close()
+        When immediate=False (called from the engine loop's finally block), just does ZMQ cleanup.
+
+        When immediate=True (external emergency shutdown), cancels the engine loop task directly.
+        Cancellation is our last resort when we can't rely on EP all-reduce or world barriers:
+        peer ranks may already be dead.
+
+        This method does NOT touch the coordinator process. It must be terminated separately.
+
+        Args:
+            immediate: Cancel the engine task instead of draining gracefully.
+        """
+        task = getattr(self, 'engine_loop_task', None)
+
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            if immediate:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            else:
+                # Inject synthetic signals to cooperatively drain all engines.
+                if self.state == EngineState.RUNNING:
+                    self._pending_signals.append(
+                        msgpack.packb([Headers.PAUSE.value], use_bin_type=True)
+                    )
+                if self.state not in (EngineState.STOPPING, EngineState.STOPPED):
+                    # It is insufficient to wait for `paused.wait()`, because that may
+                    # trigger inside RESUMING or SUSPENDING, which cannot transition to STOPPED.
+                    while self.state not in (
+                        EngineState.PAUSED,
+                        EngineState.SUSPENDED,
+                        EngineState.STOPPING,
+                        EngineState.STOPPED,
+                    ):
+                        await asyncio.sleep(0.01)
+                    if self.state in (EngineState.PAUSED, EngineState.SUSPENDED):
+                        self._pending_signals.append(
+                            msgpack.packb([Headers.STOP.value], use_bin_type=True)
+                        )
+                await task
+
+        self.state = EngineState.STOPPED
+
+        # Cleanup the request futures.
+        for entry in self.requests.values():
+            if not entry.future.done():
+                entry.future.cancel()
+
+        # ZMQ cleanup; designed to be idempotent.
+        sock = getattr(self, 'socket_for_receiving_requests', None)
+        if sock is not None and not sock.closed:
+            try:
+                sock.send(msgpack.packb([Headers.DISCONNECT.value], use_bin_type=True))
+            except Exception:
+                pass
+        for socket in getattr(self, 'zmq_sockets', []):
+            socket.close(linger=0)
+        if hasattr(self, 'zmq_sockets'):
+            self.zmq_sockets.clear()
         if hasattr(self, "expert_parallel_zmq_communicator"):
             self.expert_parallel_zmq_communicator.close()
-        self.zmq_context.term()
+        if hasattr(self, "world_zmq_communicator"):
+            self.world_zmq_communicator.close()
+        if not self.zmq_context.closed:
+            self.zmq_context.term()
+
+        # Set the stopped state at the very end.
+        self.stopped.set()
 
     @trace_async_exceptions
     async def run_engine(self, *, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -1666,7 +1756,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            not self.is_suspended
+                            self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
@@ -1677,118 +1767,115 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
-    async def _ep_group_has_work(self, local_work: int) -> bool:
-        """Determines if there are some pending requests in the expert parallel group this
-        rank is a part of.
+    async def _ep_group_has_work(self, local_work: int) -> int:
+        """All-reduce max of local work counts across the EP group.
+
+        The caller is responsible for passing the right value based on engine state:
+        - RUNNING: pass actual local_pending count (>= 0)
+        - PAUSING: pass -1 (this rank wants to stop stepping)
+
+        Returns the global max. Callers interpret the result:
+        - > 0: at least one EP peer has work (step or dummy forward)
+        - == 0: all RUNNING peers are idle (no step needed)
+        - == -1: all EP peers are PAUSING (consensus reached)
+
         Args:
-            local_work (int): The local work count for this rank. This is a sum of active
-            and waiting requests.
+            local_work (int): The local work count for this rank, or -1 if PAUSING.
         Returns:
-            bool: True if there is some work in the EP group, False otherwise.
+            int: The max work count across the EP group.
         """
         range_push("_ep_group_has_work")
 
-        is_stopped = self.stopped.is_set() or self.received_stop
-        is_paused = self.paused.is_set() or self.received_pause
-        is_suspended = self.suspend_signal
-        if is_stopped or is_paused or is_suspended:
-            # Signals can be received asynchronously on EP ranks.
-            # We do not want a rank to pause/stop/suspend prematurely if one of it's peers
-            # is yet to receive the signal.
-            # So this is an *attempt* to process the signal. This rank has received the signal
-            # and passes 0 to the all-reduce. If any other rank in the EP group has not received the signal yet,
-            # it will pass a non-zero value to the all-reduce, and hence the global work will be non-zero,
-            # and we will defer processing the signal.
-            # When all ranks receive the signal, global work will be zero, and we can process the signal safely.
-            local_work = 0
-
         if self.ep_world_size > 1:
-            # Perform all-reduce to get max global work across EP group.
-            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
-            # The user may have other tasks running in the event loop that need to be serviced.
-            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop is megatron-rl.
             max_global_work = await self.expert_parallel_zmq_communicator.all_reduce_max(local_work)
         else:
             max_global_work = local_work
 
         range_pop()
-        return max_global_work > 0
+        return max_global_work
+
+    async def _world_barrier(self):
+        """World-wide ZMQ all-reduce barrier for global rank consensus.
+
+        Used for all state transitions that require global synchronization:
+        PAUSING → PAUSED, SUSPENDING → SUSPENDED, RESUMING → PAUSED,
+        and STOPPING → STOPPED.
+
+        No-op when world_size == 1 (communicator is not created).
+        """
+        range_push("world_barrier")
+        if hasattr(self, 'world_zmq_communicator'):
+            await self.world_zmq_communicator.all_reduce_max(1)
+        range_pop()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
         self, *, loop: Optional[asyncio.AbstractEventLoop] = None
     ):
-        """Continually steps the engine asynchronously."""
+        """Continually steps the engine asynchronously.
+
+        State-dependent behavior:
+        - RUNNING: EP all-reduce to check for work, then step or idle.
+        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
+        - SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
+        - STOPPED: Teardown and exit.
+        """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+
         try:
             while True:
                 self.schedule_requests()
 
-                # for the cases below (no active requests, or undergoing a state-change)
-                # do not use asyncio.sleep(0)
-                # as tp-rank=0 will flood the num_messages publisher
-                # with "0" repeatedly. This causes some packets to drop.
-                # Instead be nice, and sleep
-                # for a short time.
-                # The minimum sleep time needed is ~100us i.e. the time
-                # needed to send one message on an IPC socket. However
-                # just to be safe, we use 20ms here.
+                if self.state in (EngineState.RUNNING, EngineState.PAUSING):
+                    local_pending = self.context.get_active_request_count() + len(
+                        self.waiting_request_ids
+                    )
+                    ep_report = local_pending if self.state == EngineState.RUNNING else -1
+                    ep_work = await self._ep_group_has_work(ep_report)
 
-                local_pending_requests = self.context.get_active_request_count() + len(
-                    self.waiting_request_ids
-                )
-                # 1. Check for work availability (Consensus Step)
-                ep_group_has_work = await self._ep_group_has_work(local_pending_requests)
-
-                # 2. Dummy Work Logic (Keep group alive if peers have work)
-                if ep_group_has_work and local_pending_requests == 0:
-                    # run dummy forward pass if EP group as a whole has work,
-                    # but this rank does not have any work.
-                    self.step_start_event.record()
-                    self.controller.dummy_forward()
-                    self.step_end_event.record()
-                    self.step_end_event.synchronize()
-                    self.step_count += 1
-                    continue
-
-                # 3. No work in EP group
-                # We handle control signals (PAUSE/STOP/SUSPEND) only when
-                # the entire EP group has received the signal. It is important to
-                # not process these signals immediately upon receipt, because
-                # other ranks in the EP group may not have received them yet.
-                # If we exit prematurely, other ranks will deadlock at the all-to-all.
-                # We use self._ep_group_has_work() to build consensus across the EP group
-                # as to when it is safe to process these signals. The function returns False
-                # when all ranks have received the signal.
-                if not ep_group_has_work:
-                    # Priority A: STOP
-                    if self.stopped.is_set():
-                        if self.rank == 0:
-                            logging.info("Stopping engine.")
-                        self.stop()
-                        break
-
-                    # Priority B: SUSPEND
-                    if self.suspend_signal:
-                        self.suspend()
+                    if ep_work > 0:
+                        # At least one EP peer has work.
+                        if local_pending > 0 and self.state == EngineState.RUNNING:
+                            await self.async_step()
+                        else:
+                            # Dummy forward to participate in the EP collective.
+                            self.step_start_event.record()
+                            self.controller.dummy_forward()
+                            self.step_end_event.record()
+                            self.step_end_event.synchronize()
+                            self.step_count += 1
+                    elif ep_work == -1:
+                        # All EP peers are PAUSING.
+                        await self._world_barrier()
+                        self.state = EngineState.PAUSED
+                        self.paused.set()
                     else:
-                        self.resume()
+                        # All EP peers have 0 work.
+                        await asyncio.sleep(0.02)
 
-                    # Priority C: PAUSE or no work - nothing needs to be done
-                    # To avoid flooding the TP publisher socket with packets,
-                    # we sleep for 20 ms here.
-                    # todo [Siddharth]: Can this hardcoded sleep be avoided
-                    # with asyncio zmq sockets?
-                    await asyncio.sleep(0.02)  # Yield to event loop
-                    continue
-
-                try:
-                    await self.async_step()
-                except EngineSuspendedError:
+                elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)
-                    continue
 
-        except asyncio.CancelledError:
-            pass
+                elif self.state == EngineState.SUSPENDING:
+                    await self._world_barrier()
+                    self.state = EngineState.SUSPENDED
+                    self.suspended.set()
+
+                elif self.state == EngineState.SUSPENDED:
+                    await asyncio.sleep(0.02)
+
+                elif self.state == EngineState.RESUMING:
+                    await self._world_barrier()
+                    self.state = EngineState.PAUSED
+                    self.paused.set()
+
+                elif self.state == EngineState.STOPPING:
+                    await self._world_barrier()
+                    if self.rank == 0:
+                        logging.info("Stopping engine.")
+                    break
+
+        finally:
+            await self.shutdown()
