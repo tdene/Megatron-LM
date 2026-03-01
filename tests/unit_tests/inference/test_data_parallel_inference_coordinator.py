@@ -5,6 +5,7 @@ import itertools
 import multiprocessing
 import os
 import time
+import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
@@ -110,13 +111,10 @@ class DummyEngine(DynamicInferenceEngine):
         self.resume_request_ids = None
         self.use_coordinator = False
 
-        # Default for EP world size (overwritten during
-        # start_listening_to_data_parallel_coordinator).
         self.ep_world_size = 1
 
-        # CUDA events used by run_engine_with_coordinator for timing.
-        self.step_start_event = torch.cuda.Event(enable_timing=True)
-        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.step_start_event = unittest.mock.MagicMock()
+        self.step_end_event = unittest.mock.MagicMock()
         self.step_count = 0
 
     async def run_engine_with_coordinator(self, *, loop=None):
