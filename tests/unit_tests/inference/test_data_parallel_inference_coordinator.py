@@ -9,7 +9,6 @@ import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
-import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -107,7 +106,8 @@ class DummyEngine(DynamicInferenceEngine):
         for attr in self._STATE_EVENTS.values():
             setattr(self, attr, asyncio.Event())
         self.running.set()
-        self._pending_signals = deque()
+        self.microbatch_processing_event = asyncio.Event()
+        self.microbatch_not_empty = asyncio.Event()
         self.resume_request_ids = None
         self.use_coordinator = False
 
@@ -172,10 +172,11 @@ class DummyEngine(DynamicInferenceEngine):
                 to_remove.append(request_id)
                 # Send signal to coordinator.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                    self._isend(
+                        self.socket_for_receiving_requests,
+                        Headers.ENGINE_REPLY,
+                        [entry.record.serialize()],
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -200,7 +201,7 @@ class DummyEngine(DynamicInferenceEngine):
 async def cleanup_engine(engine, client=None, timeout=30.0):
     """Disconnect an engine between tests. The coordinator stays alive.
 
-    PAUSE is injected into each rank's _pending_signals rather than sent through the coordinator.
+    PAUSE is injected into each rank's pending_microbatch rather than sent through the coordinator.
     This avoids state-mismatch bugs: the shared coordinator's state may differ from the engine's
     (e.g. the coordinator is PAUSED from a previous test while the engine is RUNNING).
     """
@@ -208,12 +209,10 @@ async def cleanup_engine(engine, client=None, timeout=30.0):
     if task is not None and not task.done():
         # Inject PAUSE locally so every rank transitions to PAUSED without
         # relying on the coordinator's current state.
-        engine._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
+        engine.pending_microbatch.append((Headers.PAUSE, None))
+        engine.microbatch_processing_event.set()
+        engine.microbatch_not_empty.set()
         await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
-
-        sub = getattr(engine, 'model_parallel_num_msgs_subscriber_socket', None)
-        if sub is not None:
-            sub.setsockopt(zmq.RCVTIMEO, 1000)
 
         task.cancel()
         try:
@@ -294,9 +293,9 @@ def coordinator():
         ctx = zmq.Context()
         sock = ctx.socket(zmq.DEALER)
         sock.connect(dp_addr)
-        sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-        sock.recv()  # CONNECT_ACK
-        sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+        sock.send_multipart([Headers.CLIENT_CONNECT.value.to_bytes()])
+        sock.recv_multipart()  # ACK
+        sock.send_multipart([Headers.SHUTDOWN.value.to_bytes()])
         sock.close(linger=1000)
         ctx.term()
         proc.join(timeout=10.0)
@@ -536,7 +535,9 @@ class TestCoordinator:
                     assert not f.done(), "Client futures should still be pending"
 
             # Inject STOP directly so we don't kill the shared coordinator.
-            engine._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
+            engine.pending_microbatch.append((Headers.STOP, None))
+            engine.microbatch_processing_event.set()
+            engine.microbatch_not_empty.set()
 
             await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
             assert_state(engine, EngineState.STOPPED)
