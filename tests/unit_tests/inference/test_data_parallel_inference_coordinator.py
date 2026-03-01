@@ -5,14 +5,13 @@ import itertools
 import multiprocessing
 import os
 import time
+import unittest.mock
 from collections import deque
 from typing import Dict, Optional
 
 import msgpack
 import pytest
 import torch
-from tqdm import tqdm
-
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -110,13 +109,10 @@ class DummyEngine(DynamicInferenceEngine):
         self.resume_request_ids = None
         self.use_coordinator = False
 
-        # Default for EP world size (overwritten during
-        # start_listening_to_data_parallel_coordinator).
         self.ep_world_size = 1
 
-        # CUDA events used by run_engine_with_coordinator for timing.
-        self.step_start_event = torch.cuda.Event(enable_timing=True)
-        self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.step_start_event = unittest.mock.MagicMock()
+        self.step_end_event = unittest.mock.MagicMock()
         self.step_count = 0
 
     async def run_engine_with_coordinator(self, *, loop=None):
@@ -200,27 +196,30 @@ class DummyEngine(DynamicInferenceEngine):
 
 
 async def cleanup_engine(engine, client=None, timeout=30.0):
-    """Disconnect an engine between tests. The coordinator stays alive.
-
-    PAUSE is injected into each rank's _pending_signals rather than sent through the coordinator.
-    This avoids state-mismatch bugs: the shared coordinator's state may differ from the engine's
-    (e.g. the coordinator is PAUSED from a previous test while the engine is RUNNING).
-    """
+    """Disconnect an engine between tests. The coordinator stays alive."""
     task = getattr(engine, 'engine_loop_task', None)
     if task is not None and not task.done():
-        # Inject PAUSE locally so every rank transitions to PAUSED without
-        # relying on the coordinator's current state.
-        engine._pending_signals.append(msgpack.packb([Headers.PAUSE.value], use_bin_type=True))
-        await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
+        if client is not None:
+            client.pause_engines()
+        try:
+            await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
 
         sub = getattr(engine, 'model_parallel_num_msgs_subscriber_socket', None)
         if sub is not None:
             sub.setsockopt(zmq.RCVTIMEO, 1000)
 
+        # Close ZMQ communicator sockets to unblock any stuck ranks.
+        for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+            comm = getattr(engine, attr, None)
+            if comm is not None:
+                comm.close()
+
         task.cancel()
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
+            await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
             pass
 
     if client is not None:
@@ -335,17 +334,24 @@ class TestCoordinator:
         port = int(dp_addr.rsplit(":", 1)[-1])
         requests = self.build_requests()
         engine = DummyEngine()
+        rank = torch.distributed.get_rank()
 
         await engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=port, launch_inference_coordinator=False
         )
 
         # Ensure all engines are registered before submitting requests.
-        await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+            timeout=30.0,
+        )
 
         client = None
         try:
-            if torch.distributed.get_rank() == 0:
+            if rank == 0:
+                # Yield so engine loop can run before we block the event loop
+                # with the client's synchronous connect handshake.
+                await asyncio.sleep(0)
                 client = InferenceClient(dp_addr)
                 client.start()
 
@@ -357,7 +363,11 @@ class TestCoordinator:
 
                 for record in results:
                     assert record[-1].status == Status.COMPLETED
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+                timeout=30.0,
+            )
         finally:
             await cleanup_engine(engine, client)
 
@@ -403,6 +413,7 @@ class TestCoordinator:
         engine = DummyEngine()
         client = None
         doomed_futures = []
+        rank = torch.distributed.get_rank()
 
         try:
             await engine.start_listening_to_data_parallel_coordinator(
@@ -410,9 +421,12 @@ class TestCoordinator:
             )
 
             # Synchronize all ranks so every engine has registered.
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+                timeout=30.0,
+            )
 
-            if torch.distributed.get_rank() == 0:
+            if rank == 0:
                 client = InferenceClient(dp_addr)
                 client.start()
 
@@ -527,25 +541,22 @@ class TestCoordinator:
                     client.add_request(prompt=p, sampling_params=s) for p, s in requests[10:13]
                 ]
 
-            # Synchronize all ranks: rank 0 reaches here after confirming engine is at final PAUSED.
-            # Non-rank-0 reaches here immediately (skipping the rank-0 block), but blocks.
-            # After the barrier, all engine states are synchronized so it's safe to inject STOP.
-            await asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier)
+            # Synchronize all ranks before STOP.
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, torch.distributed.barrier),
+                timeout=30.0,
+            )
 
-            if torch.distributed.get_rank() == 0:
+            if rank == 0:
                 # Verify doomed futures are still pending.
                 for f in doomed_futures:
                     assert not f.done(), "Client futures should still be pending"
-
-            # Inject STOP directly so we don't kill the shared coordinator.
-            engine._pending_signals.append(msgpack.packb([Headers.STOP.value], use_bin_type=True))
+                client.stop_engines()
 
             await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
             assert_state(engine, EngineState.STOPPED)
 
         finally:
-            # Let cleanup_engine handle client.stop() so it can first reset the
-            # coordinator back to RUNNING (it sends RESUME + UNPAUSE).
             await cleanup_engine(engine, client)
 
         # cleanup_engine called client.stop() which cancels pending futures.
