@@ -57,7 +57,7 @@ async def _run_flask_server(
 
     # Create and start the client locally inside this process
     inference_client = InferenceClient(coordinator_addr)
-    await inference_client.start()
+    inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
     try:

@@ -81,14 +81,6 @@ if __name__ == "__main__":
 
         engine = get_dynamic_inference_engine()
 
-        try:
-            asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port)
-            )
-        except KeyboardInterrupt:
-            # Catching at the top level ensures clean stdout without spamming the traceback
-            print("Server process interrupted by user.")
-        finally:
-            # Clean up PyTorch distributed groups properly
-            if torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
+        asyncio.run(
+            run_text_generation_server(engine, args.inference_coordinator_port, args.port)
+        )
