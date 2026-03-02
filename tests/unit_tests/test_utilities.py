@@ -92,6 +92,16 @@ class Utils:
         if not Utils.inited:
             return
         torch.distributed.barrier()
+
+        # Destroy process groups to release NCCL communicators.
+        # parallel_state.destroy_model_parallel() drops Python references by setting globals to None
+        # but does not actually destroy the process groups, so communicators accumulate across
+        # sequential test cases. On AWS EFA nodes this exhausts resources and causes hangs in
+        # new_group().
+        default_pg = torch.distributed.distributed_c10d._world.default_pg
+        for pg in list(torch.distributed.distributed_c10d._world.pg_map.keys()):
+            if pg != default_pg:
+                torch.distributed.destroy_process_group(pg)
         ps.destroy_model_parallel()
         Utils.inited = False
 
