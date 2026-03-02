@@ -42,38 +42,58 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import AsyncOpenAI
+        from openai import APIConnectionError, AsyncOpenAI
         client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
 
-        # Things that may be problematic when doign this switch
-        # - Add BOS token
-        # - Skip prompt logprobs
-        response = await client.chat.completions.create(
-            model="",
-            messages=[message.model_dump() for message in request.prompt],
-            temperature=request.generation_args.temperature or 1.0,
-            top_p=request.generation_args.top_p or 0.0,
-            n=1,
-            logprobs=True,
-            extra_body={
-                "skip_prompt_log_probs": True,
-                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
-            },
-        )
+        # Submit request (returns immediately with status="queued")
+        # TODO: Remove APIConnectionError retry once #3648 is merged.
+        # The Flask server shares the event loop with training, so it can't
+        # accept connections while synchronous GPU ops block the loop.
+        max_retries = 10
+        for attempt in range(max_retries):
+            try:
+                response = await client.responses.create(
+                    background=True,
+                    input=[message.model_dump() for message in request.prompt],
+                    model="",
+                    temperature=request.generation_args.temperature or 1.0,
+                    top_p=request.generation_args.top_p or 0.0,
+                    extra_body={
+                        "logprobs": True,
+                        "skip_prompt_log_probs": True,
+                        "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+                    },
+                )
+                break
+            except APIConnectionError:
+                if attempt == max_retries - 1:
+                    raise
+                logger.warning(f"Connection error on submit (attempt {attempt + 1}/{max_retries}), retrying...")
+                await asyncio.sleep(1.0)
 
-        choice = response.choices[0]
+        # Poll until completed
+        while response.status != "completed":
+            if response.status == "failed":
+                raise RuntimeError(f"Inference request {response.id} failed: {getattr(response, 'error', 'unknown error')}")
+            await asyncio.sleep(1.0)
+            try:
+                response = await client.responses.retrieve(response.id)
+            except APIConnectionError:
+                # TODO: Remove once #3648 is merged.
+                logger.warning("Connection error on poll, retrying...")
+                continue
 
         return InferenceResponse(
             # TODO: Handle tool calls and reasoning in LLMChatMessage
-            response=LLMChatMessage(**choice.message.model_dump(include={'role', 'content'})),
-            raw_text=choice.raw_text,
-            token_ids=choice.prompt_token_ids + choice.generation_token_ids,
-            logprobs=choice.generation_log_probs,
-            prompt_length=len(choice.prompt_token_ids),
-            policy_staleness=choice.policy_staleness,
-            kv_cache_staleness=choice.kv_cache_staleness,
+            response=LLMChatMessage(**response.message),
+            raw_text=response.raw_text,
+            token_ids=response.prompt_token_ids + response.generation_token_ids,
+            logprobs=response.generation_log_probs,
+            prompt_length=len(response.prompt_token_ids),
+            policy_staleness=response.policy_staleness,
+            kv_cache_staleness=response.kv_cache_staleness,
             completed_at_step=args.curr_iteration,
-            num_evictions=getattr(choice, 'num_evictions', 0),
+            num_evictions=getattr(response, 'num_evictions', 0),
         )
 
     @classmethod
@@ -111,7 +131,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         else:
             client = None
             server_task = None
-            
+
         launched_server = cls(**kwargs)
         launched_server._client = client
         launched_server._server_task = server_task
