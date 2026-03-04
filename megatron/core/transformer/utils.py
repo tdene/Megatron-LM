@@ -434,6 +434,30 @@ def toggle_cuda_graphs(model, set_to="none"):
                             delattr(module[0], "cudagraph_manager")
 
 
+def transition_moe_to_partial_cudagraphs(model):
+    """
+    Switch MoE layers to partial CUDA graph capture for training.
+    Delegates to MoETransformerLayer.transition_cudagraph_scope('partial') on each layer.
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.transition_cudagraph_scope('partial')
+
+
+def transition_moe_to_full_cudagraphs(model):
+    """Switch MoE layers to full-layer cudagraph capture for inference.
+
+    Delegates to MoETransformerLayer.transition_cudagraph_scope('full') on each layer.
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.transition_cudagraph_scope('full')
+
+
 def is_layer_window_attention(
     window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
 ) -> bool:
