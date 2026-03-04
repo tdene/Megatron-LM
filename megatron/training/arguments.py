@@ -2317,7 +2317,7 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
+    group.add_argument('--rl-parallel-generation-tasks', type=int, default=512,
                         help='Number of parallel generation tasks for RL inference.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
