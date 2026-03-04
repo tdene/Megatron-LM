@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
 from megatron.core import mpu
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
@@ -36,8 +37,7 @@ from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.utils import (
     toggle_cuda_graphs,
-    transition_moe_to_full_cudagraphs,
-    transition_moe_to_partial_cudagraphs,
+    transition_moe_cudagraphs,
 )
 from megatron.core.inference.utils import set_decode_expert_padding
 from megatron.core.resharding.refit import swap_model_weights
@@ -653,13 +653,28 @@ def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=Fa
     """
 
     args = get_args()
-    # Ensure packed_seq_params is always provided for CUDA graph signature consistency
-    if packed_seq_params is None and sequence_packing:
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=tokens.shape[1],
-            max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
-            device=tokens.device,
-        )
+    # Ensure packed_seq_params is always provided for CUDA graph signature consistency.
+    # When sequence_packing is enabled, construct from packing config (max_sequences_per_bin).
+    # When sequence_packing is disabled, construct a single-sequence default so the CUDA
+    # graph signature matches the training forward_step in train_rl.py.
+    # This is necessary because reference logprobs steps will reuse the training forward graph.
+    if packed_seq_params is None:
+        if sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     nvtx_range = get_nvtx_range()
 
@@ -1843,7 +1858,7 @@ def megatron_rl_inference_mode(
 
     # Switch MoE layers to full CUDA graph capture for inference
     if args.rl_training_cuda_graphs and args.num_experts is not None:
-        transition_moe_to_full_cudagraphs(lang_module)
+        transition_moe_cudagraphs(lang_module, 'full')
 
     lang_module.eval()
     # If this is a separate RL inference model with offloading enabled, ensure weights are on GPU
@@ -1905,7 +1920,7 @@ def megatron_rl_inference_mode(
 
         # Switch MoE layers to partial CUDA graph capture for training
         if args.rl_training_cuda_graphs and args.num_experts is not None:
-            transition_moe_to_partial_cudagraphs(lang_module)
+            transition_moe_cudagraphs(lang_module, 'partial')
 
         # If this is a separate RL inference model, prefetch weights back to CPU so they
         # don't consume GPU memory during training.
