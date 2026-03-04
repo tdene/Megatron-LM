@@ -128,7 +128,6 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         # Connection pool limits configured here to support massive concurrency
-        # TODO(ksanthanam): Make this configurable?
         concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
