@@ -3,7 +3,9 @@
 import asyncio
 import logging
 
+import httpx
 import torch.distributed as dist
+from openai import APIConnectionError, AsyncOpenAI, DefaultAioHttpClient
 from pydantic import PrivateAttr
 
 from megatron.core.inference.config import KVCacheManagementMode
@@ -23,7 +25,7 @@ from ..inference.inference_interface import (
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
-
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -31,45 +33,30 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     host: str
     port: int
 
-    _server_task: asyncio.Task = PrivateAttr(None)
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
-    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None)
+    _rl_kv_cache_management_mode: KVCacheManagementMode = PrivateAttr(None) 
+    _openai_client: AsyncOpenAI = PrivateAttr(None)
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
-
-        assert self._server_task is not None, "Inference server is not initialized"
         tokenizer = get_tokenizer()
         args = get_args()
 
-        from openai import APIConnectionError, AsyncOpenAI
-        client = AsyncOpenAI(base_url=f"http://{self.host}:{self.port}", api_key="NONE")
+        # Use the shared, optimized client instead of spinning up a new one
+        client = self._openai_client
 
-        # Submit request (returns immediately with status="queued")
-        # TODO: Remove APIConnectionError retry once #3648 is merged.
-        # The Flask server shares the event loop with training, so it can't
-        # accept connections while synchronous GPU ops block the loop.
-        max_retries = 10
-        for attempt in range(max_retries):
-            try:
-                response = await client.responses.create(
-                    background=True,
-                    input=[message.model_dump() for message in request.prompt],
-                    model="",
-                    temperature=request.generation_args.temperature or 1.0,
-                    top_p=request.generation_args.top_p or 0.0,
-                    extra_body={
-                        "logprobs": True,
-                        "skip_prompt_log_probs": True,
-                        "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
-                    },
-                )
-                break
-            except APIConnectionError:
-                if attempt == max_retries - 1:
-                    raise
-                logger.warning(f"Connection error on submit (attempt {attempt + 1}/{max_retries}), retrying...")
-                await asyncio.sleep(1.0)
+        response = await client.responses.create(
+            background=True,
+            input=[message.model_dump() for message in request.prompt],
+            model="",
+            temperature=request.generation_args.temperature or 1.0,
+            top_p=request.generation_args.top_p or 0.0,
+            extra_body={
+                "logprobs": True,
+                "skip_prompt_log_probs": True,
+                "add_BOS": (not args.rl_skip_bos_token and tokenizer.bos is not None),
+            },
+        )
 
         # Poll until completed
         while response.status != "completed":
@@ -117,32 +104,52 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         if dist.get_rank() == 0:
-            from megatron.core.inference.text_generation_server.dynamic_text_gen_server.flask_server import run_flask_server_on_client
-            loop = asyncio.get_event_loop()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import start_text_gen_server
+
             client = InferenceClient(inference_coordinator_address=dp_addr)
             client.start()
-            server_task = loop.create_task(run_flask_server_on_client(
-                client=client,
+
+            start_text_gen_server(
+                coordinator_addr=dp_addr,
                 tokenizer=inference_engine.controller.tokenizer,
-                flask_port=kwargs.get('port', 8294),
+                rank=dist.get_rank(),
+                server_port=kwargs.get('port', 8294),
                 parsers=[],
                 verbose=kwargs.get('verbose', False),
-            ))
+            )
         else:
             client = None
-            server_task = None
 
         launched_server = cls(**kwargs)
         launched_server._client = client
-        launched_server._server_task = server_task
         launched_server._inference_engine = inference_engine
         launched_server._rl_kv_cache_management_mode = KVCacheManagementMode(
             args.rl_kv_cache_management_mode
         )
 
+        # Connection pool limits configured here to support massive concurrency
+        # TODO(ksanthanam): Make this configurable?
+        concurrency_limit = args.grpo_prompts_per_step * args.grpo_group_size * args.rl_parallel_generation_tasks
+        custom_limits = httpx.Limits(
+            max_connections=concurrency_limit,
+            max_keepalive_connections=concurrency_limit
+        )
+        http_client = DefaultAioHttpClient(limits=custom_limits)
+
+        launched_server._openai_client = AsyncOpenAI(
+            base_url=f"http://{launched_server.host}:{launched_server.port}",
+            api_key="NONE",
+            max_retries=0,
+            http_client=http_client
+        )
+
         return launched_server
 
     async def kill(self):
+        # Gracefully close the shared OpenAI client connections
+        if self._openai_client is not None:
+            await self._openai_client.close()
+
         if dist.get_rank() == 0:
             self._client.pause_engines()
         await self._inference_engine.wait_until(EngineState.PAUSED)
@@ -154,6 +161,8 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
             self._client.stop()
+            from megatron.core.inference.text_generation_server.dynamic_text_gen_server import stop_text_gen_server
+            stop_text_gen_server()
 
     def increment_staleness(self):
         if dist.get_rank() == 0:

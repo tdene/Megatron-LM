@@ -1,8 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import concurrent.futures
 import logging
-import threading
 import time
 import traceback
 import uuid
@@ -13,48 +11,40 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 logger = logging.getLogger(__name__)
 
-# Module-level storage for pending requests, guarded by a lock.
-_pending_requests = {}
-_pending_lock = threading.Lock()
+
+def _serialize_result(record):
+    """Serialize an inference result into a plain dict suitable for cross-process sharing."""
+    result = record if isinstance(record, dict) else record.serialize()
+    # Unwrap ("tensor", [...]) tuples from serialize() into plain lists.
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in result.items()
+    }
 
 
-def _submit_request(client, prompt_tokens, sampling_params):
-    """Submit a request on the main event loop, returning a concurrent.futures.Future.
-
-    client.add_request() creates an asyncio.Future on asyncio.get_running_loop().
-    Flask handlers run in worker threads (via AsyncioWSGIMiddleware) with ephemeral
-    event loops that die after the handler returns. We fix this by scheduling
-    add_request() on the main event loop (client._loop) where _recv_task lives,
-    and bridging the result to a concurrent.futures.Future that works cross-thread.
-    """
-    result_future = concurrent.futures.Future()
-
-    def _submit():
+def _on_future_done(future, response_id, shared_requests):
+    """Callback fired when the inference future completes. Writes the result to shared state."""
+    try:
+        record = future.result()
+        result = _serialize_result(record)
+        # Manager dict requires full reassignment for nested updates.
+        entry = dict(shared_requests[response_id])
+        entry['status'] = 'completed'
+        entry['result'] = result
+        shared_requests[response_id] = entry
+    except Exception as e:
+        logger.error(f"Response {response_id} failed: {e}")
         try:
-            asyncio_future = client.add_request(prompt_tokens, sampling_params)
-
-            def _on_done(f):
-                if result_future.done():
-                    return
-                if f.cancelled():
-                    result_future.cancel()
-                    return
-                exc = f.exception()
-                if exc is not None:
-                    result_future.set_exception(exc)
-                else:
-                    result_future.set_result(f.result())
-
-            asyncio_future.add_done_callback(_on_done)
-        except Exception as e:
-            result_future.set_exception(e)
-
-    client._loop.call_soon_threadsafe(_submit)
-    return result_future
+            entry = dict(shared_requests[response_id])
+            entry['status'] = 'failed'
+            entry['error'] = str(e)
+            shared_requests[response_id] = entry
+        except Exception:
+            logger.error(f"Failed to update shared state for {response_id}: {traceback.format_exc()}")
 
 
 try:
-    from flask import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, current_app, jsonify, request
 
     bp = Blueprint('responses_api', __name__)
 
@@ -66,8 +56,9 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
         verbose = current_app.config['verbose']
+        shared_requests = current_app.config['shared_requests']
 
-        req = request.get_json()
+        req = await request.get_json()
 
         # --- 1. Parse Messages (from 'input' field, Responses API convention) ---
         messages = req.get("input")
@@ -130,27 +121,31 @@ try:
             return jsonify({"error": f"Invalid sampling parameter: {e}"}), 400
 
         # --- 3. Submit Request to Engine (non-blocking) ---
-        # Schedule on the main event loop so the future survives beyond this handler.
-        future = _submit_request(client, prompt_tokens, sampling_params)
+        future = client.add_request(prompt_tokens, sampling_params)
 
         response_id = str(uuid.uuid4())
+        created_at = int(time.time())
 
-        with _pending_lock:
-            _pending_requests[response_id] = {
-                "future": future,
-                "sampling_params": sampling_params,
-                "request_body": req,
-                "parsers": parsers,
-                "tokenizer": tokenizer,
-                "verbose": verbose,
-                "created_at": int(time.time()),
-            }
+        # Store request metadata in shared cross-process dict.
+        # The result will be written by _on_future_done when the future completes.
+        shared_requests[response_id] = {
+            "status": "queued",
+            "sampling_params": sampling_params,
+            "request_body": req,
+            "created_at": created_at,
+        }
+
+        # When the future resolves, write the result to shared state so any
+        # process can serve the GET poll.
+        future.add_done_callback(
+            lambda f: _on_future_done(f, response_id, shared_requests)
+        )
 
         return jsonify({
             "id": response_id,
             "object": "response",
             "status": "queued",
-            "created_at": int(time.time()),
+            "created_at": created_at,
             "model": "EMPTY",
             "output": [],
             "tools": [],
@@ -162,34 +157,31 @@ try:
     @bp.route('/v1/responses/<response_id>', methods=['GET'])
     async def get_response(response_id):
         """Poll for the result of a previously submitted inference request."""
-        with _pending_lock:
-            entry = _pending_requests.get(response_id)
+        shared_requests = current_app.config['shared_requests']
+        tokenizer = current_app.config['tokenizer']
+        parsers = current_app.config['parsers']
+        verbose = current_app.config['verbose']
+
+        entry = shared_requests.get(response_id)
 
         if entry is None:
             return jsonify({"error": "Response not found", "id": response_id}), 404
 
-        future = entry["future"]
-        sampling_params = entry["sampling_params"]
-        req = entry["request_body"]
-        parsers = entry["parsers"]
-        tokenizer = entry["tokenizer"]
-        verbose = entry["verbose"]
+        # Convert Manager proxy to a regular dict for local access.
+        entry = dict(entry)
+        status = entry["status"]
 
-        # Check for exceptions first.
-        # Don't pop on error — keep the entry so retries get a stable "failed"
-        # response instead of 404.
-        if future.done() and future.exception() is not None:
-            exc = future.exception()
-            logger.error(f"Response {response_id} failed: {exc}")
+        # --- Failed ---
+        if status == "failed":
             return jsonify({
                 "id": response_id,
                 "object": "response",
                 "status": "failed",
-                "error": str(exc),
+                "error": entry.get("error", "unknown error"),
             }), 200
 
-        # Check if future is done
-        if not future.done():
+        # --- Still in progress ---
+        if status == "queued":
             return jsonify({
                 "id": response_id,
                 "object": "response",
@@ -202,27 +194,15 @@ try:
                 "parallel_tool_calls": True,
             }), 200
 
-        # --- Done: format response ---
-        try:
-            record = future.result()
-        except Exception as e:
-            logger.error(f"Response {response_id} failed collecting result: {e}")
-            return jsonify({
-                "id": response_id,
-                "object": "response",
-                "status": "failed",
-                "error": str(e),
-            }), 200
+        # --- Completed: format response ---
+        sampling_params = entry["sampling_params"]
+        req = entry["request_body"]
+        result = entry["result"]
 
         try:
-            result = record.merge().serialize()
-            result = {
-                k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
-                for k, v in result.items()
-            }
-            prompt_tokens = result["prompt_tokens"]
+            prompt_tokens_out = result["prompt_tokens"]
             text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens) if prompt_tokens is not None else 0
+            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
 
             logprobs_content = None
             if sampling_params.return_log_probs:
@@ -275,7 +255,6 @@ try:
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", None)
-            return_log_probs = sampling_params.return_log_probs
 
             response_data = {
                 "id": response_id,
@@ -292,7 +271,7 @@ try:
                 "generation_token_ids": result["generated_tokens"],
                 "generation_log_probs": result["generated_log_probs"],
                 "raw_text": result["prompt"] + result["generated_text"],
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
+                "logprobs": {"content": logprobs_content} if sampling_params.return_log_probs else None,
                 "finish_reason": (
                     "tool_calls" if metadata.get("tool_calls", []) else "stop"
                 ),
@@ -328,11 +307,13 @@ try:
                 "error": str(e),
             }), 200
 
-        # Clean up only on success
-        with _pending_lock:
-            _pending_requests.pop(response_id, None)
+        # Clean up shared state on successful retrieval
+        try:
+            del shared_requests[response_id]
+        except KeyError:
+            pass
 
         return jsonify(response_data)
 
 except ImportError as e:
-    logger.warning(f"Could not import flask: {e}")
+    logger.warning(f"Could not import quart: {e}")
