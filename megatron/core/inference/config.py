@@ -276,6 +276,10 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    request_bookkeeping_lag: int = -1
+    """How many forward steps bookkeeping is allowed to fall behind.
+    -1 means unlimited. 0 means synchronous (no overlap)."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple

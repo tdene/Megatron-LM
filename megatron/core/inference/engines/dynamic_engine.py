@@ -223,6 +223,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
+        self.request_bookkeeping_lag = inference_config.request_bookkeeping_lag
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.cuda_graph_impl = model_config.cuda_graph_impl
@@ -292,6 +293,12 @@ class DynamicInferenceEngine(AbstractEngine):
         self._loop = get_asyncio_loop(getattr(self, "_loop", None))
         self._cond = asyncio.Condition()
         self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        # lag < 0 -> unbounded (asyncio maxsize=0)
+        # lag == 0 -> maxsize=1 (special synchronous join() after each put)
+        # lag > 0 -> maxsize=lag (with no synchronous join at all)
+        if (query_maxsize := self.request_bookkeeping_lag) == 0:
+            queue_maxsize = 1
+        self._bookkeep_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_maxsize)
         self.state = EngineState.RUNNING
         self._state_events[EngineState.RUNNING].set()
         self._pending_signals = deque()
@@ -616,7 +623,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
-        self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
+        self._engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
 
         return dp_addr
 
@@ -1784,8 +1791,18 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
-        # Keep for compatibility with current test suite.
         return ret
+
+    @trace_async_exceptions
+    async def _bookkeep_loop(self):
+        """Continuously dequeue forward results and run bookkeeping."""
+        try:
+            while self.state != EngineState.STOPPED:
+                step_data = await self._bookkeep_queue.get()
+                await self.async_bookkeep(*step_data)
+                self._bookkeep_queue.task_done()
+        except asyncio.CancelledError:
+            pass
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
@@ -2000,6 +2017,13 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         self.state = EngineState.STOPPED
 
+        # Await the engine loop task.
+        await self._engine_loop_task
+
+        # Drain the bookkeeping queue.
+        await self._bookkeep_queue.join()
+        await self._bookkeep_task
+
         # Cleanup the request futures.
         for entry in self.requests.values():
             if not entry.future.done():
@@ -2031,22 +2055,26 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
         try:
             while True:
-                # Wait until there are active requests before proceeding.
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
-                            self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
+                            self.state
+                            not in (EngineState.SUSPENDED, EngineState.SUSPENDING)
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
                             )
                         )
                     )
-                await self.async_step()
+                step_data = await self.async_forward()
+                await self._bookkeep_queue.put(step_data)
+                if self.request_bookkeeping_lag == 0:
+                    await self._bookkeep_queue.join()
         except asyncio.CancelledError:
-            pass
+            self._bookkeep_task.cancel()
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
@@ -2120,14 +2148,15 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously.
 
         State-dependent behavior:
-        - RUNNING: EP all-reduce to check for work, then step or idle.
-        - PAUSING: EP all-reduce to reach consensus, then world barrier.
+        - RUNNING: EP all-reduce to check for work, then forward or idle.
+        - PAUSING: EP all-reduce to reach consensus, drain bookkeep queue, then world barrier.
         - PAUSED / SUSPENDED: Idle-sleep, wait for signals via schedule_requests().
         - UNPAUSING / SUSPENDING / RESUMING / STOPPING: World barrier, then transition.
         - STOPPED: Teardown and exit.
         """
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = True
+        self._bookkeep_task = self._loop.create_task(self._bookkeep_loop())
 
         try:
             while True:
@@ -2142,14 +2171,18 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                     if all_pausing:
-                        # All EP peers are PAUSING: pause immediately.
+                        # All EP peers are PAUSING: drain bookkeep, then pause.
+                        await self._bookkeep_queue.join()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_pending > 0:
-                            await self.async_step()
+                            step_data = await self.async_forward()
+                            await self._bookkeep_queue.put(step_data)
+                            if self.request_bookkeeping_lag == 0:
+                                await self._bookkeep_queue.join()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
