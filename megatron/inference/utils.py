@@ -351,6 +351,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,
+        request_bookkeeping_lag=args.inference_request_bookkeeping_lag,
     )
 
 
