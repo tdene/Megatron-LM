@@ -106,7 +106,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
                 policy_staleness=[response.policy_staleness],
                 kv_cache_staleness=[response.kv_cache_staleness],
-                completed_at_step=[response.completed_at_step],
                 num_evictions=[response.num_evictions],
             )
         else:
@@ -117,7 +116,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 problem_id=golden['problem_id'] if 'problem_id' in golden else None,
                 policy_staleness=[response.policy_staleness],
                 kv_cache_staleness=[response.kv_cache_staleness],
-                completed_at_step=[response.completed_at_step],
                 num_evictions=[response.num_evictions],
             )
 

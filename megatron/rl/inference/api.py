@@ -25,5 +25,4 @@ class InferenceResponse(BaseModel):
     logprobs: list[float] | None = None
     policy_staleness: list[int]
     kv_cache_staleness: list[int]
-    completed_at_step: int
     num_evictions: int
