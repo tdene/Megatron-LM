@@ -755,11 +755,11 @@ def to_empty_if_meta_device(module: torch.nn.Module, *, device: torch.device, re
 
 def get_nvtx_range():
     """Create an NVTX range context manager.
-    
+
     Returns a context manager that:
     - Creates an NVTX range for profiling (nsight-systems compatible)
     - Optionally tracks time via Megatron timers when time=True
-    
+
     Args (for returned context manager):
         msg: Name of the range/timer
         time: If True, also track with Megatron timers (default: False)

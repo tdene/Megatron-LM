@@ -1085,12 +1085,12 @@ def pretrain(
                 profile_dir = os.path.join(args.save, 'profiles')
             else:
                 profile_dir = './profiles'
-        
+
         # Generate run ID from job name or timestamp
         run_id = os.getenv("SLURM_JOB_ID", None)
         if run_id is None:
             run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         initialize_rl_profiler(
             output_dir=profile_dir,
             run_id=run_id,
@@ -2244,20 +2244,20 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
-        
+
         # Compute tokens/sec metrics for logging
         tokens_per_sec = None
         tokens_per_sec_per_gpu = None
         actual_tokens_per_sec = None
         actual_tokens_per_sec_per_gpu = None
         packing_efficiency = None
-        
+
         if hasattr(args, 'seq_length') and args.seq_length > 0:
             # Compute tokens (includes padding for consistency with tensor shapes)
             tokens_per_iteration = batch_size * args.seq_length
             tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
             tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
-            
+
             # For sequence packing, also compute actual tokens (non-padding)
             if has_rl_utils and getattr(args, 'perform_rl_step', False) and getattr(args, 'rl_use_sequence_packing', False):
                 runtime_state = rl_utils.get_rl_runtime_state()
@@ -2265,17 +2265,17 @@ def training_log(
                     # Get actual tokens from packing context
                     actual_tokens = rl_utils.get_packing_actual_tokens(runtime_state.packing_context)
                     compute_tokens = rl_utils.get_packing_compute_tokens(runtime_state.packing_context)
-                    
+
                     # Scale to global batch (all DP ranks)
                     actual_tokens_global = actual_tokens * mpu.get_data_parallel_world_size()
-                    
+
                     actual_tokens_per_sec = actual_tokens_global / elapsed_time_per_iteration
                     actual_tokens_per_sec_per_gpu = actual_tokens_per_sec / args.world_size
                     packing_efficiency = rl_utils.get_packing_efficiency(runtime_state.packing_context)
-                    
+
                     # Update runtime state with token counts
                     runtime_state.update_token_counts(actual_tokens, compute_tokens)
-            
+
             # Add tokens/sec to log string
             log_string += f' toks/s: {tokens_per_sec:.0f} |'
             log_string += f' toks/s/gpu: {tokens_per_sec_per_gpu:.0f} |'

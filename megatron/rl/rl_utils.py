@@ -324,7 +324,7 @@ class RLRuntimeState:
 
     def update_token_counts(self, actual_tokens: int, compute_tokens: int):
         """Update token counts for the current iteration.
-        
+
         Args:
             actual_tokens: Number of real tokens (non-padding)
             compute_tokens: Number of total tokens including padding
@@ -527,7 +527,7 @@ def get_environment_rollouts(
                     "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
             with nvtx_range("rl/offload/optimizer-state", time=True):
                 optimizer.offload_to_cpu()
-             
+
     # If we have separate training and inference models we to refit weights from the training model to the inference model.
     has_separate_inference_model = inference_model is not None
     if has_separate_inference_model:
@@ -1437,7 +1437,7 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
-            with torch.no_grad(), nvtx_range("compute_old_logprobs", time=True):
+            with torch.no_grad(), nvtx_range("compute-old-logprobs", time=True):
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,

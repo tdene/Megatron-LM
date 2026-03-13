@@ -44,7 +44,7 @@ RL_TIMER_NAMES = [
     "optimizer",
     "rl/rollout-collection",
     "rl/prepare-data-for-update",
-    
+
     # Rollout collection breakdown
     "rl/inference-setup",
     "rl/build-cuda-graphs",
@@ -52,7 +52,7 @@ RL_TIMER_NAMES = [
     "rl/sync-rollouts",
     "rl/suspend-engine",
     "rl/wait-for-decode-only",
-    
+
     # Optimizer offload/restore (canonical names)
     "rl/offload-optimizer-before-inference",
     "rl/restore-optimizer-after-inference",
@@ -64,11 +64,11 @@ RL_TIMER_NAMES = [
     "rl/restore/grad-buffers",
     "rl/restore/optimizer-state",
     "rl/restore/wait-for-transfers",
-    
+
     # Weight prefetching
     "rl/prefetch-weights-to-gpu",
     "rl/prefetch-weights-to-cpu",
-    
+
     # Data preparation breakdown
     "rl/compute-group-stats",
     "rl/prepare-advantages",
@@ -81,7 +81,7 @@ RL_TIMER_NAMES = [
     "rl/log-wandb-tb",
     "pack_sequences",
     "regather_trajectories",
-    
+
     # Logprobs computation
     "rl/compute-logprobs",
     "rl/compute-old-logprobs",
@@ -89,11 +89,11 @@ RL_TIMER_NAMES = [
     "rl/get-logprobs",
     "rl/forward-pass",
     "rl/log-softmax",
-    
+
     # Training
     "rl/train/forward",
     "rl/train/grpo-loss",
-    
+
     # Gradient sync
     "embedding-grads-all-reduce",
     "all-grads-sync",
@@ -107,7 +107,7 @@ RL_TIMER_NAMES = [
 TIMER_HIERARCHY = {
     "rl/rollout-collection": [
         "rl/inference-setup",
-        "rl/collect-rollouts", 
+        "rl/collect-rollouts",
         "rl/sync-rollouts",
         "rl/suspend-engine",
         "rl/offload-optimizer-before-inference",
@@ -160,12 +160,12 @@ class IterationProfile:
     actual_tokens_per_sec: Optional[float] = None
     actual_tokens_per_sec_per_gpu: Optional[float] = None
     packing_efficiency: Optional[float] = None
-    
+
     # Computed metrics
     load_imbalance: Dict[str, float] = field(default_factory=dict)  # timer -> max/min ratio
     # Rank0 times (for detailed analysis - rank0 is typically the coordinator)
     rank0_timers: Dict[str, float] = field(default_factory=dict)  # timer_name -> rank0_ms
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         result = {
@@ -180,27 +180,27 @@ class IterationProfile:
             "actual_tokens_per_sec_per_gpu": self.actual_tokens_per_sec_per_gpu,
             "packing_efficiency": self.packing_efficiency,
         }
-        
+
         # Flatten timer data
         for name, (min_t, max_t) in self.timers.items():
             safe_name = name.replace("/", "_").replace("-", "_")
             result[f"timer_{safe_name}_min_ms"] = min_t
             result[f"timer_{safe_name}_max_ms"] = max_t
-        
+
         # Add rank0 timer values
         for name, rank0_t in self.rank0_timers.items():
             safe_name = name.replace("/", "_").replace("-", "_")
             result[f"timer_{safe_name}_rank0_ms"] = rank0_t
-        
+
         # Add load imbalance metrics
         for name, ratio in self.load_imbalance.items():
             safe_name = name.replace("/", "_").replace("-", "_")
             result[f"imbalance_{safe_name}"] = ratio
-            
+
         return result
 
 
-@dataclass 
+@dataclass
 class RunSummary:
     """Aggregated statistics across all iterations in a run."""
     run_id: str
@@ -208,7 +208,7 @@ class RunSummary:
     end_time: str
     num_iterations: int
     world_size: int
-    
+
     # Per-timer aggregated stats
     timer_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # Format: timer_name -> {"mean", "min", "max", "std", "p50", "p95", "p99"}
@@ -217,13 +217,13 @@ class RunSummary:
 class RLProfiler:
     """
     Profiling infrastructure for RL training.
-    
+
     Collects timer data at each iteration and provides:
     - Per-iteration JSONL logging
     - End-of-run CSV summary
     - Integration with WandB/TensorBoard
     """
-    
+
     def __init__(
         self,
         output_dir: Optional[str] = None,
@@ -235,7 +235,7 @@ class RLProfiler:
     ):
         """
         Initialize the RL Profiler.
-        
+
         Args:
             output_dir: Directory to write profiling data. If None, uses LANGRL_LOG_DIR or ./profiles
             run_id: Unique identifier for this run. If None, generates from timestamp
@@ -248,7 +248,7 @@ class RLProfiler:
         self.log_to_wandb = log_to_wandb
         self.log_to_tensorboard = log_to_tensorboard
         self.timer_names = timer_names or RL_TIMER_NAMES
-        
+
         # Determine output directory
         if output_dir:
             self.output_dir = Path(output_dir)
@@ -258,44 +258,44 @@ class RLProfiler:
                 self.output_dir = Path(env_dir) / "profiles"
             else:
                 self.output_dir = Path("./profiles")
-        
+
         # Generate run ID
         if run_id:
             self.run_id = run_id
         else:
             self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
+
         self.start_time = datetime.now().isoformat()
-        
+
         # Storage for iteration data
         self.iteration_profiles: List[IterationProfile] = []
         self._timer_history: Dict[str, List[float]] = defaultdict(list)  # For stats
-        
+
         # File handles (lazy init)
         self._jsonl_file = None
         self._initialized = False
-        
+
     def _ensure_initialized(self):
         """Lazy initialization of output files (only on rank 0)."""
         if self._initialized:
             return
-            
+
         # Only rank 0 writes files
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank != 0:
             self._initialized = True
             return
-            
+
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Open JSONL file for streaming writes
         jsonl_path = self.output_dir / f"profile_{self.run_id}.jsonl"
         self._jsonl_file = open(jsonl_path, "w")
-        
+
         logger.info(f"[RLProfiler] Writing profiles to {jsonl_path}")
         self._initialized = True
-        
+
     def log_iteration(
         self,
         iteration: int,
@@ -314,7 +314,7 @@ class RLProfiler:
     ):
         """
         Log profiling data for a single iteration.
-        
+
         Args:
             iteration: Current training iteration
             timers: Megatron Timers object
@@ -332,23 +332,23 @@ class RLProfiler:
         """
         if not self.enabled:
             return
-            
+
         self._ensure_initialized()
-        
+
         # Collect timer data (min, max across ranks) and rank0 times
         timer_data, rank0_timers = self._collect_timer_data(timers)
-        
+
         # Warn if no timer data was collected (might indicate timing issue)
         if not timer_data:
             logger.warning(f"[RLProfiler] No timer data collected for iteration {iteration}. "
                           "Timers may have been reset before profiling.")
-        
+
         # Compute load imbalance metrics
         load_imbalance = {}
         for name, (min_t, max_t) in timer_data.items():
             if min_t > 0:
                 load_imbalance[name] = max_t / min_t
-        
+
         # Create profile
         profile = IterationProfile(
             iteration=iteration,
@@ -365,28 +365,28 @@ class RLProfiler:
             load_imbalance=load_imbalance,
             rank0_timers=rank0_timers,
         )
-        
+
         self.iteration_profiles.append(profile)
-        
+
         # Track history for summary stats
         for name, (_, max_t) in timer_data.items():
             self._timer_history[name].append(max_t)
-        
+
         # Write to JSONL (rank 0 only)
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0 and self._jsonl_file:
             self._jsonl_file.write(json.dumps(profile.to_dict()) + "\n")
             self._jsonl_file.flush()
-        
+
         # Log to WandB/TensorBoard
         if self.log_to_wandb and wandb_writer:
             self._log_to_wandb(profile, wandb_writer, iteration, extra_metrics)
         if self.log_to_tensorboard and tb_writer:
             self._log_to_tensorboard(profile, tb_writer, iteration, extra_metrics)
-            
+
     def _collect_timer_data(self, timers) -> Tuple[Dict[str, Tuple[float, float]], Dict[str, float]]:
         """Collect min/max timer data across ranks and rank0 times.
-        
+
         Returns:
             Tuple of:
                 - Dict mapping timer_name -> (min_ms, max_ms) across all ranks
@@ -398,68 +398,68 @@ class RLProfiler:
             reset=False,  # Don't reset - let the main logging code handle that
             barrier=False,
         )
-        
+
         if rank_name_to_time is None:
             return {}, {}
-        
+
         # Convert from seconds to milliseconds
         normalizer = 1000.0  # seconds -> ms
-        
+
         # Extract min/max and rank0 times
         name_to_min_max = {}
         rank0_timers = {}
-        
+
         for i, name in enumerate(self.timer_names):
             # Get times for all ranks for this timer
             rank_times = rank_name_to_time[:, i].tolist()
             # Filter out zeros (timers that weren't active)
             active_times = [t for t in rank_times if t > 0.0]
-            
+
             if active_times:
                 min_time = min(active_times) * normalizer
                 max_time = max(active_times) * normalizer
                 name_to_min_max[name] = (min_time, max_time)
-            
+
             # Get rank0's time specifically (index 0)
             rank0_time = rank_times[0] * normalizer if rank_times else 0.0
             if rank0_time > 0:
                 rank0_timers[name] = rank0_time
-        
+
         return name_to_min_max, rank0_timers
-        
+
     def _log_to_wandb(
-        self, 
-        profile: IterationProfile, 
-        wandb_writer, 
+        self,
+        profile: IterationProfile,
+        wandb_writer,
         iteration: int,
         extra_metrics: Optional[Dict[str, float]] = None,
     ):
         """Log timer metrics to WandB."""
         metrics = {}
-        
+
         # Log max times for each timer (most relevant for optimization)
         for name, (min_t, max_t) in profile.timers.items():
             metrics[f"profile/{name}_max_ms"] = max_t
             metrics[f"profile/{name}_min_ms"] = min_t
-            
+
             # Log imbalance for timers with significant spread
             if name in profile.load_imbalance and profile.load_imbalance[name] > 1.1:
                 metrics[f"profile/{name}_imbalance"] = profile.load_imbalance[name]
-        
+
         # Log aggregated phase times
         phase_times = self._compute_phase_times(profile)
         for phase, time_ms in phase_times.items():
             metrics[f"profile/phase_{phase}_ms"] = time_ms
-            
+
         if extra_metrics:
             metrics.update(extra_metrics)
-            
+
         wandb_writer.log(metrics, step=iteration)
-        
+
     def _log_to_tensorboard(
-        self, 
-        profile: IterationProfile, 
-        tb_writer, 
+        self,
+        profile: IterationProfile,
+        tb_writer,
         iteration: int,
         extra_metrics: Optional[Dict[str, float]] = None,
     ):
@@ -467,65 +467,65 @@ class RLProfiler:
         # Log max times for each timer
         for name, (min_t, max_t) in profile.timers.items():
             tb_writer.add_scalar(f"profile/{name}_max_ms", max_t, iteration)
-            
+
         # Log phase times
         phase_times = self._compute_phase_times(profile)
         for phase, time_ms in phase_times.items():
             tb_writer.add_scalar(f"profile/phase_{phase}_ms", time_ms, iteration)
-            
+
         if extra_metrics:
             for key, value in extra_metrics.items():
                 tb_writer.add_scalar(key, value, iteration)
-                
+
     def _compute_phase_times(self, profile: IterationProfile) -> Dict[str, float]:
         """Compute high-level phase times from detailed timers."""
         timers = profile.timers
         phases = {}
-        
+
         # Helper to get max time safely
         def get_max(name: str) -> float:
             return timers.get(name, (0, 0))[1]
-        
+
         # Rollout generation (actual generation, not container)
         phases["rollout_generation"] = get_max("rl/collect-rollouts")
-        
+
         # Optimizer memory management
         phases["optimizer_offload"] = get_max("rl/offload-optimizer-before-inference")
         phases["optimizer_restore"] = get_max("rl/restore-optimizer-after-inference")
         phases["optimizer_memory_mgmt"] = phases["optimizer_offload"] + phases["optimizer_restore"]
-        
+
         # Logprobs computation
         phases["logprobs_old"] = get_max("rl/compute-old-logprobs")
         phases["logprobs_ref"] = get_max("rl/compute-ref-logprobs")
         phases["logprobs_total"] = phases["logprobs_old"] + phases["logprobs_ref"]
-        
+
         # Training
         phases["training"] = get_max("forward-backward")
-        
+
         # Wait/sync time (proxy for load imbalance)
         phases["sync_wait"] = get_max("rl/suspend-engine") + get_max("rl/sync-rollouts")
-        
+
         return phases
-        
+
     def export_summary(self, output_path: Optional[str] = None) -> Optional[str]:
         """
         Export aggregated summary statistics to CSV.
-        
+
         Args:
             output_path: Path for CSV output. If None, uses default in output_dir.
-            
+
         Returns:
             Path to the exported CSV file, or None if no data.
         """
         if not self.enabled or not self._timer_history:
             return None
-            
+
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank != 0:
             return None
-            
+
         self._ensure_initialized()
-        
+
         # Compute statistics for each timer
         stats = {}
         for name, values in self._timer_history.items():
@@ -543,24 +543,24 @@ class RLProfiler:
                 "p99": sorted_values[int(n * 0.99)] if n >= 100 else sorted_values[-1],
                 "count": n,
             }
-        
+
         # Write CSV
         if output_path:
             csv_path = Path(output_path)
         else:
             csv_path = self.output_dir / f"summary_{self.run_id}.csv"
-            
+
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "timer_name", "mean_ms", "std_ms", "min_ms", "max_ms", 
+                "timer_name", "mean_ms", "std_ms", "min_ms", "max_ms",
                 "p50_ms", "p95_ms", "p99_ms", "count"
             ])
             for name in self.timer_names:
                 if name in stats:
                     s = stats[name]
                     writer.writerow([
-                        name, 
+                        name,
                         f"{s['mean']:.2f}",
                         f"{s['std']:.2f}",
                         f"{s['min']:.2f}",
@@ -570,19 +570,19 @@ class RLProfiler:
                         f"{s['p99']:.2f}",
                         s['count'],
                     ])
-                    
+
         logger.info(f"[RLProfiler] Exported summary to {csv_path}")
         return str(csv_path)
-        
+
     def print_summary(self):
         """Print a summary of timer statistics to stdout."""
         if not self.enabled or not self._timer_history:
             return
-            
+
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank != 0:
             return
-            
+
         print("\n" + "=" * 80)
         print("RL PROFILING SUMMARY")
         print("=" * 80)
@@ -591,7 +591,7 @@ class RLProfiler:
         print("-" * 80)
         print(f"{'Timer Name':<50} {'Mean':>8} {'P95':>8} {'Max':>8}")
         print("-" * 80)
-        
+
         for name in self.timer_names:
             if name not in self._timer_history or not self._timer_history[name]:
                 continue
@@ -602,9 +602,9 @@ class RLProfiler:
             p95 = sorted_values[int(n * 0.95)] if n >= 20 else sorted_values[-1]
             max_v = max(values)
             print(f"{name:<50} {mean:>7.1f}ms {p95:>7.1f}ms {max_v:>7.1f}ms")
-            
+
         print("=" * 80 + "\n")
-        
+
     def close(self):
         """Close file handles and export final summary."""
         if self._jsonl_file:
@@ -631,7 +631,7 @@ def initialize_rl_profiler(
 ) -> RLProfiler:
     """
     Initialize the global RL profiler.
-    
+
     Should be called once at training start.
     """
     global _RL_PROFILER
@@ -661,9 +661,9 @@ def log_iteration_profile(
 ):
     """
     Convenience function to log iteration profile using global profiler.
-    
+
     This is the main entry point for logging timer data.
-    
+
     Args:
         tokens_per_sec: Compute tokens/sec (includes padding in packed sequences)
         tokens_per_sec_per_gpu: Compute tokens/sec per GPU
@@ -739,28 +739,28 @@ def compare_runs(
 ) -> str:
     """
     Compare profiling data across multiple runs.
-    
+
     Args:
         run_paths: List of paths to summary CSV files
         run_names: Optional names for each run (defaults to filenames)
         output_path: Optional path to write comparison CSV
-        
+
     Returns:
         Formatted comparison string
     """
     if run_names is None:
         run_names = [Path(p).stem for p in run_paths]
-    
+
     # Load all summaries
     summaries = []
     for path in run_paths:
         summaries.append(load_summary_csv(path))
-    
+
     # Get all timer names across all runs
     all_timers = set()
     for summary in summaries:
         all_timers.update(summary.keys())
-    
+
     # Build comparison table
     lines = []
     header = f"{'Timer':<50}"
@@ -768,7 +768,7 @@ def compare_runs(
         header += f" {name:>12}"
     lines.append(header)
     lines.append("-" * len(header))
-    
+
     for timer in sorted(all_timers):
         line = f"{timer:<50}"
         for summary in summaries:
@@ -777,51 +777,51 @@ def compare_runs(
             else:
                 line += f" {'N/A':>12}"
         lines.append(line)
-    
+
     result = "\n".join(lines)
-    
+
     if output_path:
         with open(output_path, "w") as f:
             f.write(result)
-    
+
     return result
 
 
 def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
     """
     Analyze a profile to identify top bottlenecks.
-    
+
     Args:
         profile_path: Path to summary CSV file
         top_n: Number of top timers to report
-        
+
     Returns:
         Formatted analysis string
     """
     stats = load_summary_csv(profile_path)
-    
+
     # Sort by mean time (descending)
     sorted_timers = sorted(
-        stats.items(), 
-        key=lambda x: x[1]["mean_ms"], 
+        stats.items(),
+        key=lambda x: x[1]["mean_ms"],
         reverse=True
     )
-    
+
     lines = []
     lines.append("=" * 70)
     lines.append("BOTTLENECK ANALYSIS")
     lines.append("=" * 70)
     lines.append(f"{'Rank':<6} {'Timer':<45} {'Mean':>8} {'P95':>8}")
     lines.append("-" * 70)
-    
+
     for i, (timer, s) in enumerate(sorted_timers[:top_n], 1):
         lines.append(f"{i:<6} {timer:<45} {s['mean_ms']:>7.1f}ms {s['p95_ms']:>7.1f}ms")
-    
+
     # Compute phase breakdown
     lines.append("")
     lines.append("PHASE BREAKDOWN:")
     lines.append("-" * 70)
-    
+
     phases = {
         "Rollout Generation": ["rl/collect-rollouts"],
         "Optimizer Memory Mgmt": [
@@ -835,14 +835,14 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
         "Training": ["forward-backward"],
         "Sync/Wait": ["rl/suspend-engine", "rl/sync-rollouts"],
     }
-    
+
     for phase_name, timer_list in phases.items():
         total = sum(stats.get(t, {}).get("mean_ms", 0) for t in timer_list)
         if total > 0:
             lines.append(f"  {phase_name:<40} {total:>7.1f}ms")
-    
+
     lines.append("=" * 70)
-    
+
     return "\n".join(lines)
 
 
@@ -853,28 +853,28 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
 def main():
     """Command-line interface for profile analysis."""
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="RL Profiling Analysis")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
-    
+
     # analyze command
     analyze_parser = subparsers.add_parser("analyze", help="Analyze a single run")
     analyze_parser.add_argument("profile", help="Path to summary CSV file")
     analyze_parser.add_argument("--top", type=int, default=10, help="Top N bottlenecks")
-    
+
     # compare command
     compare_parser = subparsers.add_parser("compare", help="Compare multiple runs")
     compare_parser.add_argument("profiles", nargs="+", help="Paths to summary CSV files")
     compare_parser.add_argument("--names", nargs="+", help="Names for each run")
     compare_parser.add_argument("--output", help="Output file path")
-    
+
     # list command
     list_parser = subparsers.add_parser("list", help="List iterations in JSONL file")
     list_parser.add_argument("profile", help="Path to JSONL profile file")
     list_parser.add_argument("--last", type=int, default=10, help="Show last N iterations")
-    
+
     args = parser.parse_args()
-    
+
     if args.command == "analyze":
         print(analyze_bottlenecks(args.profile, args.top))
     elif args.command == "compare":
