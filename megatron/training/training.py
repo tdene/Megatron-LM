@@ -65,6 +65,56 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
+# Canonical list of RL timer names to include in timers_to_log.
+# When the profiling branch is merged, this will be imported from rl_profiling
+# as RL_LOGGABLE_TIMER_NAMES instead of being defined here.
+RL_LOGGABLE_TIMER_NAMES = [
+    # Top-level RL phases
+    'rl/rollout-collection',
+    'rl/prepare-data-for-update',
+    # Rollout collection breakdown
+    'rl/inference-setup',
+    'rl/collect-rollouts',
+    'rl/sync-rollouts',
+    'rl/suspend-engine',
+    # Optimizer offload/restore
+    'rl/offload-optimizer-before-inference',
+    'rl/restore-optimizer-after-inference',
+    'rl/offload-kv-cache-after-inference',
+    'rl/restore-kv-cache-before-inference',
+    # Fine-grained offload/restore breakdown
+    'rl/restore/grad-buffers',
+    'rl/restore/optimizer-state',
+    'rl/restore/wait-for-transfers',
+    'rl/offload/grad-buffers',
+    'rl/offload/optimizer-state',
+    # Weight prefetching
+    'rl/prefetch-weights-to-gpu',
+    'rl/prefetch-weights-to-cpu',
+    # Data preparation
+    'rl/compute-group-stats',
+    'rl/prepare-advantages',
+    'rl/prepare-trajectories',
+    'rl/get-ltor-masks',
+    'rl/create-dataloader',
+    'rl/sequence-packing',
+    'rl/align-inference-logprobs',
+    'rl/log-wandb-tb',
+    'rl/pack-sequences',
+    'rl/regather-trajectories',
+    # Logprobs computation
+    'rl/compute-logprobs',
+    'rl/compute-old-logprobs',
+    'rl/compute-ref-logprobs',
+    'rl/get-logprobs',
+    'rl/forward-pass',
+    'rl/log-softmax',
+    # Inference / cuda graphs
+    'rl/build-cuda-graphs',
+    'rl/wait-for-decode-only',
+]
+
 from megatron.rl.parallel_utils import build_inference_pg_collection
 try:
     from modelopt.torch.distill.plugins.megatron import (
@@ -644,6 +694,7 @@ def get_start_time_from_progress_log():
     start_time = None
     start_num_floating_point_operations = None
     latest_num_floating_point_operations = 0
+    latest_num_floating_point_operations_uncommitted = None
 
     def _get_field(string, type):
         return type(string.split(': ')[1])
@@ -655,6 +706,18 @@ def get_start_time_from_progress_log():
             world_size_in_line = _get_field(line_tokens[2], int)
             if line_tokens[3] == "Saved checkpoint":
                 latest_num_floating_point_operations = _get_field(line_tokens[7], float)
+            elif line_tokens[3] == "Saving async checkpoint":
+                # Checkpoint hasn't committed yet, so store for now in a different variable.
+                latest_num_floating_point_operations_uncommitted = _get_field(line_tokens[7], float)
+            elif line_tokens[3] == "Saved async checkpoint":
+                # Checkpoint has committed, so can update latest_num_floating_point_operations to
+                # value from latest 'Saving async checkpoint' message.
+                # Note: latest_num_floating_point_operations_uncommitted can be None if
+                # save_checkpoint was called directly (without save_checkpoint_and_time),
+                # which writes "Saved async checkpoint" but not "Saving async checkpoint".
+                if latest_num_floating_point_operations_uncommitted is not None:
+                    latest_num_floating_point_operations = latest_num_floating_point_operations_uncommitted
+                    latest_num_floating_point_operations_uncommitted = None
             if world_size_in_line != args.world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
@@ -667,6 +730,8 @@ def get_start_time_from_progress_log():
     assert (
         start_time is not None and start_num_floating_point_operations is not None
     ), "Should have seen at least one 'Starting job' entry with same world_size"
+    print_rank_0(f"megatron.training.get_start_time_from_progress_log: "
+                 f"{start_time=}, {start_num_floating_point_operations=}")
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
 
 
@@ -1924,15 +1989,8 @@ def training_log(
             'forward-backward-send-forward-backward-recv',
         ])
     # Add timers from RL loop if needed.
-    if args.perform_rl_step:
-        timers_to_log.extend(['rollout-collection', 'inference-setup', 'collect-rollouts', 'postrollout-gc-collect',
-                              'sync-rollouts', 'prepare-data-for-update', 'compute-group-stats',
-                              'prepare-trajectories', 'get-ltor-masks-and-position-ids', 'create-logprobs-dataloader',
-                              'compute-logprobs', 'compute-ref-logprobs', 'compute-prob-stats',
-                              'prepare-advantages', 'create-dataloader', 'log-wandb-tb',
-                              'offload-optimizer-before-inference', 'onload-kv-cache-before-inference',
-                              'wait-for-decode-only', 'build-cuda-graphs', 'suspend-engine',
-                              'offload-kv-cache-after-inference', 'onload-optimizer-after-inference'])
+    if getattr(args, 'perform_rl_step', False):
+        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
@@ -2857,7 +2915,7 @@ def train(
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
-        if iteration in args.iterations_to_skip:
+        if (iteration + 1) in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
