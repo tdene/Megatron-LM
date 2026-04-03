@@ -1426,8 +1426,6 @@ def validate_args(args, defaults={}):
         assert args.inference_dynamic_batching_block_size % 256 == 0, "block size should be a multiple of 256"
 
     if getattr(args, 'inference_dynamic_batching_autotune', False):
-        assert args.inference_dynamic_batching, \
-            "--inference-dynamic-batching-autotune requires --inference-dynamic-batching"
         try:
             import torch_memory_saver  # noqa: F401
         except ImportError:
@@ -1435,10 +1433,36 @@ def validate_args(args, defaults={}):
                 "--inference-dynamic-batching-autotune requires torch_memory_saver to be "
                 "installed. See https://github.com/fzyzcjy/torch_memory_saver."
             )
-        assert args.cuda_graph_impl != "none", \
-            "--inference-dynamic-batching-autotune requires CUDA graphs to be enabled"
-        assert args.enable_chunked_prefill, \
-            "--inference-dynamic-batching-autotune requires --enable-chunked-prefill"
+
+        # Auto-enable required prerequisites, warn if we had to set them.
+        if args.cuda_graph_impl == "none":
+            warn_rank_0(
+                'Setting --cuda-graph-impl=local (required by --inference-dynamic-batching-autotune).'
+            )
+            args.cuda_graph_impl = "local"
+        if not args.enable_chunked_prefill:
+            warn_rank_0(
+                'Enabling --enable-chunked-prefill (required by --inference-dynamic-batching-autotune).'
+            )
+            args.enable_chunked_prefill = True
+
+        # Warn about arguments that will be overridden by the auto-tuner.
+        overridden_args = {
+            'inference_dynamic_batching_max_requests': '--inference-dynamic-batching-max-requests',
+            'inference_dynamic_batching_max_tokens': '--inference-dynamic-batching-max-tokens',
+            'inference_dynamic_batching_mamba_memory_ratio': '--inference-dynamic-batching-mamba-memory-ratio',
+        }
+        for attr, flag in overridden_args.items():
+            if getattr(args, attr, None) is not None:
+                warn_rank_0(
+                    f'{flag} is set but will be overridden by --inference-dynamic-batching-autotune.'
+                )
+        if args.inference_dynamic_batching_buffer_size_gb != 40.:
+            warn_rank_0(
+                '--inference-dynamic-batching-buffer-size-gb is set but will be overridden '
+                'by --inference-dynamic-batching-autotune (buffer size is auto-determined '
+                'from available GPU memory).'
+            )
 
     if args.cuda_graph_impl == "local" and args.expert_model_parallel_size > 1 and args.transformer_impl != "inference_optimized":
        assert args.moe_pad_experts_for_cuda_graph_inference, \
