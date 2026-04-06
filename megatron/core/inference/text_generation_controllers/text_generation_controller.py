@@ -827,7 +827,7 @@ class TextGenerationController:
                 )
 
         # Refresh active slices of tensors that rewind just mutated.
-        context.build_active_kv_slices(active_request_count)
+        context.build_active_kv_slices(context.padded_active_request_count)
 
     def _sample_from_logits_2d(self, logits_2d: Tensor) -> Tensor:
         """Sample tokens from 2D logits using existing sampling parameters.
