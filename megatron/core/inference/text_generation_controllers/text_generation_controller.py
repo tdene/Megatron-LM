@@ -51,6 +51,7 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.dual_stream import SideDecision
 
 
 # pylint: disable=line-too-long
@@ -668,9 +669,11 @@ class TextGenerationController:
         if self.model_is_pipeline_parallel:
             if context.config.materialize_only_last_token_logits:
                 if self.num_speculative_tokens > 0:
+                    num_prefill_requests = context.active_num_prefill_requests
+                    num_decode_requests = active_request_count - num_prefill_requests
                     logits_seq_len = (
-                        context.num_decode_requests * (self.num_speculative_tokens + 1)
-                        + context.num_prefill_requests
+                        num_decode_requests * (self.num_speculative_tokens + 1)
+                        + num_prefill_requests
                     )
                 else:
                     logits_seq_len = active_request_count
@@ -718,7 +721,7 @@ class TextGenerationController:
                 (indices, *sampling_params) for sampling_params, indices in bucket_map.items()
             ]
 
-    def _rewind_kv_cache(self):
+    def _rewind_kv_cache(self, reservation_pool=None):
         """Update the KV cache bookkeeping for speculative decoding.
 
         After forward pass with speculative tokens, some tokens may be rejected.
@@ -731,7 +734,22 @@ class TextGenerationController:
            - Reduce request_kv_block_counts
            - Update request_last_kv_block_id to point to the previous block
            - Clear the entry in request_to_kv_block_ids for the released block
-           - Release the block back to the allocator
+           - Release the block (to reservation_pool if provided, else to allocator)
+
+        The block-release path runs unconditionally: when no requests cross a
+        block boundary, ``torch.nonzero`` returns an empty tensor and all
+        downstream indexing becomes a no-op. This removes the explicit
+        ``if remove_allocated_blocks_mask.any():`` branch from the caller.
+        ``torch.nonzero`` still synchronizes on its data-dependent output
+        shape, and the dual-stream path below calls ``.tolist()`` to push
+        freed block IDs back into the reservation pool, so this function is
+        not sync-free — it only skips one extra host round-trip.
+
+        Args:
+            reservation_pool: Optional ``ReservationPool`` from dual-stream
+                coordinator. When provided, rewind-released blocks go directly
+                to the pool (immediately safe — main stream just freed them).
+                When ``None``, blocks go back to the KV block allocator.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -745,8 +763,12 @@ class TextGenerationController:
         num_tokens_to_rewind = self.num_speculative_tokens - accepted_tokens_per_request
 
         # For prefill requests, no speculative tokens were forwarded through the model,
-        # so there is nothing to rewind.
-        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        # so there is nothing to rewind. Read from the forward-time mirror
+        # (populated in ``build_active_slices``) so dual-stream's side
+        # stream cannot race ``chain_update``'s prefill→decode transitions.
+        request_in_prefill_status = context.active_request_in_prefill_status_tensor[
+            :active_request_count
+        ]
         num_tokens_to_rewind[request_in_prefill_status == 1] = 0
 
         # Save the original offset BEFORE modifying to correctly detect block boundary crossing
@@ -767,51 +789,35 @@ class TextGenerationController:
 
         # No need to update request_query_lengths (It will be set correctly in the next iteration)
 
-        # For requests that crossed back to a previous block, we need to:
-        # 1. Reduce the block count by 1
-        # 2. Get the block ID to release (current request_last_kv_block_id)
-        # 3. Update request_last_kv_block_id to point to the previous block
-        # 4. Clear the entry in request_to_kv_block_ids for the released block
-        # 5. Release the block back to the allocator
+        # Block release for requests that crossed back to a previous block.
         if remove_allocated_blocks_mask.any():
-            # Get indices of requests that need to release a block (relative to active requests)
             requests_needing_release = torch.nonzero(remove_allocated_blocks_mask, as_tuple=True)[0]
-            # Convert to absolute indices in the context tensors
             absolute_indices = requests_needing_release + context.paused_request_count
 
-            # No clone needed: advanced (fancy) indexing with a tensor already returns
-            # a copy, not a view.
             blocks_to_release = context.request_last_kv_block_id[absolute_indices]
 
-            # Reduce block counts for requests that crossed back
             context.request_kv_block_counts[absolute_indices] -= 1
-
-            # Get the new block counts after decrement
             new_block_counts = context.request_kv_block_counts[absolute_indices]
 
-            # Update request_last_kv_block_id to point to the previous block
-            # and clear the released block entry in request_to_kv_block_ids
-            # Vectorized implementation using advanced indexing:
-            # Note: new_block_counts is guaranteed to be > 0 for all requests here, since
-            # crossing back to a previous block implies the request had at least 2 blocks.
-
-            # Update request_last_kv_block_id to point to the previous block (at index new_count - 1)
             context.request_last_kv_block_id[absolute_indices] = context.request_to_kv_block_ids[
                 absolute_indices, new_block_counts - 1
             ]
 
-            # Clear the released block entry (at index new_count, which was the old last block)
             context.request_to_kv_block_ids[absolute_indices, new_block_counts] = -1
 
-            # Release the blocks back to the allocator
-            context.kv_block_allocator.release_memory_blocks(blocks_to_release)
+            if reservation_pool is not None:
+                reservation_pool.push_many(blocks_to_release.tolist())
+            else:
+                context.kv_block_allocator.release_memory_blocks(blocks_to_release)
 
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
             active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
                 active_request_slice
             ]
-            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
+            is_decode_mask = (
+                context.active_request_in_prefill_status_tensor[:active_request_count] == 0
+            )
             decode_mamba_indices = active_mamba_indices[is_decode_mask]
             accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
 
@@ -1119,12 +1125,18 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+        # Read forward-time state from the stable mirrors populated by
+        # ``build_active_slices``. The backing ``request_in_prefill_status_tensor``
+        # and ``num_prefill_requests`` are mutated by ``chain_update`` at the
+        # end of each iteration (chunked-prefill transitions), so any code
+        # that runs after the forward — especially on the dual-stream side
+        # stream — must consume the mirrors to see the forward-time values.
+        request_in_prefill_status_tensor = context.active_request_in_prefill_status_tensor[
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
-        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
+        num_prefill_requests = context.active_num_prefill_requests
         num_decode_requests = active_request_count - num_prefill_requests
 
         # Get the logit indices for tokens that need sampling.
@@ -1230,14 +1242,25 @@ class TextGenerationController:
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
-    def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
+    def _dynamic_step_log_probs_bookkeeping(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 
+        Args:
+            active_request_count: Optional override for the active request
+                count. Single-stream callers leave this as ``None`` and the
+                method reads the live context; the dual-stream bookkeeping
+                pass passes the forward-time value from the snapshot so the
+                decision doesn't race ``chain_update``'s pause-induced
+                mutations of ``paused_request_count``.
+
         Returns:
-            return_log_probs (bool): Whether to return the sampled log_probs.
+            (return_log_probs, return_top_n_logprobs).
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
 
         return (
             (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
@@ -1304,10 +1327,74 @@ class TextGenerationController:
 
         return routing_indices_per_request
 
-    def _dynamic_step_calculate_log_probs(self) -> Optional[Tensor]:
-        """Calculate log probs from logits."""
+    def _compute_finished_mask(
+        self,
+        sampled_tokens: Tensor,
+        active_request_count: int,
+        accepted_token_counts: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Compute the finished-request mask from stop conditions.
+
+        Shared by both single-stream and dual-stream paths. Checks the
+        termination-ID condition, the max-sequence-length condition, and
+        (when configured) the stop-word callback.
+
+        Args:
+            sampled_tokens: The sampled base tokens for active requests.
+                Shape ``[active_request_count]``.
+            active_request_count: Number of active requests.
+            accepted_token_counts: Per-request accepted speculative token
+                counts (speculative decoding only). When ``None``,
+                ``seq_len_increment`` defaults to 1.
+
+        Returns:
+            A boolean mask of shape ``[active_request_count]`` where
+            ``True`` marks finished requests.
+        """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+
+        termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
+        seq_lengths = context.active_sequence_lengths[:active_request_count]
+        output_lengths = context.active_request_output_lengths[:active_request_count]
+
+        if accepted_token_counts is not None:
+            seq_len_increment = accepted_token_counts + 1
+        else:
+            seq_len_increment = 1
+
+        active_mask = (
+            sampled_tokens[:active_request_count] != termination_ids
+        ).byte() & torch.less(seq_lengths + seq_len_increment, output_lengths).byte()
+
+        if self._get_stop_word_finished_ids_callback is not None:
+            active_request_ids = context.active_request_ids[:active_request_count]
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        active_mask[idx] = 0
+
+        return active_mask == 0
+
+    def _dynamic_step_calculate_log_probs(
+        self, active_request_count: Optional[int] = None, active_token_count: Optional[int] = None
+    ) -> Tuple[List[List[float]], Tensor]:
+        """Calculate log probs from logits.
+
+        Args:
+            active_request_count: Optional override for the active request
+                count. Defaults to the live context value; the dual-stream
+                bookkeeping pass passes the forward-time value so the
+                computation doesn't race ``chain_update``'s pause-induced
+                mutations.
+            active_token_count: Optional override for
+                ``context.active_token_count``. Same rationale — passed by
+                the dual-stream pass.
+        """
+        context = self.inference_wrapped_model.inference_context
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
         logits_seq_len = (
             active_request_count
             if context.config.materialize_only_last_token_logits
@@ -1318,9 +1405,16 @@ class TextGenerationController:
             self._all_logits_cuda[:, :logits_seq_len, :],
             self._sampled_tokens_cuda[:active_request_count],
             only_last_token_logits=context.config.materialize_only_last_token_logits,
+            active_token_count=active_token_count,
         )
 
-    def _dynamic_step_calculate_log_probs_speculative(self) -> Tuple[List[List[float]], Tensor]:
+    def _dynamic_step_calculate_log_probs_speculative(
+        self,
+        active_request_count: Optional[int] = None,
+        num_prefill_requests: Optional[int] = None,
+        active_token_count: Optional[int] = None,
+        accepted_token_counts: Optional[Tensor] = None,
+    ) -> Tuple[List[List[float]], Tensor]:
         """Calculate log probs from logits for speculative decoding.
 
         For decode requests, computes log probs for each accepted speculative token
@@ -1331,6 +1425,19 @@ class TextGenerationController:
         - log_prob(accepted_token[j]) comes from logits at position j
         - log_prob(newly_sampled_token) comes from logits at position accepted_count
 
+        Args:
+            active_request_count: Optional override for the active request count.
+                Defaults to the live context value; dual-stream's side-stream
+                pass passes the forward-time value from the snapshot.
+            num_prefill_requests: Optional override for the forward-time prefill
+                count. Defaults to ``context.active_num_prefill_requests``
+                (the forward-time mirror populated in ``build_active_slices``).
+                Dual-stream can still pass the snapshot's value explicitly;
+                both are equivalent because the mirror is captured at forward
+                init and ``chain_update`` does not touch it.
+            active_token_count: Optional override for
+                ``context.active_token_count``. Same rationale.
+
         Returns:
             Tuple of (log_probs_list, log_probs_tensor):
                 log_probs_list: List of lists, one per active request, containing
@@ -1338,14 +1445,17 @@ class TextGenerationController:
                 log_probs_tensor: Full log_softmax tensor for top-n computation.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
+        if num_prefill_requests is None:
+            num_prefill_requests = context.active_num_prefill_requests
+        if active_token_count is None:
+            active_token_count = context.active_token_count
+        if accepted_token_counts is None:
+            accepted_token_counts = self._accepted_token_counts_per_request
 
-        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
-        ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
-        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
 
         only_last = context.config.materialize_only_last_token_logits
@@ -1354,7 +1464,7 @@ class TextGenerationController:
         if only_last:
             log_probs_tensor = F.log_softmax(logits_squeezed, dim=-1)
         else:
-            log_probs_tensor = F.log_softmax(logits_squeezed[: context.active_token_count], dim=-1)
+            log_probs_tensor = F.log_softmax(logits_squeezed[:active_token_count], dim=-1)
 
         log_probs_list_decode = []
 
@@ -1363,7 +1473,7 @@ class TextGenerationController:
             decode_log_probs = log_probs_tensor[:decode_len].reshape(
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
-            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            accepted_counts = accepted_token_counts[:num_decode_requests]
 
             # Build a [num_decode, num_spec+1] token ID matrix for gathering.
             # Columns 0..num_spec-1 hold accepted speculative tokens (clamped to 0
@@ -1405,17 +1515,28 @@ class TextGenerationController:
                 ]
                 log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
             else:
-                prefill_token_ids = context.token_to_input_ids[
-                    decode_len : context.active_token_count
+                # Read from the stable active_token_to_input_ids mirror so
+                # dual-stream's side stream sees the forward-time token
+                # layout (chain_update mutates token_to_input_ids at the
+                # end of the iteration).
+                prefill_token_ids = context.active_token_to_input_ids[
+                    decode_len:active_token_count
                 ].roll(-1, 0)
-                prefill_query_lengths = request_query_lengths[request_in_prefill_status_tensor == 1]
+                # Prefill requests are guaranteed to be laid out at
+                # positions [num_decode_requests, active_request_count)
+                # in the active ordering (the forward pass places decode
+                # requests first, then prefill), so we can slice
+                # active_request_query_lengths directly rather than
+                # masking on request_in_prefill_status_tensor (which
+                # chain_update mutates).
+                prefill_query_lengths = request_query_lengths[num_decode_requests:]
                 new_token_idx = prefill_query_lengths.cumsum(0) - 1
                 prefill_new_tokens = self._sampled_tokens_cuda[
                     num_decode_requests:active_request_count
                 ]
                 prefill_token_ids[new_token_idx] = prefill_new_tokens
 
-                prefill_token_count = context.active_token_count - decode_len
+                prefill_token_count = active_token_count - decode_len
                 seq_idx = torch.arange(prefill_token_count, device=logits.device)
                 selected_log_probs = prefill_log_probs[seq_idx, prefill_token_ids]
 
@@ -1429,7 +1550,11 @@ class TextGenerationController:
         return log_probs_list, log_probs_tensor
 
     def _dynamic_step_calculate_top_n_logprobs_speculative(
-        self, log_probs_tensor: Tensor
+        self,
+        log_probs_tensor: Tensor,
+        active_request_count: Optional[int] = None,
+        num_prefill_requests: Optional[int] = None,
+        accepted_token_counts: Optional[Tensor] = None,
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """Calculate top-n log probs for speculative decoding.
 
@@ -1440,20 +1565,26 @@ class TextGenerationController:
         Args:
             log_probs_tensor (Tensor): Pre-computed log_softmax tensor from
                 _dynamic_step_calculate_log_probs_speculative.
+            active_request_count: Optional override; dual-stream passes the
+                snapshot's forward-time value.
+            num_prefill_requests: Optional override for the forward-time prefill
+                count. Defaults to ``context.active_num_prefill_requests``
+                (the forward-time mirror populated in ``build_active_slices``).
 
         Returns:
             A dictionary mapping request_idx to list of (top_n_values, top_n_indices)
             tuples, one per emitted token position.
         """
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
+        if num_prefill_requests is None:
+            num_prefill_requests = context.active_num_prefill_requests
+        if accepted_token_counts is None:
+            accepted_token_counts = self._accepted_token_counts_per_request
 
-        request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
-        ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
-        num_prefill_requests = request_in_prefill_status_tensor.sum().item()
         num_decode_requests = active_request_count - num_prefill_requests
 
         top_n_results = {}
@@ -1463,7 +1594,7 @@ class TextGenerationController:
             decode_log_probs = log_probs_tensor[:decode_len].reshape(
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
-            accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
+            accepted_counts = accepted_token_counts[:num_decode_requests]
             top_n_per_request = context.active_request_metadata["top_n_logprobs"][
                 :num_decode_requests
             ]
@@ -1515,9 +1646,13 @@ class TextGenerationController:
                                 (topk_vals_cpu[i, :top_n], topk_idxs_cpu[i, :top_n])
                             ]
                 else:
-                    prefill_query_lengths = request_query_lengths[
-                        request_in_prefill_status_tensor == 1
-                    ]
+                    # Prefill requests are laid out at positions
+                    # [num_decode_requests, active_request_count) in the
+                    # forward-time ordering, so we slice
+                    # active_request_query_lengths directly instead of
+                    # masking on request_in_prefill_status_tensor (which
+                    # chain_update mutates).
+                    prefill_query_lengths = request_query_lengths[num_decode_requests:]
                     prefill_log_probs_per_request = prefill_log_probs.split(
                         prefill_query_lengths.tolist(), dim=0
                     )
@@ -1549,7 +1684,10 @@ class TextGenerationController:
         return top_n_results if top_n_results else None
 
     def _dynamic_step_calculate_top_n_logprobs(
-        self, log_probs_tensor: Optional[Tensor] = None
+        self,
+        log_probs_tensor: Optional[Tensor] = None,
+        active_request_count: Optional[int] = None,
+        active_token_count: Optional[int] = None,
     ) -> Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]:
         """Calculate top-n log probs from logits for dynamic batching.
 
@@ -1557,6 +1695,11 @@ class TextGenerationController:
             log_probs_tensor (Optional[Tensor]): Pre-computed log probabilities tensor.
                 If provided, avoids recomputing log_softmax. Should be the tensor
                 returned by calculate_log_probs.
+            active_request_count: Optional override; dual-stream passes the
+                snapshot's forward-time value so the decision doesn't race
+                chain_update's pause-induced mutations.
+            active_token_count: Optional override for
+                ``context.active_token_count``. Same rationale.
 
         Returns:
             A dictionary mapping request_idx to list of (top_n_logprobs, top_n_indices) tuples.
@@ -1568,7 +1711,10 @@ class TextGenerationController:
         )
 
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count is None:
+            active_request_count = context.total_request_count - context.paused_request_count
+        if active_token_count is None:
+            active_token_count = context.active_token_count
 
         # Handle decode-only mode (only last token)
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
@@ -1590,7 +1736,7 @@ class TextGenerationController:
         # Handle prefill mode - need to extract top-n for tokens per request
         # This follows the same pattern as calculate_log_probs in dynamic_context.py
         # Note: logits may be padded, so we only take the first active_token_count tokens
-        log_probs = log_probs_tensor[: context.active_token_count]
+        log_probs = log_probs_tensor[:active_token_count]
 
         active_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1755,100 +1901,34 @@ class TextGenerationController:
                     pp_group=self.pp_group,
                 )
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling.
-
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
-
-        Return:
-            Dict [str, Tensor]: A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
-        """
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
-
-        # Active sequence lengths.
-        # After the forward pass and KV-cache rewind, active_sequence_lengths
-        # (kv_offsets + query_lengths) already includes all accepted
-        # speculative tokens (they were part of the query and survived the rewind).
-        # Only the newly sampled base token is not yet in the KV cache, so add 1.
-        active_sequence_lengths = context.active_sequence_lengths[:active_request_count] + 1
-
-        # Request finished if termination_id or length >= max_sequence_length.
-        # Note: termination_id tensor has per-request termination IDs from mixed sampling
-        active_request_mask = (
-            self._sampled_tokens_cuda[:active_request_count]
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(
-            active_sequence_lengths, context.active_request_output_lengths[:active_request_count]
-        ).byte()
-
-        active_request_ids = context.active_request_ids[:active_request_count]
-
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
-
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
-        finished_request_ids = context.request_ids[finished_idxs]
-
-        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused _sampled_tokens_cuda buffer.
-        new_sample_copy = self._sampled_tokens_cuda[:active_request_count].clone()
-
-        # Update requests.
-        # _sampled_mtp_tokens_cuda has shape [num_speculative_tokens, max_requests]
-        if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda[:, :active_request_count]
-        else:
-            sampled_mtp_tokens_cuda = None
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
-        )
-
-        return {
-            "active_request_ids": active_request_ids,
-            "finished_request_ids": finished_request_ids,
-            **(update_result or {}),
-        }
-
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
-        """Forward step the model and update the inference context.
+        """Single-stream iteration: forward → sample → allocate → finalize.
+
+        Uses the shared ``_advance_iteration_state`` /
+        ``_finalize_iteration_state`` helpers directly. No reservation pool,
+        no quarantine, no thread pool — blocks are allocated from the KV
+        block allocator inline. Requests that can't get a block under
+        pressure are evicted immediately (their KV blocks are released
+        back to the allocator and they're re-admitted through the engine's
+        waiting queue).
 
         Args:
-            skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            skip_bookkeeping: If true, skip the stop-detection and
+                finished-drop phase.
 
         Return:
-            (Optional[Dict]): A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
-                sample (Tensor): New sample.
-                log_probs (Optional[Tensor]): Log probabilities of the new sample, if requested.
-                cuda_graph_request_count (Optional[int]): Size of cuda graph used for this step.
+            (Optional[Dict]): Step result dictionary.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
             return None
+
+        sampled_mtp_tokens: Optional[Tensor] = None
+        num_gen = 1 + context.num_speculative_tokens
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
@@ -1859,7 +1939,6 @@ class TextGenerationController:
                 else None
             )
 
-            # Enable routing recording before forward pass if routing replay is enabled
             config = self.inference_wrapped_model.model.config
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
@@ -1869,27 +1948,13 @@ class TextGenerationController:
             with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
                 self._pre_forward_bookkeeping_event.record()
 
-            # Forward pass produces only base logits. When speculative decoding is
-            # active, MTP logits are computed serially after verification.
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
             if context.is_hybrid_model and context.mamba_slot_allocator is not None:
                 context.mamba_slot_allocator.commit_intermediate_states()
 
-            # Collect routing indices per request (must be done before context transitions)
             routing_indices_per_request = self._router_record_bookkeeping()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
         await asyncio.sleep(0)
 
         self._pre_forward_bookkeeping_event.synchronize()
@@ -1898,18 +1963,15 @@ class TextGenerationController:
             self._dynamic_step_sample_bookkeeping()
 
             if self.num_speculative_tokens > 0:
-                # Phase 1: Verify speculative tokens using base logits only.
                 self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
-                # Phase 2: Rewind KV cache for rejected tokens.
                 self._rewind_kv_cache()
 
-                # Disable MoE padding for MTP computation
                 if self.model_config.moe_pad_experts_for_cuda_graph_inference:
                     unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
                     set_decode_expert_padding(unwrapped_model, False)
 
-                # Phase 3: Compute MTP serially with correct (verified) inputs.
                 self._compute_serial_mtp_and_sample()
+                sampled_mtp_tokens = self._sampled_mtp_tokens_cuda[:, :active_request_count]
             else:
                 self._dynamic_step_sample_logits()
 
@@ -1931,30 +1993,152 @@ class TextGenerationController:
                             log_probs_tensor
                         )
 
+            # Stop detection.
+            spec_accepted = (
+                self._accepted_token_counts_per_request[:active_request_count]
+                if self.num_speculative_tokens > 0
+                else None
+            )
+            finished_mask = self._compute_finished_mask(
+                self._sampled_tokens_cuda, active_request_count, accepted_token_counts=spec_accepted
+            )
             if skip_bookkeeping:
-                request_bookkeeping = {}
-            else:
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                finished_mask = torch.zeros_like(finished_mask, dtype=torch.bool)
 
-            ret = {
-                # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
-                "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
-                "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
-                    self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0
-                    else None
-                ),
-                "log_probs": log_probs,
-                "top_n_logprobs": top_n_logprobs,
-                "routing_indices_per_request": routing_indices_per_request,
-                "cuda_graph_request_count": cuda_graph_request_count,
-            }
+            active_request_ids = context.active_request_ids[:active_request_count]
+            finished_request_ids = active_request_ids[finished_mask]
+            finished_ids_list = (
+                finished_request_ids.tolist() if finished_request_ids.numel() > 0 else []
+            )
+
+            sample_clone = self._sampled_tokens_cuda[:active_request_count].clone()
+            accepted_tokens_clone = (
+                self._accepted_tokens_per_request.clone()
+                if self.num_speculative_tokens > 0
+                else None
+            )
+
+            # Drop finished requests, releasing blocks directly to allocator.
+            # compact_tokens=False: _finalize_iteration_state rebuilds
+            # token_to_input_ids from scratch.
+            num_dropped, surviving = context.apply_finished_drops(
+                finished_ids_list, num_gen, compact_tokens=False
+            )
+            active_request_count -= num_dropped
+
+            # Compact _sampled_tokens_cuda to match the post-drop active
+            # layout. apply_finished_drops compacts the bookkeeping tensors
+            # but doesn't touch sample buffers; _finalize_iteration_state
+            # reads sampled_tokens[0:active_request_count] and expects it
+            # to correspond to the compacted bookkeeping positions.
+            if num_dropped > 0 and surviving is not None:
+                self._sampled_tokens_cuda[:active_request_count] = self._sampled_tokens_cuda[
+                    surviving
+                ]
+                if sampled_mtp_tokens is not None:
+                    self._sampled_mtp_tokens_cuda[:, :active_request_count] = (
+                        self._sampled_mtp_tokens_cuda[:, surviving]
+                    )
+                    sampled_mtp_tokens = self._sampled_mtp_tokens_cuda[:, :active_request_count]
+
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
-            ret.update(request_bookkeeping)
-            return ret
+
+            # ── Advance + allocate + finalize ────────────────────────
+            if active_request_count > 0 and not skip_bookkeeping:
+                (
+                    crossing_indices_padded,
+                    chunked_prefill_idx,
+                    forward_paused_count,
+                    active_request_count,
+                ) = context._advance_iteration_state(num_gen)
+
+                # Inline .tolist() — no thread pool needed.
+                crossing_indices_cpu = (
+                    crossing_indices_padded.tolist()
+                    if crossing_indices_padded is not None
+                    else None
+                )
+
+                # Allocate blocks directly from the allocator. Evict
+                # requests that can't get a block.
+                evict_abs_list = []
+                if crossing_indices_cpu is not None:
+                    crossings = [
+                        forward_paused_count + idx
+                        for idx in crossing_indices_cpu
+                        if idx >= 0 and (forward_paused_count + idx) != chunked_prefill_idx
+                    ]
+                    if crossings:
+                        allocator = context.kv_block_allocator
+                        num_allocable = min(len(crossings), allocator.get_active_avail())
+                        if num_allocable > 0:
+                            block_ids = allocator.allocate_memory_blocks(num_allocable)
+                            for i, abs_idx in enumerate(crossings[:num_allocable]):
+                                blk_count = context.request_kv_block_counts[abs_idx].item()
+                                context.request_to_kv_block_ids[abs_idx, blk_count] = block_ids[i]
+                                context.request_kv_block_counts[abs_idx] += 1
+                                context.request_last_kv_block_id[abs_idx] = block_ids[i]
+                        evict_abs_list = crossings[num_allocable:]
+
+                # Evict block-pressure failures: release their KV blocks
+                # and compact the active set.
+                evict_ids_from_pressure = []
+                if evict_abs_list:
+                    device = context.request_ids.device
+                    evict_rids = context.request_ids[
+                        torch.tensor(evict_abs_list, dtype=torch.long, device=device)
+                    ].tolist()
+                    evict_ids_from_pressure = [int(rid) for rid in evict_rids]
+                    num_evicted, evict_surviving = context.apply_finished_drops(
+                        evict_ids_from_pressure, num_gen, compact_tokens=False
+                    )
+                    active_request_count -= num_evicted
+
+                    # Compact sample buffers again after eviction.
+                    if num_evicted > 0 and evict_surviving is not None:
+                        self._sampled_tokens_cuda[:active_request_count] = (
+                            self._sampled_tokens_cuda[evict_surviving]
+                        )
+                        if sampled_mtp_tokens is not None:
+                            self._sampled_mtp_tokens_cuda[:, :active_request_count] = (
+                                self._sampled_mtp_tokens_cuda[:, evict_surviving]
+                            )
+                            sampled_mtp_tokens = self._sampled_mtp_tokens_cuda[
+                                :, :active_request_count
+                            ]
+
+                context._finalize_iteration_state(
+                    self._sampled_tokens_cuda,
+                    sampled_mtp_tokens,
+                    active_request_count,
+                    0,
+                    forward_paused_count,
+                    num_gen,
+                )
+            else:
+                evict_ids_from_pressure = []
+
+        device = sample_clone.device
+        evict_request_ids_ret = (
+            torch.tensor(evict_ids_from_pressure, dtype=torch.long, device=device)
+            if evict_ids_from_pressure
+            else None
+        )
+
+        return {
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "newly_paused_request_ids": None,
+            "evict_request_ids": evict_request_ids_ret,
+            "sample": sample_clone,
+            "accepted_tokens": accepted_tokens_clone,
+            "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
+            "routing_indices_per_request": routing_indices_per_request,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
@@ -1963,6 +2147,552 @@ class TextGenerationController:
         """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
         loop = get_asyncio_loop(loop)
         return loop.run_until_complete(self.async_generate_output_tokens_dynamic_batch())
+
+    # ------------------------------------------------------------------
+    # Dual-stream methods
+    # ------------------------------------------------------------------
+
+    async def _ds_enqueue_one_iter(self, coordinator) -> Optional[Dict]:
+        """Main-stream per-iteration work: init → forward → sample → chain_update.
+
+        Enqueues all GPU work for one iteration on ``coordinator.main_stream``.
+        Returns a snapshot dict for the side stream to process, or None if
+        there are no active requests.
+
+        This method is ``async`` because ``chain_update`` awaits its CPU-GPU
+        sync via the coordinator's helper thread pool — letting the side
+        stream's bookkeeping task run during the wait. The GPU work leading
+        up to ``chain_update`` is wrapped in a ``torch.cuda.stream(...)``
+        block that ends *before* the await, so the main-stream context
+        manager state never straddles an await boundary (which would leak
+        into the side-stream task). ``chain_update`` enters its own
+        main-stream context internally.
+
+        Must be called while the critical task owns the event loop
+        (i.e., between PROCEED.clear() and the next yield at the top of
+        the critical loop).
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if context.active_token_count == 0 and active_request_count == 0:
+            return None
+
+        # CUDA graph replay on coordinator.main_stream is safe:
+        # cudaGraphLaunch targets whichever stream it's called on, and
+        # all internal ops within the replay run on the launch stream.
+        # However, CUDA graph *capture* during dual-stream would silently
+        # produce wrong results (capture records the default stream while
+        # kernels are issued on main_stream). Guard against this.
+        assert not context.is_creating_cuda_graphs, (
+            "CUDA graph capture must not run during dual-stream inference. "
+            "Graphs should be created at engine startup before generate_dual_stream."
+        )
+
+        sampled_mtp_tokens = None
+        snapshot: Optional[Dict] = None
+
+        # ── Part 1: all forward-path GPU work on main stream ────────
+        # Everything from decision application through snapshot build
+        # runs inside this stream-scoped block. We exit before awaiting
+        # chain_update so the stream context doesn't cross the await.
+        # Part 2 (chain_update) enters its own inference_mode block.
+        with torch.inference_mode(), torch.cuda.stream(coordinator.main_stream):
+            # Cross-stream ordering: block main stream's next kernels
+            # (notably _dynamic_step_context_init, which overwrites the
+            # context.active_* mirrors) until side stream has finished
+            # reading them in the previous iteration's bookkeeping pass.
+            # On the first iteration, side_reads_done_event is unrecorded
+            # and the wait is a no-op.
+            coordinator.main_stream.wait_event(coordinator.side_reads_done_event)
+
+            # ── Apply handoff decisions from side stream ─────────────
+            # Main stream is the sole mutator of context tensors. Side
+            # stream publishes SideDecision with:
+            #   - finished_request_ids (EOS / max-len),
+            #   - resume_request_ids (paused requests to bring back),
+            #   - evict_request_ids (paused-region overflow to evict).
+            # Main stream applies all three here. Resume is done first
+            # so the active set includes any resumed requests before
+            # finished-removal runs; eviction is done after finished so
+            # the order of operations on total_request_count stays
+            # consistent with single-stream's update_requests.
+            decisions = coordinator.drain_decisions()
+            num_gen = 1 + context.num_speculative_tokens
+
+            # Flatten all resumes / finishes / evictions across decisions
+            # so we can handle them with a single shift of
+            # token_to_input_ids on the resume path.
+            all_resume_ids: List[int] = []
+            all_finished_ids: List[int] = []
+            all_evict_ids: List[int] = []
+            for dec in decisions:
+                all_resume_ids.extend(dec.resume_request_ids)
+                all_finished_ids.extend(dec.finished_request_ids)
+                all_evict_ids.extend(dec.evict_request_ids)
+
+            # Apply resumes (LIFO: the most recently paused requests).
+            # For each resumed request we optionally pop a block from
+            # the pool (only if its current KV block is actually full)
+            # and decrement paused_request_count. The decremented
+            # position becomes the new first active slot.
+            #
+            # chain_update may have pushed new pauses between the side
+            # stream's decision and this apply, so we verify the request
+            # ID at the tail matches the side stream's intended target
+            # before committing each resume.
+            resume_id_set = set(int(rid) for rid in all_resume_ids)
+            num_resumed = 0
+            remaining_resumes = len(all_resume_ids)
+            while remaining_resumes > 0:
+                if context.paused_request_count == 0:
+                    break
+                resumed_abs_idx = context.paused_request_count - 1
+                candidate_rid = int(context.request_ids[resumed_abs_idx].item())
+                if candidate_rid not in resume_id_set:
+                    # Tail of paused region is a request chain_update
+                    # added after the side stream's decision — skip it.
+                    break
+                resume_id_set.discard(candidate_rid)
+                remaining_resumes -= 1
+                offset = context.request_last_kv_block_offset[resumed_abs_idx].item()
+                block_boundary = context.block_size_tokens - 1 - context.num_speculative_tokens
+                needs_block = offset >= block_boundary
+                block_id = None
+                if needs_block:
+                    block_id = coordinator.reservation_pool.pop()
+                    if block_id is None:
+                        # Pool ran dry between side's resume decision
+                        # and main's apply; leave remaining resumes
+                        # for the next iteration.
+                        break
+                # Commit the resume.
+                context.paused_request_count -= 1
+                if block_id is not None:
+                    blk_count = context.request_kv_block_counts[resumed_abs_idx].item()
+                    context.request_to_kv_block_ids[resumed_abs_idx, blk_count] = block_id
+                    context.request_kv_block_counts[resumed_abs_idx] += 1
+                    context.request_last_kv_block_id[resumed_abs_idx] = block_id
+                active_request_count += 1
+                num_resumed += 1
+
+            if num_resumed > 0:
+                # Shift the existing token_to_input_ids entries right to
+                # make room for the resumed requests, and write the
+                # resumed samples (from context.paused_tokens /
+                # paused_speculative_tokens) at the front. This keeps
+                # the flat token layout in sync with the post-resume
+                # active set: flat index i → absolute position
+                # paused_request_count + i.
+                resume_token_count = num_resumed * num_gen
+                prev_active_token_count = context.active_token_count
+                if prev_active_token_count > 0:
+                    existing = context.token_to_input_ids[:prev_active_token_count].clone()
+                    context.token_to_input_ids[
+                        resume_token_count : resume_token_count + prev_active_token_count
+                    ] = existing
+                # Read the resumed samples.
+                new_paused = context.paused_request_count
+                old_paused = new_paused + num_resumed
+                if (
+                    context.num_speculative_tokens > 0
+                    and context.paused_speculative_tokens is not None
+                ):
+                    base = context.paused_tokens[new_paused:old_paused]
+                    mtp = context.paused_speculative_tokens[:, new_paused:old_paused]
+                    resumed_tokens = torch.vstack([base.unsqueeze(0), mtp]).T.reshape(-1)
+                else:
+                    resumed_tokens = context.paused_tokens[new_paused:old_paused]
+                context.token_to_input_ids[:resume_token_count] = resumed_tokens
+                # paused_request_count was already decremented in the
+                # resume loop above, so the valid range of
+                # paused_tokens is implicitly truncated.
+                # Update active_token_count to reflect the additional
+                # resumed tokens.
+                context.active_token_count = prev_active_token_count + resume_token_count
+
+            # Apply finished decisions (vectorized compaction).
+            num_dropped, _ = context.apply_finished_drops(
+                all_finished_ids,
+                num_gen,
+                quarantine=coordinator.quarantine,
+                quarantine_gen=coordinator.main_gen,
+            )
+            active_request_count -= num_dropped
+
+            # Apply eviction decisions (vectorized compaction of paused region).
+            context.apply_paused_evictions(
+                all_evict_ids, coordinator.quarantine, coordinator.main_gen
+            )
+
+            if active_request_count == 0:
+                return None
+
+            # ── Init ─────────────────────────────────────────────────
+            input_ids, position_ids = self._dynamic_step_context_init()
+
+            cuda_graph_request_count = (
+                context.padded_active_request_count if context.is_decode_only() else None
+            )
+
+            # Enable routing recording.
+            config = self.inference_wrapped_model.model.config
+            if config.moe_enable_routing_replay:
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+            # ── Forward ──────────────────────────────────────────────
+            # Launch pre-forward bookkeeping on a side stream so it
+            # overlaps with the forward pass (mirrors single-stream).
+            self._pre_forward_bookkeeping_stream.wait_stream(coordinator.main_stream)
+            with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
+                self._pre_forward_bookkeeping_event.record()
+
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+
+            # Commit Mamba intermediate states.
+            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+                context.mamba_slot_allocator.commit_intermediate_states()
+
+            # Collect routing indices.
+            routing_indices_per_request = self._router_record_bookkeeping()
+
+            # ── Sample bookkeeping + sample ──────────────────────────
+            self._dynamic_step_sample_bookkeeping()
+
+            if self.num_speculative_tokens > 0:
+                # Phase 1: Verify speculative tokens using base logits.
+                # (Reads logits from self._all_logits_cuda internally.)
+                self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+
+                # Phase 2: Rewind KV cache for rejected tokens.
+                # Released blocks go directly to reservation pool
+                # (immediately safe).
+                self._rewind_kv_cache(reservation_pool=coordinator.reservation_pool)
+
+                # Disable MoE padding for MTP computation.
+                if self.model_config.moe_pad_experts_for_cuda_graph_inference:
+                    unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
+                    set_decode_expert_padding(unwrapped_model, False)
+
+                # Phase 3: Compute MTP serially with correct (verified) inputs.
+                self._compute_serial_mtp_and_sample()
+
+                # NB: this is a view, not a copy. chain_update mutates it
+                # in-place via pause-swaps. Do not read it after chain_update.
+                sampled_mtp_tokens = self._sampled_mtp_tokens_cuda[:, :active_request_count]
+            else:
+                # Reads logits from self._all_logits_cuda internally.
+                self._dynamic_step_sample_logits()
+
+            # Cross-stream ordering: publish "main stream has finished
+            # sampling, self._all_logits_cuda and self._sampled_tokens_cuda
+            # are populated for this iteration." The side stream's
+            # bookkeeping pass waits on this event before reading either.
+            coordinator.main_sample_done_event.record(coordinator.main_stream)
+
+            # ── Build minimal snapshot ───────────────────────────────
+            # Under Option 2 the side stream reads log-probs / stop
+            # detection inputs directly from stable context buffers
+            # (context.active_* and self._all_logits_cuda), so this
+            # snapshot only needs to carry:
+            #   - data that would otherwise be corrupted by subsequent
+            #     main-stream work (sampled tokens, accepted_tokens,
+            #     routing indices);
+            #   - CPU-side scalar counts that chain_update mutates
+            #     (active_request_count, active_token_count) so the
+            #     log-probs methods can override the live context values
+            #     with the forward-time values they were produced under.
+            # ``num_prefill_requests`` comes from
+            # ``active_num_prefill_requests`` — the forward-time mirror
+            # captured in ``build_active_slices`` — so snapshot and
+            # log-probs fallback share a single canonical source.
+            snapshot = {
+                "main_gen": coordinator.main_gen,
+                "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
+                "active_request_count": active_request_count,
+                "active_token_count": context.active_token_count,
+                "num_prefill_requests": context.active_num_prefill_requests,
+                "paused_request_count": context.paused_request_count,
+                "cuda_graph_request_count": cuda_graph_request_count,
+                "routing_indices_per_request": routing_indices_per_request,
+                "accepted_tokens": (
+                    self._accepted_tokens_per_request.clone()
+                    if self.num_speculative_tokens > 0
+                    else None
+                ),
+                "accepted_token_counts": (
+                    self._accepted_token_counts_per_request[:active_request_count].clone()
+                    if self.num_speculative_tokens > 0
+                    else None
+                ),
+            }
+
+            if self.num_speculative_tokens > 0:
+                self._accepted_tokens_per_request.fill_(-1)
+                self._accepted_token_counts_per_request.fill_(0)
+
+        # ── Part 2: chain_update (async, enters its own stream context) ──
+        # Stream context above is exited. Synchronize the pre-forward
+        # bookkeeping event before chain_update touches context state.
+        self._pre_forward_bookkeeping_event.synchronize()
+
+        # chain_update awaits the CPU-GPU sync via the coordinator's
+        # helper thread pool; during that await, the bookkeeping task
+        # on the side stream gets to run.
+        with torch.inference_mode():
+            await context.chain_update(
+                self._sampled_tokens_cuda, coordinator, sampled_mtp_tokens=sampled_mtp_tokens
+            )
+        coordinator.main_gen += 1
+        return snapshot
+
+    async def _ds_bookkeeping_pass(self, coordinator, snapshot: Dict) -> Dict:
+        """Side-stream per-iteration bookkeeping pass.
+
+        Calls the refactored ``_dynamic_step_calculate_log_probs[_speculative]``
+        and ``_dynamic_step_calculate_top_n_logprobs[_speculative]`` methods
+        directly, with the side CUDA stream as current. Those methods read
+        from ``self._all_logits_cuda``, ``self._sampled_tokens_cuda``, and
+        ``context.active_request_metadata`` / ``context.active_request_query_lengths``
+        — buffers populated once per iteration at forward init and not
+        mutated by ``chain_update``, so side stream can read them post-chain
+        without snapshot cloning.
+
+        Stop detection also reads from the stable ``active_*`` mirrors
+        (``active_request_metadata["termination_id"]``, ``active_sequence_lengths``,
+        ``active_request_output_lengths``) and the live
+        ``self._sampled_tokens_cuda`` (which is only overwritten by the next
+        iteration's sample, not by chain_update).
+
+        Returns a result dict compatible with the engine's ``async_bookkeep``.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = snapshot["active_request_count"]
+        active_token_count = snapshot["active_token_count"]
+        num_prefill_requests = snapshot["num_prefill_requests"]
+        sample = snapshot["sample"]
+        accepted_token_counts = snapshot.get("accepted_token_counts")
+
+        with torch.inference_mode(), torch.cuda.stream(coordinator.side_stream):
+            # Cross-stream ordering: block side stream's reads until main
+            # stream has finished sampling this iteration.
+            # self._all_logits_cuda and self._sampled_tokens_cuda are only
+            # valid past this point.
+            coordinator.side_stream.wait_event(coordinator.main_sample_done_event)
+
+            # ── Log probs (refactored methods, reading stable buffers) ──
+            # Pass the snapshot's forward-time counts so the log-probs
+            # computations see the state as it was at the moment the
+            # forward ran, not the post-chain_update state main stream
+            # has since moved to.
+            log_probs = None
+            top_n_logprobs = None
+            log_probs_tensor = None
+            (return_log_probs, return_top_n_logprobs) = self._dynamic_step_log_probs_bookkeeping(
+                active_request_count=active_request_count
+            )
+
+            if return_log_probs or return_top_n_logprobs:
+                if self.num_speculative_tokens > 0:
+                    log_probs, log_probs_tensor = (
+                        self._dynamic_step_calculate_log_probs_speculative(
+                            active_request_count=active_request_count,
+                            num_prefill_requests=num_prefill_requests,
+                            active_token_count=active_token_count,
+                            accepted_token_counts=accepted_token_counts,
+                        )
+                    )
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs_speculative(
+                            log_probs_tensor,
+                            active_request_count=active_request_count,
+                            num_prefill_requests=num_prefill_requests,
+                            accepted_token_counts=accepted_token_counts,
+                        )
+                else:
+                    log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs(
+                        active_request_count=active_request_count,
+                        active_token_count=active_token_count,
+                    )
+                    if return_top_n_logprobs:
+                        top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(
+                            log_probs_tensor,
+                            active_request_count=active_request_count,
+                            active_token_count=active_token_count,
+                        )
+
+            # ── Stop detection (shared method, includes stop-word callback) ──
+            finished_mask = self._compute_finished_mask(
+                sample, active_request_count, accepted_token_counts=accepted_token_counts
+            )
+
+            # active_request_ids is the stable mirror populated at
+            # forward init. Keep the ``.tolist()`` sync inside the
+            # side-stream context so the drain and subsequent event
+            # record happen on the side stream, not on the default
+            # stream the caller may be holding.
+            active_request_ids = context.active_request_ids[:active_request_count]
+            finished_request_ids_tensor = active_request_ids[finished_mask]
+            finished_ids_list = (
+                finished_request_ids_tensor.tolist()
+                if finished_request_ids_tensor.numel() > 0
+                else []
+            )
+
+            # All reads of main-stream-owned state are done for this
+            # iteration. Publish the side-reads-done event so main
+            # stream's next _dynamic_step_context_init can proceed.
+            # (The ``.tolist()`` above already drained the side stream,
+            # so this record is effectively instant; the event still
+            # matters because it unblocks main stream's wait_event on
+            # the GPU without requiring another Python-level sync.)
+            coordinator.side_reads_done_event.record(coordinator.side_stream)
+
+        # ── Drain main→side pause events ─────────────────────────────
+        # chain_update emits a pause event for each request it pauses
+        # under block pressure. We forward those IDs as
+        # ``newly_paused_request_ids`` to async_bookkeep so the engine
+        # can call ``add_event_pause`` on each.
+        pause_request_ids = coordinator.drain_pauses()
+
+        # ── Reclaim quarantined blocks + top-up from allocator ───────
+        # Reclaim adds finished/evicted blocks back to the pool; the
+        # allocator top-up adds any fresh blocks. Both have to happen
+        # before the resume / overflow-eviction decisions below so the
+        # pool depth and paused-block budget reflect the maximum space
+        # we can give paused requests.
+        coordinator.reclaim_blocks()
+        allocator = context.kv_block_allocator
+        need = coordinator.reservation_pool.capacity - len(coordinator.reservation_pool)
+        target = min(need, allocator.get_active_avail())
+        if target > 0:
+            new_block_ids = allocator.allocate_memory_blocks(target)
+            if new_block_ids is not None:
+                coordinator.reservation_pool.push_many(new_block_ids.tolist())
+
+        # ── Resume decision ──────────────────────────────────────────
+        # If the pool has blocks and there are paused requests, pick the
+        # most recently paused ones (LIFO) to bring back to the active
+        # set. Main stream applies the decision at the top of its next
+        # _ds_enqueue_one_iter by decrementing paused_request_count and
+        # popping one block per resumed request. The paused region is
+        # stable between this read and main's apply because chain_update
+        # only touches it via pause-swap (adding to the end) and no
+        # chain_update runs between side iter K's read and main iter
+        # K+1's apply.
+        paused_count = context.paused_request_count
+        pool_depth = len(coordinator.reservation_pool)
+        resume_count = min(pool_depth, paused_count)
+        if resume_count > 0:
+            resume_start = paused_count - resume_count
+            # This ``.tolist()`` is the only resume-related CPU sync.
+            resume_ids_list = context.request_ids[resume_start:paused_count].tolist()
+        else:
+            resume_ids_list = []
+
+        # ── Overflow eviction ────────────────────────────────────────
+        # Check whether paused requests are using more KV blocks than
+        # the allocator's paused budget. If so, evict the oldest
+        # (head-most) paused requests until we're back under budget.
+        # FIFO eviction is chosen so that resumes — which pick from
+        # the tail — don't race the eviction. The disjoint-region
+        # guarantee: resumes select [paused_count - resume_count,
+        # paused_count), evictions select [0, num_to_evict); these
+        # don't overlap as long as num_to_evict + resume_count <=
+        # paused_count, which we enforce below.
+        evict_ids_list: List[int] = []
+        overflow = allocator.get_paused_used() - allocator.paused_count
+        if overflow > 0 and paused_count > resume_count:
+            paused_block_counts = context.request_kv_block_counts[:paused_count].tolist()
+            freed = 0
+            num_to_evict = 0
+            for i in range(paused_count):
+                freed += paused_block_counts[i]
+                num_to_evict += 1
+                if freed >= overflow:
+                    break
+            max_evict = paused_count - resume_count
+            num_to_evict = min(num_to_evict, max_evict)
+            if num_to_evict > 0:
+                evict_ids_list = context.request_ids[:num_to_evict].tolist()
+
+        # ── Publish combined decisions for main stream ──────────────
+        coordinator.publish_decisions(
+            SideDecision(
+                finished_request_ids=finished_ids_list,
+                resume_request_ids=resume_ids_list,
+                evict_request_ids=evict_ids_list,
+            )
+        )
+
+        # ── Build result ─────────────────────────────────────────────
+        # evict_request_ids forwarded to async_bookkeep (via
+        # post_process_requests) covers the overflow-evicted paused
+        # requests, so the engine can checkpoint them and re-admit
+        # them via the waiting queue.
+        ret = self._ds_build_result(
+            snapshot,
+            active_request_ids,
+            log_probs,
+            top_n_logprobs,
+            finished_ids_list,
+            evict_ids_list,
+            pause_request_ids,
+        )
+
+        coordinator.side_gen += 1
+        return ret
+
+    def _ds_build_result(
+        self,
+        snapshot: Dict,
+        active_request_ids: Tensor,
+        log_probs,
+        top_n_logprobs,
+        finished_ids: List[int],
+        evict_ids: List[int],
+        pause_ids: List[int],
+    ) -> Dict:
+        """Build the step result dict for engine bookkeeping.
+
+        ``active_request_ids`` comes from the bookkeeping pass (reading
+        from the stable ``context.active_request_ids`` mirror).
+        ``evict_ids`` are the paused-region overflow evictions picked by
+        the side stream's resume/evict decision logic — they're
+        forwarded as ``evict_request_ids`` so
+        ``post_process_requests`` can checkpoint them and push them
+        back onto the waiting queue for re-admission. ``pause_ids``
+        come from ``coordinator.drain_pauses()`` and are forwarded as
+        ``newly_paused_request_ids`` so ``async_bookkeep`` can call
+        ``add_event_pause`` on each.
+        """
+        sample = snapshot["sample"]
+        device = sample.device
+
+        finished_request_ids = (
+            torch.tensor(finished_ids, dtype=torch.long, device=device)
+            if finished_ids
+            else torch.tensor([], dtype=torch.long, device=device)
+        )
+        evict_request_ids = (
+            torch.tensor(evict_ids, dtype=torch.long, device=device) if evict_ids else None
+        )
+        newly_paused_request_ids = (
+            torch.tensor(pause_ids, dtype=torch.long, device=device) if pause_ids else None
+        )
+
+        return {
+            "sample": sample,
+            "accepted_tokens": snapshot.get("accepted_tokens"),
+            "log_probs": log_probs,
+            "top_n_logprobs": top_n_logprobs,
+            "routing_indices_per_request": snapshot.get("routing_indices_per_request"),
+            "cuda_graph_request_count": snapshot.get("cuda_graph_request_count"),
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "evict_request_ids": evict_request_ids,
+            "newly_paused_request_ids": newly_paused_request_ids,
+        }
 
     def _update_top_n_logprobs_dict(
         self,

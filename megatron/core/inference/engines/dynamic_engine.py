@@ -31,6 +31,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.dual_stream import PIPELINE_PRIME_ITERATIONS, DualStreamCoordinator
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -2017,6 +2018,312 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_records_list.sort(key=lambda r: r.request_id)
 
         return finished_request_records_list
+
+    # ------------------------------------------------------------------
+    # Dual-stream generation
+    # ------------------------------------------------------------------
+
+    def generate_dual_stream(
+        self,
+        prompts: List[str],
+        sampling_params: Optional[SamplingParams] = SamplingParams(),
+        reservation_pool_capacity: int = 256,
+    ) -> List[DynamicInferenceRequestRecord]:
+        """Generate completions using the dual-stream architecture.
+
+        Overlaps forward+sampling (main stream) with bookkeeping+logprobs
+        (side stream). Block-pressure is handled by pausing the affected
+        requests (preserving their KV cache) and resuming them once the
+        pool has headroom again, rather than dropping and re-prefilling.
+
+        Args:
+            prompts: List of prompt strings.
+            sampling_params: Sampling parameters.
+            reservation_pool_capacity: Size of pre-allocated block pool.
+
+        Returns:
+            Sorted list of finished request records.
+        """
+        for prompt in prompts:
+            request_id = int(next(self.request_counter))
+            _ = self.add_request(request_id, prompt, sampling_params)
+
+        coordinator = DualStreamCoordinator(reservation_pool_capacity=reservation_pool_capacity)
+
+        loop = get_asyncio_loop(self._loop)
+        result = loop.run_until_complete(self._run_dual_stream(coordinator))
+        return result
+
+    async def _run_dual_stream(self, coordinator) -> List[DynamicInferenceRequestRecord]:
+        """Top-level async driver for dual-stream generation.
+
+        Launches the critical and bookkeeping tasks as concurrent coroutines,
+        coordinated via the DualStreamCoordinator's two-signal protocol. On
+        normal completion, signals bookkeeping to drain and awaits it. On
+        exception, cancels the sibling task and awaits it before running
+        block cleanup — the cleanup touches coordinator state that the
+        bookkeeping task also reads, so we cannot run them concurrently.
+        """
+        coordinator.start()
+        finished_records: List[DynamicInferenceRequestRecord] = []
+
+        self._ds_coordinator = coordinator
+
+        # Pre-fill the reservation pool from the block allocator.
+        self._ds_fill_reservation_pool(coordinator)
+
+        critical_task = asyncio.ensure_future(self._ds_critical_loop(coordinator, finished_records))
+        bookkeeping_task = asyncio.ensure_future(
+            self._ds_bookkeeping_loop(coordinator, finished_records)
+        )
+
+        try:
+            await critical_task
+            # Critical finished normally: signal bookkeeping to drain and exit.
+            coordinator.stop()
+            await bookkeeping_task
+        except BaseException:
+            # Critical raised (or we were cancelled). Tear down both tasks
+            # before touching shared coordinator state in cleanup.
+            coordinator.stop()
+            for task in (critical_task, bookkeeping_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(critical_task, bookkeeping_task, return_exceptions=True)
+            raise
+        finally:
+            self._ds_cleanup_blocks(coordinator)
+            self._ds_coordinator = None
+
+        finished_records.sort(key=lambda r: r.request_id)
+        return finished_records
+
+    async def _ds_critical_loop(self, coordinator, finished_records):
+        """The critical path: init → forward → sample → chain_update.
+
+        Runs on ``coordinator.main_stream``. Uses the STOP+PROCEED
+        two-signal protocol to coordinate with bookkeeping.
+
+        ``_ds_enqueue_one_iter`` is an async method (it awaits
+        ``chain_update``'s CPU-GPU sync via the helper thread pool). The
+        ``with torch.cuda.stream(...)`` blocks around
+        ``schedule_waiting_requests`` are scoped locally and never span an
+        await — the stream context manager state is thread-local, so
+        holding it across an await would leak the main stream setting
+        into whichever task runs next on the event loop.
+
+        On early exit (no unfinished requests), bookkeeping may still have
+        snapshots queued in the ring. ``_run_dual_stream`` calls
+        ``coordinator.stop()`` after this loop returns, and
+        ``_ds_bookkeeping_loop`` drains the ring in its tail phase before
+        exiting, so nothing is lost.
+        """
+        # Prime the pipeline: enqueue a small constant number of
+        # iterations to seed the snapshot ring so side stream has work
+        # to process during the first wake-event handoff. The constant
+        # lives in dual_stream.PIPELINE_PRIME_ITERATIONS; the old
+        # ``pipeline_depth`` parameter was removed because the CPU sync
+        # inside ``chain_update`` bottlenecks main-stream dispatch to
+        # GPU speed regardless of its value.
+        for _ in range(PIPELINE_PRIME_ITERATIONS):
+            self.schedule_waiting_requests()
+            if not self.has_unfinished_requests():
+                break
+            snapshot = await self.controller._ds_enqueue_one_iter(coordinator)
+            if snapshot is not None:
+                coordinator.publish_snapshot(snapshot)
+
+        # Main loop.
+        while self.has_unfinished_requests():
+            # Arm the wake event at the current position in main stream.
+            coordinator._wake_event.record(coordinator.main_stream)
+
+            # Release bookkeeping. Order: clear STOP first, then open PROCEED.
+            coordinator._stop_bookkeeping = False
+            coordinator._bookkeeping_proceed.set()
+
+            # Hand over event loop. Thread flips STOP when GPU reaches wake point.
+            await coordinator._await_wake()
+
+            # Close gate so bookkeeping blocks at its next proceed.wait().
+            coordinator._bookkeeping_proceed.clear()
+
+            # schedule_waiting_requests is CPU-only (queue draining,
+            # prefix-cache bookkeeping). It runs outside the stream context
+            # because wrapping CPU work in ``with torch.cuda.stream(...)``
+            # gives no benefit. Any GPU kernels it launches internally go
+            # to the default stream; _ds_enqueue_one_iter enters its own
+            # main-stream context for all GPU work that follows.
+            self.schedule_waiting_requests()
+
+            if not self.has_unfinished_requests():
+                break
+
+            snapshot = await self.controller._ds_enqueue_one_iter(coordinator)
+            if snapshot is not None:
+                coordinator.publish_snapshot(snapshot)
+
+    async def _ds_bookkeeping_loop(self, coordinator, finished_records):
+        """The bookkeeping path: logprobs + stop detection + compaction + reclaim.
+
+        Runs on ``coordinator.side_stream``. Snapshot processing is strictly
+        in-order: ``_ds_bookkeeping_pass`` is never preempted mid-snapshot,
+        because doing so allowed newer snapshots to overtake older ones and
+        corrupted per-request output ordering. ``_stop_bookkeeping`` only
+        gates picking up a *new* snapshot at the top of the loop, so the
+        side stream yields to critical between snapshots but never mid-pass.
+        """
+        while coordinator._running:
+            # Gate: wait until critical releases us.
+            await coordinator._bookkeeping_proceed.wait()
+
+            if not coordinator._running:
+                break
+
+            if coordinator._stop_bookkeeping:
+                # Helper thread has signalled that main is about to close
+                # PROCEED; yield and re-check the gate instead of grabbing
+                # a new snapshot that we'd immediately stall on.
+                await asyncio.sleep(0)
+                continue
+
+            # Consume next snapshot from the ring buffer.
+            snapshot = coordinator.consume_snapshot()
+            if snapshot is None:
+                # No work yet; yield and retry.
+                await asyncio.sleep(0)
+                continue
+
+            # Run the bookkeeping pass on the side stream. This pass runs
+            # to completion — no mid-pass STOP checks.
+            step_result = await self.controller._ds_bookkeeping_pass(coordinator, snapshot)
+
+            context_state = self._ds_build_context_state(snapshot)
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+            # async_bookkeep releases freed KV blocks back to the allocator
+            # (for finished / evicted requests). Those blocks are picked up
+            # by the next iteration's _ds_bookkeeping_pass, which runs its
+            # own top-up-from-allocator step before computing the resume
+            # decision. We intentionally do NOT call _ds_fill_reservation_pool
+            # here a second time.
+            ret = await self.async_bookkeep(step_result, context_state, step_time=0.0)
+            if ret and "finished_request_records" in ret:
+                finished_records.extend(ret["finished_request_records"])
+
+            # Yield to event loop.
+            await asyncio.sleep(0)
+
+        # Drain remaining snapshots that critical published before it exited.
+        # The bookkeeping pass still publishes decisions (finish/resume/evict)
+        # back to the coordinator during drain, but the critical loop has
+        # exited so drain_decisions() is never called again — those decisions
+        # are silently dropped. This is correct: generation is over, so no
+        # request lifecycle changes can take effect. The drain exists only so
+        # that log-probs and stop-detection results reach async_bookkeep and
+        # the finished_records list.
+        while True:
+            snapshot = coordinator.consume_snapshot()
+            if snapshot is None:
+                break
+            step_result = await self.controller._ds_bookkeeping_pass(coordinator, snapshot)
+            context_state = self._ds_build_context_state(snapshot)
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+            ret = await self.async_bookkeep(step_result, context_state, step_time=0.0)
+            if ret and "finished_request_records" in ret:
+                finished_records.extend(ret["finished_request_records"])
+
+    def _ds_build_context_state(self, snapshot: Dict) -> Dict:
+        """Build the context_state dict for async_bookkeep.
+
+        ``active_token_count``, ``total_request_count``, and
+        ``paused_request_count`` are read from the snapshot so that
+        ``post_process_requests`` sees the counts from the iteration
+        that produced this snapshot. Everything else — logging-only
+        fields like ``is_decode_only``, allocator stats, queue depths,
+        and ``kv_stats`` — is read from live context so the log line
+        reflects the most current state, consistently offset from the
+        snapshot's iteration by however many iterations have elapsed.
+        """
+        total_request_count = snapshot["active_request_count"] + snapshot.get(
+            "paused_request_count", 0
+        )
+        paused_request_count = snapshot.get("paused_request_count", 0)
+        active_token_count = snapshot["active_token_count"]
+
+        if (
+            self.logging_step_interval > 0
+            and self.context.step_count > 0
+            and self.context.step_count % self.logging_step_interval == 0
+            and self.metrics_writer is not None
+        ):
+            kv_stats = self.context.get_kvcache_utilization_stats()
+        else:
+            kv_stats = None
+
+        context_state = {
+            "is_decode_only": self.context.is_decode_only(),
+            "max_requests": self.context.max_requests,
+            "total_request_count": total_request_count,
+            "paused_request_count": paused_request_count,
+            "active_token_count": active_token_count,
+            "step_count": self.context.step_count,
+            "waiting_request_count": len(self.waiting_request_ids),
+            "finished_request_count": self.finished_request_count,
+            "evicted_request_count": self.evicted_request_count,
+            "kv_stats": kv_stats,
+            "padded_active_token_count": self.context.padded_active_token_count,
+            "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
+            "total_active_block_count": self.context.kv_block_allocator.active_count,
+            "total_paused_block_count": self.context.kv_block_allocator.paused_count,
+            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+            "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
+        }
+        return context_state
+
+    def _ds_fill_reservation_pool(self, coordinator) -> None:
+        """Pre-fill the reservation pool from the block allocator.
+
+        Called once at the start of dual-stream generation. Moves available
+        blocks from the main KV block allocator into the reservation pool
+        so that main stream's chain_update can pre-allocate without touching
+        the allocator directly.
+        """
+        allocator = self.context.kv_block_allocator
+        need = coordinator.reservation_pool.capacity - len(coordinator.reservation_pool)
+        target = min(need, allocator.get_active_avail())
+        if target <= 0:
+            return
+
+        block_ids = allocator.allocate_memory_blocks(target)
+        if block_ids is not None:
+            coordinator.reservation_pool.push_many(block_ids.tolist())
+
+    def _ds_cleanup_blocks(self, coordinator) -> None:
+        """Return reservation pool and quarantine blocks to the allocator.
+
+        Called at the end of ``_run_dual_stream`` (and on exception) so that
+        blocks borrowed from the allocator are not leaked when the coordinator
+        goes out of scope.
+        """
+        allocator = self.context.kv_block_allocator
+        device = self.context.request_ids.device
+
+        # Drain reservation pool.
+        pool_blocks = []
+        while True:
+            block_id = coordinator.reservation_pool.pop()
+            if block_id is None:
+                break
+            pool_blocks.append(block_id)
+
+        # Drain all quarantined blocks (use main_gen + 1 to release everything).
+        quarantine_blocks = coordinator.quarantine.drain(coordinator.main_gen + 1)
+
+        all_blocks = pool_blocks + quarantine_blocks
+        if all_blocks:
+            allocator.release_memory_blocks(torch.tensor(all_blocks, device=device))
 
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
