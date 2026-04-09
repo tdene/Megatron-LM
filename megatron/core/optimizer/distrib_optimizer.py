@@ -7,6 +7,7 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from contextlib import nullcontext
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -35,7 +36,11 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -53,7 +58,12 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    _OPTIMIZER_TMS_TAG,
+    MixedPrecisionOptimizer,
+    _zero_grad_group_helper,
+    param_group_identifier_keys,
+)
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -97,7 +107,7 @@ class Range:
 class DistributedOptimizer(MixedPrecisionOptimizer):
     """Optimizer that shards state across data-parallel ranks.
 
-    This class reduces memory usage by distributing optimizer states (like 
+    This class reduces memory usage by distributing optimizer states (like
     momentum and variance buffers) across GPUs in the data-parallel group.
 
     Attributes:
@@ -231,9 +241,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _build_gbuf_range_map(cls, param_and_grad_buffer: _ParamAndGradBuffer):
         """Builds a map between parameters and their ranges in the grad buffer.
 
-        These mappings are partitioned according to data type. This method 
-        iterates through all buckets of a grad buffer to construct param 
-        ranges that this rank "owns" (the dp_rank'th shard of each bucket, 
+        These mappings are partitioned according to data type. This method
+        iterates through all buckets of a grad buffer to construct param
+        ranges that this rank "owns" (the dp_rank'th shard of each bucket,
         where each shard is 1/dp_world_size of the bucket).
 
         Args:
@@ -483,33 +493,33 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ):
         """Initializes the distributed optimizer for FP16, BF16, and FP32.
 
-        The steps in this method create the core mapping between param and grad 
-        buffers, parameters, and parameter shard ranges, that is needed for 
-        converting between model param indexes and main parameter shard indexes. 
-        This method also updates the optimizer parameter groups with the 
+        The steps in this method create the core mapping between param and grad
+        buffers, parameters, and parameter shard ranges, that is needed for
+        converting between model param indexes and main parameter shard indexes.
+        This method also updates the optimizer parameter groups with the
         newly created shards.
 
         Args:
             optimizer (torch.optim.Optimizer): Base optimizer such as Adam or SGD.
             config (OptimizerConfig): Configuration object for the optimizer.
-            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that 
-                this can be None for BF16 training if no loss scale is used. 
+            grad_scaler (MegatronGradScaler): Used for scaling gradients. Note that
+                this can be None for BF16 training if no loss scale is used.
                 For FP16, a grad scaler is always required.
-            init_state_fn (Callable, optional): Function to initialize state in 
+            init_state_fn (Callable, optional): Function to initialize state in
                 the optimizer.
             model_chunks (List[MegatronModule]): List of model chunks to optimize.
-            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The 
-                implementation of the distributed optimizer is centered on using 
-                a contiguous buffer for communicating grads & params between 
-                the model state and the optimizer state. For a detailed 
+            per_model_buffers (Dict[int, List[_ParamAndGradBuffer]]): The
+                implementation of the distributed optimizer is centered on using
+                a contiguous buffer for communicating grads & params between
+                the model state and the optimizer state. For a detailed
                 description, see `docs/source/distrib_optimizer.md`.
-            data_parallel_group (ProcessGroup): Data-parallel group used to 
+            data_parallel_group (ProcessGroup): Data-parallel group used to
                 all-gather params after optimizer.step().
-            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel 
+            data_parallel_group_gloo (ProcessGroup, optional): Gloo data-parallel
                 group used specifically for checkpoint loading and saving.
-            data_parallel_group_idx (int): Index in the data-parallel group 
+            data_parallel_group_idx (int): Index in the data-parallel group
                 used by distributed checkpointing logic.
-            distributed_optimizer_instance_id (int): Unique identifier for the 
+            distributed_optimizer_instance_id (int): Unique identifier for the
                 distributed optimizer instance.
         """
 
@@ -601,15 +611,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # Allocate main param shards.
-        (
-            self.model_float16_groups,
-            self.model_fp32_groups,
-            self.shard_float16_groups,
-            self.shard_fp32_groups,
-            self.shard_fp32_from_float16_groups,
-        ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+        # When offloading optimizer during RL, allocate fp32 master weights inside a TMS region
+        # to keep these tensors out of the CUDA-graph memory pool.
+        tms_ctx = (
+            torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+            if config.rl_offload_optimizer_during_inference
+            else nullcontext()
         )
+        with tms_ctx:
+            (
+                self.model_float16_groups,
+                self.model_fp32_groups,
+                self.shard_float16_groups,
+                self.shard_fp32_groups,
+                self.shard_fp32_from_float16_groups,
+            ) = self._build_model_and_main_param_groups(
+                self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+            )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
@@ -784,39 +802,49 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             #   empty tensors (i.e., torch.empty), which in turn reduces memory
             #   fragmentation.
             # - Real data is overwritten during load_parameter_state().
+            # When using TMS offload, allocate inside the TMS region so that
+            # pause/resume keeps these tensors out of the CUDA-graph pool.
+            tms_ctx = (
+                torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+                if self.config.rl_offload_optimizer_during_inference
+                else nullcontext()
+            )
             state_dict_state = []
-            for gbuf_range_maps in self.gbuf_ranges:
-                for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
-                    for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
+            with tms_ctx:
+                for gbuf_range_maps in self.gbuf_ranges:
+                    for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                        for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                            for model_param, param_range_map in gbuf_range_map["param_map"].items():
 
-                            # Get parameter ordering information (see method docstring
-                            # for details).
-                            group_index, group_order = self.model_param_group_index_map[model_param]
-                            state_order = inner_state_dict["param_groups"][group_index]["params"][
-                                group_order
-                            ]
+                                # Get parameter ordering information (see method docstring
+                                # for details).
+                                group_index, group_order = self.model_param_group_index_map[
+                                    model_param
+                                ]
+                                state_order = inner_state_dict["param_groups"][group_index][
+                                    "params"
+                                ][group_order]
 
-                            # Allocate dummy tensors.
-                            numel = len(param_range_map["gbuf_world"])
-                            init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
-                            )
+                                # Allocate dummy tensors.
+                                numel = len(param_range_map["gbuf_world"])
+                                init_shard = lambda dtype=torch.float32: torch.empty(
+                                    (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                )
 
-                            # For precision_aware_optimizer, the empty tensors should also be
-                            #  initialized with the correct dtype.
-                            tensors = {
-                                "exp_avg": init_shard(self.config.exp_avg_dtype),
-                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
-                            }
-                            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
-                                    tensors["master_param"] = init_shard(torch.int16)
-                                else:
-                                    tensors["master_param"] = init_shard(
-                                        self.config.main_params_dtype
-                                    )
-                            state_dict_state.append((state_order, tensors))
+                                # For precision_aware_optimizer, the empty tensors should also be
+                                #  initialized with the correct dtype.
+                                tensors = {
+                                    "exp_avg": init_shard(self.config.exp_avg_dtype),
+                                    "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
+                                }
+                                if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                                    if self.config.store_param_remainders and self.config.bf16:
+                                        tensors["master_param"] = init_shard(torch.int16)
+                                    else:
+                                        tensors["master_param"] = init_shard(
+                                            self.config.main_params_dtype
+                                        )
+                                state_dict_state.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).
             state_dict_state.sort(key=lambda s: s[0])
@@ -848,9 +876,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
+        tms_ctx = (
+            torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+            if self.config.rl_offload_optimizer_during_inference
+            else nullcontext()
         )
+        with tms_ctx:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -944,7 +978,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
                     if k == "param":
                         k = "master_param"
-                    self.optimizer.state[sharded_model_param][k] = v
+                    self.optimizer.state[sharded_model_param][k].copy_(v)
                     continue
 
                 if k == "param":
@@ -2645,4 +2679,3 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return update_successful
-    
