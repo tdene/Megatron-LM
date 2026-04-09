@@ -84,11 +84,23 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Allocator for Mamba state slots
-        self.mamba_state_free_slots = torch.arange(
+        # Allocator for Mamba state slots.
+        # Pre-sized to ``2 * max_requests`` so that ``pad_for_release`` never
+        # needs to reallocate the buffer — avoiding a reallocation that could
+        # shift the CUDA caching allocator's free-block topology between
+        # CUDA graph captures.
+        self.mamba_state_free_slots = torch.empty(
+            2 * self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.mamba_state_free_slots[: self.max_requests] = torch.arange(
             self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        self.mamba_state_free_slots[self.max_requests :] = 0
         self.mamba_state_free_slot_count = self.max_requests
+
+        # Populated by `pad_for_release`; used by the graphed release path.
+        self._free_slot_count_gpu: Optional[torch.Tensor] = None
+        self._free_arange: Optional[torch.Tensor] = None
 
         # Intermediate state extraction buffers (CUDA graph compatible)
         # Each prefill request can produce up to 3 intermediate offsets
@@ -118,10 +130,12 @@ class MambaMetadata:
         self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        self.mamba_state_free_slots[: self.max_requests].copy_(
+            torch.arange(self.max_requests, dtype=torch.int32, device=torch.cuda.current_device())
         )
         self.mamba_state_free_slot_count = self.max_requests
+        if self._free_slot_count_gpu is not None:
+            self._free_slot_count_gpu.fill_(self.max_requests)
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -443,6 +457,8 @@ class MambaMetadata:
         # Get a free slot
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+        if self._free_slot_count_gpu is not None:
+            self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         return mamba_idx
 
@@ -462,6 +478,8 @@ class MambaMetadata:
         mamba_idx = self.mamba_state_free_slots[
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
+        if self._free_slot_count_gpu is not None:
+            self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         return mamba_idx
 
@@ -485,6 +503,46 @@ class MambaMetadata:
             end_idx = start_idx + num_to_free
             self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
             self.mamba_state_free_slot_count = end_idx
+            if self._free_slot_count_gpu is not None:
+                self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
+
+    def pad_for_release(self) -> None:
+        """Extend `mamba_state_free_slots` and allocate GPU scratch state.
+
+        The graphed release path over-writes `max_requests` entries at the current stack pointer
+        and advances the pointer by the number of valid entries, so we need twice as much buffer.
+        """
+        if self._free_arange is not None:
+            return
+        device = torch.cuda.current_device()
+        # Skip reallocation if __init__ already pre-sized to 2 * max_requests.
+        if self.mamba_state_free_slots.numel() < 2 * self.max_requests:
+            new_pool = torch.empty(2 * self.max_requests, dtype=torch.int32, device=device)
+            new_pool[: self.max_requests] = self.mamba_state_free_slots[: self.max_requests]
+            new_pool[self.max_requests :] = 0
+            self.mamba_state_free_slots = new_pool
+        self._free_slot_count_gpu = torch.tensor(
+            [self.mamba_state_free_slot_count], dtype=torch.int32, device=device
+        )
+        self._free_arange = torch.arange(self.max_requests, dtype=torch.int32, device=device)
+
+    def free_slots_gpu(self, packed_slots: torch.Tensor, num_valid: torch.Tensor) -> None:
+        """Shape-stable mamba free that writes a pre-packed buffer onto the stack.
+
+        Args:
+            packed_slots: (`max_requests`,) tensor with mamba slot IDs packed at `[0, num_valid)`.
+            num_valid: 0-d or 1-element int tensor holding the valid count.
+        """
+        assert self._free_arange is not None, "pad_for_release() must run before free_slots_gpu()"
+        assert packed_slots.numel() == self.max_requests
+        free_indices = self._free_slot_count_gpu + self._free_arange
+        self.mamba_state_free_slots[free_indices.long()] = packed_slots
+        self._free_slot_count_gpu.add_(num_valid.to(torch.int32).view(1))
+
+    def sync_to_cpu(self) -> None:
+        """Mirror `_free_slot_count_gpu` back into the Python int."""
+        if self._free_slot_count_gpu is not None:
+            self.mamba_state_free_slot_count = int(self._free_slot_count_gpu.item())

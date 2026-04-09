@@ -24,12 +24,17 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    CUDAGraphCache,
+    get_attention_mask,
+    set_decode_expert_padding,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -104,6 +109,13 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+
+        # CUDA graph cache for the update_requests graph bodies.
+        # The engine switches _ur_eager to False after its own graph warmup
+        # and calls _graphed_update_requests to force-capture the graphs.
+        self._ur_graphs = CUDAGraphCache()
+        self._ur_eager = True
+        self._ur_graph_pool = CudaGraphManager.global_mempool
 
     def _get_mtp_num_heads(self) -> int:
         """Get the number of MTP layers from the model config."""
@@ -1788,14 +1800,18 @@ class TextGenerationController:
         active_request_ids = context.request_ids[:active_request_count]
 
         # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
+        # (detected in previous step's post_process_requests).
+        # Vectorized: build a CPU bool mask in one pass, H2D in one transfer.
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
             if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+                stop_mask = torch.tensor(
+                    [rid in stop_word_finished_ids for rid in request_ids_list],
+                    dtype=torch.bool,
+                    device=active_request_mask.device,
+                )
+                active_request_mask.masked_fill_(stop_mask, 0)
 
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
         finished_request_ids = context.request_ids[finished_idxs]
@@ -1810,8 +1826,8 @@ class TextGenerationController:
             sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         else:
             sampled_mtp_tokens_cuda = None
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
+        update_result = self._graphed_update_requests(
+            context, active_request_mask, new_sample_copy, sampled_mtp_tokens_cuda
         )
 
         return {
@@ -1949,6 +1965,21 @@ class TextGenerationController:
                 self._accepted_token_counts_per_request.fill_(0)
             ret.update(request_bookkeeping)
             return ret
+
+    def _graphed_update_requests(
+        self, context, active_requests_mask, new_tokens, new_speculative_tokens=None
+    ):
+        """Graph-wrapped update_requests: captures/replays CUDA graphs around the bodies."""
+        phase1 = context._prepare_update_requests(
+            active_requests_mask, new_tokens, new_speculative_tokens
+        )
+        for _ in self._ur_graphs(
+            "update_requests", eager=self._ur_eager, pool=self._ur_graph_pool, skip_warmup=True
+        ):
+            context._classify_and_resume_body()
+            context._evict_resume_chunked_tokens_body()
+
+        return context._finalize_update_requests(**phase1)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

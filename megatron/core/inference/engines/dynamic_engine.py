@@ -401,6 +401,26 @@ class DynamicInferenceEngine(AbstractEngine):
 
             context.reset()
 
+        # Switch update_requests from eager mode (direct execution) to
+        # graph mode (capture on first call, replay on subsequent calls).
+        controller._ur_eager = False
+
+        # Force-capture update_requests graphs with deterministic empty
+        # state.  This eliminates first-call capture overhead from the
+        # production path and ensures the graphs are captured with the
+        # same CUDA memory layout as the forward-pass graphs above.
+        device = torch.cuda.current_device()
+        controller._graphed_update_requests(
+            context,
+            active_requests_mask=torch.zeros(0, dtype=torch.uint8, device=device),
+            new_tokens=torch.zeros(0, dtype=torch.int64, device=device),
+        )
+
+        # Verify the graph was captured during warmup.
+        assert (
+            "update_requests" in controller._ur_graphs
+        ), "Graph 'update_requests' was not captured during update_requests warmup"
+
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
@@ -1676,7 +1696,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event.synchronize()
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
         self.context.step_count += 1
-        self.context.prefix_cache_lru_clock += 1
+        self.context.kv_block_allocator.bump_lru_clock()
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
@@ -2328,7 +2348,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                            self.context.kv_block_allocator.bump_lru_clock()
                     else:
                         # No work, but not all pausing: idle.
                         await asyncio.sleep(0.02)

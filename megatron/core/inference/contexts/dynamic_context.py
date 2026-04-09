@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -27,7 +27,7 @@ from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
 )
-from megatron.core.inference.utils import device_memory_summary, tensor_swap
+from megatron.core.inference.utils import device_memory_summary, scatter_pack_valid, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.mamba_hybrid_layer_allocation import (
@@ -244,6 +244,23 @@ class DynamicInferenceContext(BaseInferenceContext):
     REQUEST_ROUNDER = 4
     TMS_TAG = "inference_context"
 
+    # Named offsets into ``_ur_combined_sync`` (the single GPU->CPU sync
+    # buffer read once per ``update_requests`` call).
+    # Graph 1 outputs:
+    _SYNC_BUCKET0 = 0  # bucket_counts[0] (continuing)
+    _SYNC_BUCKET1 = 1  # bucket_counts[1] (chunked)
+    _SYNC_BUCKET2 = 2  # bucket_counts[2] (stayed-paused)
+    _SYNC_BUCKET3 = 3  # bucket_counts[3] (newly paused)
+    _SYNC_RESUME1 = 4  # resume_count from graph-1 resume
+    # Graph 2 outputs:
+    _SYNC_RESUME2 = 5  # resume_count from graph-2 resume
+    _SYNC_ACTIVE_FINAL = 6  # new_active after evict+resume
+    _SYNC_TOTAL_FINAL = 7  # new_total after evict+resume+chunked
+    _SYNC_TOTAL_AVAIL = 8  # kv_block_allocator.total_avail_gpu
+    _SYNC_MAMBA_FREE = 9  # mamba free slot count
+    _SYNC_EVICT_COUNT = 10  # eviction count
+    _SYNC_SIZE = 11
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message=(
@@ -261,11 +278,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
-
-        # Monotonic clock for prefix caching LRU eviction ordering.
-        # Incremented each engine step but kept independent so the engine step
-        # counter is not overloaded with cache-eviction semantics.
-        self.prefix_cache_lru_clock = 0
 
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
@@ -507,23 +519,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = block_count_tensor[0].item()
             paused_block_count = block_count_tensor[1].item()
 
-        self.kv_block_allocator = KVBlockAllocator(
-            context=self,
-            total_count=(
-                block_count if self.unified_memory_level == 0 else block_count + paused_block_count
-            ),
-            paused_count=paused_block_count,
-            enable_prefix_caching=self.enable_prefix_caching,
-            prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
-        )
-
-        # Track request metadata.
-        request_metadata_types = inference_config.request_metadata_types
-        if request_metadata_types is None:
-            request_metadata_types = DynamicInferenceRequest.get_metadata_types()
-        self.request_metadata_types = request_metadata_types
-
-        # Initialize context state.
+        # Initialize context state (needed before allocator for block_bag pre-sizing).
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
 
@@ -533,6 +529,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_kv_block_count = math.ceil(self.max_sequence_length / self.block_size_tokens)
         if self.num_speculative_tokens > 0:
             self.max_kv_block_count += 1
+
+        self.kv_block_allocator = KVBlockAllocator(
+            context=self,
+            total_count=(
+                block_count if self.unified_memory_level == 0 else block_count + paused_block_count
+            ),
+            paused_count=paused_block_count,
+            enable_prefix_caching=self.enable_prefix_caching,
+            prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            max_kv_block_count=self.max_kv_block_count,
+        )
+
+        # Track request metadata.
+        request_metadata_types = inference_config.request_metadata_types
+        if request_metadata_types is None:
+            request_metadata_types = DynamicInferenceRequest.get_metadata_types()
+        self.request_metadata_types = request_metadata_types
 
         # Set max_requests, max_tokens.
         if inference_config.max_requests is None:
@@ -555,9 +568,10 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
 
-        assert self.max_tokens >= self.max_requests, (
+        min_tokens = self.max_requests * (self.num_speculative_tokens + 1)
+        assert self.max_tokens >= min_tokens, (
             f"max_tokens ({self.max_tokens}) must be >= "
-            f"max_requests ({self.max_requests}), "
+            f"max_requests * (num_speculative_tokens + 1) = {min_tokens}, "
             "to have consistency between cuda graph sizes and the block table size."
         )
 
@@ -624,6 +638,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
         self.initialize_all_tensors()
+
+        # Allocate update_requests scratch tensors.  Pre-sizing block_bag and
+        # mamba_state_free_slots in their constructors (above) avoids the
+        # reallocations that used to shift the caching allocator's free-block
+        # topology.  With no reallocations, these allocations are pure additions
+        # that don't disturb subsequent CUDA graph captures.
+        self.init_update_requests_state()
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
@@ -865,6 +886,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
+        self._ur_num_generated_tokens = 1 + self.num_speculative_tokens
+        self._ur_max_allowed_active = min(
+            self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+        )
+        self._ur_spec_tokens: Optional[Tensor] = None
+
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.mamba_metadata = MambaMetadata(
@@ -1096,6 +1123,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[padding_token_slice] = 0
         self.token_to_position_in_request[padding_token_slice] = 0
+        self.token_to_input_ids[padding_token_slice] = 0
+        self.token_to_pos_ids[padding_token_slice] = 0
 
         # Request-level padding.
         active_request_count = self.total_request_count - self.paused_request_count
@@ -1862,9 +1891,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter and LRU clock
         self.step_count = 0
-        self.prefix_cache_lru_clock = 0
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -2335,34 +2362,53 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
-    def _move_book_keeping_tensors(
-        self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
-    ):
+    def _permute_book_keeping_tensors(
+        self, perm: Tensor, next_tokens: Tensor, target: slice = slice(None)
+    ) -> None:
         """
-        Move all the relevent booking tensors with src idxs to dst idxs
+        Permute bookkeeping tensors according to the provided indices.
+
+        Args:
+            perm (Tensor): A 1-D long tensor of indices indicating the new order of requests.
+            next_tokens (Tensor): An extra tensor to permute
+            target (slice, optional): A slice object specifying the range of requests to permute.
+                Defaults to slice(None), which means all requests.
         """
-        self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
-        self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
-            src_idxs
-        ]
-        self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
-        self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
-        self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
-        if new_speculative_tokens is not None:
-            new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
-        self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
-        self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[src_idxs]
-        self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[src_idxs]
-        self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[src_idxs]
+        p = perm
+        s = target
+        self.request_kv_length_offsets[s] = self.request_kv_length_offsets[p]
+        self.request_query_lengths[s] = self.request_query_lengths[p]
+        self.request_output_lengths[s] = self.request_output_lengths[p]
+        self.request_ids[s] = self.request_ids[p]
+        self.request_in_prefill_status_tensor[s] = self.request_in_prefill_status_tensor[p]
+        if next_tokens is not None:
+            next_tokens[s] = next_tokens[p]
+
+        self.request_to_kv_block_ids[s] = self.request_to_kv_block_ids[p]
+        self.request_kv_block_counts[s] = self.request_kv_block_counts[p]
+        self.request_last_kv_block_id[s] = self.request_last_kv_block_id[p]
+        self.request_last_kv_block_offset[s] = self.request_last_kv_block_offset[p]
 
         for metadata_tensor in self.request_metadata.values():
-            metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
+            metadata_tensor[s] = metadata_tensor[p]
 
         if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
-                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+            self.mamba_metadata.request_to_mamba_state_idx[s] = (
+                self.mamba_metadata.request_to_mamba_state_idx[p]
             )
+
+        if self._ur_spec_tokens is not None:
+            self._ur_spec_tokens[:, s] = self._ur_spec_tokens[:, p]
+
+        # Keep the prev-block-ID snapshot aligned with request_last_kv_block_id.
+        # Eviction and chunked positioning permute slots after the snapshot is
+        # taken; without this, token bookkeeping under speculative decoding
+        # would read pre-permute prev IDs at post-permute slot positions.
+        if (
+            self.num_speculative_tokens > 0
+            and getattr(self, "_ur_prev_last_block_ids", None) is not None
+        ):
+            self._ur_prev_last_block_ids[s] = self._ur_prev_last_block_ids[p]
 
     def _swap_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
@@ -2394,15 +2440,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
 
+        # See _permute_book_keeping_tensors for rationale.
+        if (
+            self.num_speculative_tokens > 0
+            and getattr(self, "_ur_prev_last_block_ids", None) is not None
+        ):
+            tensor_swap(self._ur_prev_last_block_ids, src_idxs, dst_idxs)
+
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
-        """
-        Get the index of the chunked prefill request in the context.
+        """Get the slot index of the chunked prefill request.
 
-        If `safe` is True, then clamp the search space to the current total request count.
-        Otherwise, expand the search beyond the current total request count.
+        If ``safe`` is True, only ``request_ids[:total_request_count]`` is
+        searched; a hidden chunked request (past the boundary) returns -1.
+        Otherwise the search covers the full ``[0, max_requests)`` range.
 
-        Return:
-            (int) Index of the chunked prefill request, or -1 if none exists.
+        Uses a single ``.item()`` CPU sync via the any+argmax shape-stable
+        pattern (no variable-length intermediates).
+
+        Returns:
+            (int) Slot index of the chunked prefill request, or -1 if none
+            exists in the searched range.
         """
         if self.chunked_prefill_request_id == -1:
             return -1
@@ -2411,687 +2468,879 @@ class DynamicInferenceContext(BaseInferenceContext):
         if safe:
             request_ids = request_ids[: self.total_request_count]
 
-        matches = torch.where(request_ids == self.chunked_prefill_request_id)[0]
-        if len(matches) > 0:
-            return matches[0].item()
-        return -1
+        mask = request_ids == self.chunked_prefill_request_id
+        any_match = mask.any()
+        # argmax on a bool/int tensor returns the index of the first True
+        # (or 0 if all False); disambiguate via where against a -1 sentinel.
+        first_match = mask.to(torch.int32).argmax()
+        idx_gpu = torch.where(any_match, first_match, torch.full_like(first_match, -1))
+        return int(idx_gpu.item())
 
     def is_chunked_prefill_enabled(self) -> bool:
         """Returns whether chunked prefill is enabled."""
         return self.enable_chunked_prefill
 
     def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
-        """Release memory blocks used by the given request idxs.
+        """Release KV blocks and mamba slots for the given request indexes.
+
+        Dispatches to the shape-stable :meth:`_release_blocks_from_mask_gpu`.
+        Scratch tensors are allocated in ``__init__`` so this is always safe.
 
         Args:
-            request_indexes (torch.Tensor): Request indexes. (*Note*, NOT request
-                ids.)
+            request_indexes (torch.Tensor): Request indexes. (*Note*, NOT
+                request ids.)
         """
-        kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
-        non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
+        device = request_indexes.device
+        released_mask = torch.zeros(self.max_requests, dtype=torch.bool, device=device)
+        released_mask[request_indexes] = True
+        self._release_blocks_from_mask_gpu(released_mask)
+        # Eager release: we just enqueued possible dereg events GPU-side, so
+        # arm the host flag that drain_pending_dereg uses to gate its sync,
+        # then drain in the same call to keep the host dict consistent for
+        # subsequent add_request calls.
+        self.kv_block_allocator._pc_dereg_may_have_events = True
+        self.kv_block_allocator.drain_pending_dereg()
 
-        # Reset the KV blocks for finished requests.
-        # Note: do not use fill_() (or add_() and similar inplace ops) here.
-        # The combinition of indexing with a tensor (like finished_idxs) and
-        # fill_()/add_() creates a clone and updates it instead of the original
-        # tensor.
-        self.request_to_kv_block_ids[request_indexes] = -1
+    def _release_blocks_from_mask_gpu(self, released_mask: Tensor) -> None:
+        """Shape-stable release driven by a full-size bool mask.
 
-        # Free Mamba slots.
+        The body is graph-safe: every intermediate has a shape that depends
+        only on ``max_requests`` and ``max_kv_block_count``, and the stack
+        pointer advances via GPU-scalar ops. Safe to call from inside a
+        captured graph body (``update_requests`` Phase 2) or from host
+        code (the ``release_memory_blocks_from_request_indexes`` wrapper).
+
+        Args:
+            released_mask: ``(max_requests,)`` bool tensor. True at each
+                slot whose KV blocks and mamba slot should be released.
+        """
+        max_req = self.max_requests
+        max_blk = self.max_kv_block_count
+        max_release = max_req * max_blk
+
+        # ── KV blocks: scatter-pack into the release buffer ──
+        row_mask = released_mask.unsqueeze(1).expand(max_req, max_blk)
+        kv_gathered = torch.where(
+            row_mask,
+            self.request_to_kv_block_ids,
+            torch.full_like(self.request_to_kv_block_ids, -1),
+        )
+        kv_flat = kv_gathered.reshape(-1)
+        num_valid_gpu = scatter_pack_valid(
+            kv_flat,
+            kv_flat != -1,
+            self._ur_release_pack_buf,
+            fill_value=self.kv_block_allocator.dummy_block_idx,
+            sink_idx_value=max_release,
+        )
+        if self.enable_prefix_caching:
+            # Prefix-aware release: per-block ref count decrement,
+            # deregistration, hash clearing, and policy-dependent
+            # pool push. Host-side dict cleanup is deferred to
+            # ``drain_pending_dereg`` called after this graph body syncs.
+            self.kv_block_allocator.release_memory_blocks_prefix_aware_gpu(
+                self._ur_release_pack_buf[:max_release], num_valid_gpu
+            )
+        else:
+            self.kv_block_allocator.release_memory_blocks_gpu(
+                self._ur_release_pack_buf[:max_release], num_valid_gpu
+            )
+        # Invalidate released rows in the block ID matrix.
+        self.request_to_kv_block_ids.masked_fill_(row_mask, -1)
+
+        # ── Mamba slots: same pattern over a 1-D tensor ──
         if self.is_hybrid_model:
-            self.mamba_metadata.free_slots(request_indexes)
+            mamba_idx_tensor = self.mamba_metadata.request_to_mamba_state_idx
+            mamba_gathered = torch.where(
+                released_mask, mamba_idx_tensor, torch.full_like(mamba_idx_tensor, -1)
+            )
+            m_num_valid_gpu = scatter_pack_valid(
+                mamba_gathered,
+                mamba_gathered != -1,
+                self._ur_mamba_release_pack_buf,
+                fill_value=0,
+                sink_idx_value=max_req,
+            )
+            self.mamba_metadata.free_slots_gpu(
+                self._ur_mamba_release_pack_buf[:max_req], m_num_valid_gpu
+            )
+            # Invalidate the released slot mappings.
+            self.mamba_metadata.request_to_mamba_state_idx.masked_fill_(released_mask, -1)
 
-        # Clear intermediate offset entries for released requests
+        # ── Mamba slot allocator intermediate state ──
+        # Mask-based resets so the op shapes never depend on the number of
+        # released requests. 1-D tensors use the base mask; 2-D tensors
+        # broadcast it over the second dim.
         if self.mamba_slot_allocator is not None:
             sa = self.mamba_slot_allocator
-            sa._intermediate_counts_gpu[request_indexes] = 0
-            sa._intermediate_offsets_gpu[request_indexes] = 0
-            sa._intermediate_block_ids_gpu[request_indexes] = -1
-            sa._eos_cache_block_id_gpu[request_indexes] = -1
+            sa._intermediate_counts_gpu.masked_fill_(released_mask, 0)
+            sa._eos_cache_block_id_gpu.masked_fill_(released_mask, -1)
+            row_mask_k = released_mask.unsqueeze(1).expand_as(sa._intermediate_offsets_gpu)
+            sa._intermediate_offsets_gpu.masked_fill_(row_mask_k, 0)
+            sa._intermediate_block_ids_gpu.masked_fill_(row_mask_k, -1)
 
-    def resume_paused_requests(
-        self, active_request_count: int, newly_paused_request_ids: torch.Tensor
-    ) -> tuple[int, torch.Tensor]:
-        """Resume as many paused requests as we have space for in the active buffer.
+    def init_update_requests_state(self) -> None:
+        """Allocate the static GPU scratch tensors used by ``update_requests``.
 
-        Args:
-            active_request_count (int): Number of active requests.
-            newly_paused_request_ids (torch.Tensor): List of newly paused request ids.
-            next_tokens (torch.Tensor): Sampled tokens.
-
-        Returns:
-            (tuple[int, torch.Tensor]) active_request_count, newly_paused_request_ids.
+        Called from ``__init__`` after ``initialize_all_tensors()``.  Pre-sizing
+        ``block_bag`` and ``mamba_state_free_slots`` in their constructors
+        eliminates the reallocations that used to disturb the CUDA caching
+        allocator between graph captures, making this safe to run before
+        engine warmup.
         """
 
-        # Assign released blocks to paused requests.
-        # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        # Layout: [active | paused | dead]. Paused at [active_count, total).
-        active_count = self.total_request_count - self.paused_request_count
-        resume_request_count = 0
-        if self.paused_request_count > 0:
-            active_block_count_avail = self.kv_block_allocator.get_active_avail()
-            paused_start = active_count
-            paused_end = self.total_request_count
-            paused_block_counts = self.request_kv_block_counts[paused_start:paused_end]
-            # In the [active | paused] layout, the leftmost paused requests are
-            # the most recently paused (LIFO). Resume from left to right — no flip needed.
+        device = torch.cuda.current_device()
 
-            # Check which paused requests will actually need a new block upon resuming
-            offsets = self.request_last_kv_block_offset[paused_start:paused_end]
-            needs_new_block = (
-                offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).to(paused_block_counts.dtype)
+        # Prepare the allocators for shape-stable (graphed) release and
+        # allocate. Both allocators grow their backing buffers and allocate
+        # static aranges for indexing; idempotent if already padded.
+        self.kv_block_allocator.pad_for_release(self.max_requests, self.max_kv_block_count)
+        if self.is_hybrid_model:
+            self.mamba_metadata.pad_for_release()
+        max_release_per_step = self.kv_block_allocator.max_release_per_step
 
-            # Add +1 ONLY to the block counts of requests that finished their previous memory block
-            paused_block_counts = paused_block_counts + needs_new_block
-            paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-            resume_request_count = min(
-                torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel(),
-                self.kv_block_allocator.total_avail,
+        self._ur_sort_key = torch.full((self.max_requests,), 5, dtype=torch.int32, device=device)
+        self._ur_next_tokens = torch.zeros(self.max_requests, dtype=torch.int64, device=device)
+        self._ur_arange_long = torch.arange(self.max_requests, dtype=torch.int64, device=device)
+        self._ur_active_pre_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+        self._ur_total_pre_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+        self._ur_chunked_id_gpu = torch.full((1,), -1, dtype=torch.int32, device=device)
+        self._ur_active_mask = torch.zeros(self.max_requests, dtype=torch.uint8, device=device)
+        self._ur_bucket_counts = torch.zeros(5, dtype=torch.int64, device=device)
+        self._ur_swap_src = torch.empty(1, dtype=torch.int64, device=device)
+        self._ur_swap_dst = torch.empty(1, dtype=torch.int64, device=device)
+        if self.num_speculative_tokens > 0:
+            self._ur_spec_tokens = torch.zeros(
+                self.num_speculative_tokens, self.max_requests, dtype=torch.int64, device=device
+            )
+            # Pre-allocated constants for the multi-token bookkeeping path,
+            # avoiding per-replay allocations inside the captured graph body.
+            num_gen = self._ur_num_generated_tokens
+            self._ur_gen_arange = torch.arange(num_gen, dtype=torch.int64, device=device)
+            self._ur_pos_offset_pattern = self._ur_gen_arange.repeat(self.max_requests)
+        self._ur_prev_last_block_ids = torch.empty(
+            self.max_requests, dtype=torch.int32, device=device
+        )
+        # Read-only (max_requests,) view of a single 1. Used as the source
+        # for ``_ur_bucket_counts.index_add_`` inside the classify graph
+        # body — the scalar's stride-0 expansion avoids the per-call
+        # (max_requests * 8) byte allocation a real ones-tensor would need.
+        self._ur_ones_long = torch.ones((), dtype=torch.int64, device=device).expand(
+            self.max_requests
+        )
+
+        # Scatter-pack scratch buffers for the graphed release path.
+        # Size is max_release + 1: valid entries land in [0, num_valid),
+        # invalid (-1 sentinel) entries all land at index max_release (sink)
+        # and never get read. The +1 is the sink slot.
+        self._ur_release_pack_buf = torch.full(
+            (max_release_per_step + 1,),
+            self.kv_block_allocator.dummy_block_idx,
+            dtype=torch.int32,
+            device=device,
+        )
+        # Released KV-block mask and its (max_requests, max_kv_block_count)
+        # expansion are computed on the fly each release; no scratch needed.
+        if self.is_hybrid_model:
+            # Mamba release at most max_requests slots per call; +1 for sink.
+            self._ur_mamba_release_pack_buf = torch.zeros(
+                self.max_requests + 1, dtype=torch.int32, device=device
             )
 
-            # Constrain resumptions by the maximum allowed active requests and tokens
-            max_allowed_active = min(
-                self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+        # GPU-resident boundaries consumed by the folded release inside the
+        # classify graph and by the resume graph body. The classify graph
+        # derives them from ``_ur_bucket_counts``:
+        #   _ur_new_active_gpu = bucket[0] + bucket[1]  (continues + chunked)
+        #   _ur_new_total_gpu  = new_active_gpu + bucket[2] + bucket[3]
+        self._ur_new_active_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+        self._ur_new_total_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+
+        # Output scalar for the resume graph body: number of paused requests
+        # brought back to active.
+        self._ur_resume_count_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+
+        # Eviction scratch: packed evict IDs buffer (+ 1 sink slot) and
+        # GPU-scalar evict count.
+        self._ur_evict_ids_buf = torch.full(
+            (self.max_requests + 1,), -1, dtype=torch.int64, device=device
+        )
+        self._ur_evict_count_gpu = torch.zeros(1, dtype=torch.int64, device=device)
+
+        # Newly-paused IDs capture buffer (+ 1 sink slot).  Packed inside
+        # graph 1 before eviction can modify request_ids.
+        self._ur_newly_paused_ids_buf = torch.full(
+            (self.max_requests + 1,), -1, dtype=torch.int64, device=device
+        )
+
+        # Static buffers for paused tokens, avoiding a per-step clone.
+        # In _finalize_update_requests, the paused region of _ur_next_tokens
+        # is copied into these buffers (GPU→GPU, no alloc) instead of cloned.
+        self._ur_paused_tokens_buf = torch.zeros(
+            self.max_requests, dtype=torch.int64, device=device
+        )
+        if self.num_speculative_tokens > 0:
+            self._ur_paused_spec_tokens_buf = torch.zeros(
+                self.num_speculative_tokens, self.max_requests, dtype=torch.int64, device=device
             )
-            allowed_to_resume = max(0, max_allowed_active - active_request_count)
-            resume_request_count = min(resume_request_count, allowed_to_resume)
 
-        # In [active | paused] layout, resumed requests are at the left of the
-        # paused region: [active_count, active_count + resume_request_count).
-        # Capture resume_start BEFORE decrementing paused_request_count.
-        resume_start = active_count  # = total - paused (before decrement)
+        # Combined sync buffer for the graph, read in a single .cpu().
+        # Named offsets (class-level _SYNC_* constants) index into this buffer.
+        self._ur_combined_sync = torch.zeros(self._SYNC_SIZE, dtype=torch.int64, device=device)
 
-        self.paused_request_count -= resume_request_count
-        active_request_count += resume_request_count
+    def _graphed_resume_body(self) -> None:
+        """Graph-safe resume body: pure GPU tensor ops over max_requests buffers.
 
-        # Resume requests by assigning blocks and updating bookkeeping tensors.
-        if resume_request_count > 0:
-            resume_end = resume_start + resume_request_count
+        Layout: ``[active | paused | dead]``.
+        ``_ur_new_active_gpu`` = boundary between active and paused (= active count).
+        ``_ur_new_total_gpu`` = boundary between paused and dead.
 
-            # Check which resumed requests actually need a new block
-            offsets = self.request_last_kv_block_offset[resume_start:resume_end]
-            needs_new_block = offsets >= (self.block_size_tokens - 1 - self.num_speculative_tokens)
-            num_new_blocks = needs_new_block.sum().item()
+        Reads these boundaries, writes the updated ``_ur_new_active_gpu`` back
+        in-place (incremented by the number of resumed requests), and leaves
+        ``_ur_resume_count_gpu`` holding the count of requests actually resumed.
 
-            if num_new_blocks > 0:
-                assert num_new_blocks <= self.kv_block_allocator.total_avail
-                block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+        Expresses the resume logic as fully masked tensor ops:
 
-                # Apply updates only to the requests that required a new block
-                relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
-                row_idx = resume_start + relative_row_idx
-                col_idx = self.request_kv_block_counts[row_idx]
-
-                self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
-                self.request_kv_block_counts[row_idx] += 1
-                self.request_last_kv_block_id[row_idx] = block_ids
-
-        # Remove resumed IDs from newly_paused_request_ids.  The list was built
-        # in positional order (leftmost paused first), and resume takes from the
-        # left of the paused region, so slicing off the first `resume_request_count`
-        # entries removes exactly the resumed IDs.
-        if newly_paused_request_ids is not None and resume_request_count > 0:
-            newly_paused_request_ids = newly_paused_request_ids[resume_request_count:]
-
-        return active_request_count, newly_paused_request_ids
-
-    def evict_overflow_paused_requests(
-        self,
-        active_request_count: int,
-        next_tokens: torch.Tensor,
-        new_speculative_tokens: Optional[torch.Tensor] = None,
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """Evict requests that overflow the paused buffer.
-
-        Args:
-            active_request_count (int): Number of active requests.
-            next_tokens (torch.Tensor): Sampled tokens.
-
-        Returns:
-            (torch.Tensor) Evicted request ids.
+        1. Compute ``active_used`` and ``active_avail`` via masked sum.
+        2. For each paused slot, compute ``block_count + needs_new_block``.
+        3. Forward cumsum over paused slots (left-to-right = most-recently
+           paused first in ``[active | paused]`` LIFO layout).
+        4. Count how many paused slots fit within the active block budget.
+        5. Clamp by ``total_avail_gpu`` and by ``max_allowed_active -
+           active_cur``.
+        6. Allocate new blocks for the "needs_new" slots in the resumed
+           range via ``allocate_memory_blocks_gpu``.
+        7. Masked write back to ``request_to_kv_block_ids``,
+           ``request_kv_block_counts``, ``request_last_kv_block_id``.
         """
+        max_req = self.max_requests
+        slot_idx = self._ur_arange_long  # (max_req,) int64
+        active_cur = self._ur_new_active_gpu  # (1,) int64 — start of paused region
+        total_cur = self._ur_new_total_gpu  # (1,) int64
+        active_count_const = self.kv_block_allocator.active_count  # Python int const
+        max_allowed_active_const = self._ur_max_allowed_active  # Python int const
+        block_size_threshold = (
+            self.block_size_tokens - 1 - self.num_speculative_tokens
+        )  # Python int const
 
-        # Overflow paused block count.
-        overflow_paused_block_count = (
-            self.kv_block_allocator.get_paused_used() - self.kv_block_allocator.paused_count
+        # -- Slot-role masks: [active | paused | dead] --
+        is_active_now = slot_idx < active_cur
+        is_paused_now = (slot_idx >= active_cur) & (slot_idx < total_cur)
+
+        # -- Active-used block budget --
+        block_count_dtype = self.request_kv_block_counts.dtype
+        active_blocks = torch.where(
+            is_active_now,
+            self.request_kv_block_counts,
+            torch.zeros_like(self.request_kv_block_counts),
+        )
+        active_used_gpu = active_blocks.to(torch.int64).sum()
+        active_avail_gpu = active_count_const - active_used_gpu  # 0-d int64
+
+        # -- Needs-new-block per paused slot --
+        needs_new_block_full = (
+            self.request_last_kv_block_offset >= block_size_threshold
+        )  # (max_req,) bool
+        needs_new_block_cnt = needs_new_block_full.to(block_count_dtype)
+        paused_blocks_full = torch.where(
+            is_paused_now,
+            self.request_kv_block_counts + needs_new_block_cnt,
+            torch.zeros_like(self.request_kv_block_counts),
+        )
+        paused_blocks_i64 = paused_blocks_full.to(torch.int64)
+        total_paused_blocks = paused_blocks_i64.sum()
+
+        # -- Forward cumsum over paused region --
+        # In [active | paused], paused_blocks_full is 0 for active slots and
+        # nonzero for paused slots. The forward cumsum naturally accumulates
+        # from the leftmost paused (most recently paused = resume first).
+        forward_cumsum = paused_blocks_i64.cumsum(dim=0)
+
+        # -- fits: count paused slots whose forward cumsum <= budget --
+        # Only count paused slots (active slots have cumsum = 0 which is
+        # always <= budget, so we must restrict to the paused region).
+        over_budget_paused = is_paused_now & (forward_cumsum > active_avail_gpu)
+        i_star = over_budget_paused.to(torch.int64).sum()  # 0-d
+        paused_count = total_cur.view(()) - active_cur.view(())
+        fits_gpu = paused_count - i_star  # 0-d
+
+        # -- Clamp by total_avail and by max_allowed_active - active_cur --
+        # For LRU prefix caching, the effective pool also includes
+        # currently-cached blocks (ref=0, hash set), which the graphed
+        # allocate path will LRU-evict if needed. REF_ZERO doesn't cache
+        # anything, so its pool is just ``total_avail_gpu``.
+        if (
+            self.enable_prefix_caching
+            and self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU
+        ):
+            alloc = self.kv_block_allocator
+            evictable = (
+                ((alloc.block_ref_counts == 0) & (alloc.block_hashes != -1)).to(torch.int64).sum()
+            )
+            total_pool = alloc.total_avail_gpu.view(()).to(torch.int64) + evictable
+        else:
+            total_pool = self.kv_block_allocator.total_avail_gpu.view(()).to(torch.int64)
+        resume_by_pool = torch.minimum(fits_gpu, total_pool)
+        room = torch.clamp(max_allowed_active_const - active_cur.view(()), min=0)
+        resume_count_gpu = torch.minimum(resume_by_pool, room)
+        # Avoid negative resume counts (defensive; can't happen unless state corrupted).
+        resume_count_gpu = torch.clamp(resume_count_gpu, min=0)
+
+        # -- Write outputs --
+        self._ur_resume_count_gpu.copy_(resume_count_gpu.view(1))
+        # Resume grows active: boundary shifts right by resume_count.
+        new_active_after_resume = active_cur.view(()) + resume_count_gpu
+        self._ur_new_active_gpu.copy_(new_active_after_resume.view(1))
+
+        # -- Resumed range = [old_active_cur, old_active_cur + resume_count) --
+        # These are the leftmost paused slots, which become active.
+        resumed_range_start = active_cur.view(())
+        resumed_range_end = resumed_range_start + resume_count_gpu
+        resumed_mask = (slot_idx >= resumed_range_start) & (slot_idx < resumed_range_end)
+
+        # -- "Needs new" among resumed slots --
+        needs_new_in_resumed = resumed_mask & needs_new_block_full
+        needs_new_i64_mask = needs_new_in_resumed.to(torch.int64)
+        num_new_blocks_gpu = needs_new_i64_mask.sum()
+
+        # -- Allocate --
+        if self.enable_prefix_caching:
+            # Prefix-aware: may LRU-evict cached blocks to refill the pool,
+            # bumps ref counts and LRU timestamps for new allocations.
+            allocated_full = self.kv_block_allocator.allocate_memory_blocks_prefix_aware_gpu(
+                num_new_blocks_gpu
+            )
+        else:
+            allocated_full = self.kv_block_allocator.allocate_memory_blocks_gpu(num_new_blocks_gpu)
+
+        # -- Per-slot target into allocated_full --
+        prefix = torch.cumsum(needs_new_i64_mask, dim=0) - needs_new_i64_mask
+        safe_prefix = prefix.clamp(max=max_req - 1)
+        allocated_per_slot = allocated_full[safe_prefix]  # (max_req,) int32
+
+        # -- 2D masked write: request_to_kv_block_ids[i, col_counts[i]] = allocated --
+        col_idx_long = self.request_kv_block_counts.to(torch.int64).clamp(
+            min=0, max=self.max_kv_block_count - 1
+        )
+        current_vals = self.request_to_kv_block_ids[slot_idx, col_idx_long]
+        new_vals = torch.where(needs_new_in_resumed, allocated_per_slot, current_vals)
+        self.request_to_kv_block_ids[slot_idx, col_idx_long] = new_vals
+
+        # -- Increment per-slot block counts where needs_new_in_resumed --
+        self.request_kv_block_counts.add_(
+            needs_new_in_resumed.to(self.request_kv_block_counts.dtype)
         )
 
-        # Nothing to evict?
-        if overflow_paused_block_count <= 0:
-            return None
-
-        # Overflow paused block count.
-        # Layout: [active | paused]. Paused at [active_count, total).
-        active_count = self.total_request_count - self.paused_request_count
-        paused_block_counts = self.request_kv_block_counts[active_count : self.total_request_count]
-        paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
-        valid_paused_request_count = torch.nonzero(
-            paused_block_counts_cumsum <= self.kv_block_allocator.paused_count
-        ).numel()
-        overflow_paused_request_count = self.paused_request_count - valid_paused_request_count
-
-        # Nothing to evict? (Similar to checking overflow_paused_block_count
-        # above, but here we allow up to one paused request to overflow into the
-        # active buffer.
-        if overflow_paused_request_count == 0:
-            return None
-
-        # Evict request count. In the [active | paused] layout, the oldest
-        # paused requests are at the RIGHT (tail). Evict from the tail.
-        # We flip the overflow portion (rightmost paused) to count evicted
-        # blocks from the rightmost side.
-        paused_block_counts_tail = paused_block_counts[-overflow_paused_request_count:].flip(
-            dims=[0]
+        # -- Update last block ID --
+        new_last = torch.where(
+            needs_new_in_resumed,
+            allocated_per_slot.to(self.request_last_kv_block_id.dtype),
+            self.request_last_kv_block_id,
         )
-        paused_block_counts_cumsum = paused_block_counts_tail.cumsum(dim=0)
-        remaining_paused_request_counts = torch.arange(
-            overflow_paused_request_count - 1,
-            -1,
-            -1,
-            dtype=paused_block_counts_cumsum.dtype,
-            device=torch.cuda.current_device(),
+        self.request_last_kv_block_id.copy_(new_last)
+
+    def _graphed_chunked_positioning(self) -> None:
+        """Graph-safe chunked-prefill positioning.
+
+        Finds the chunked request slot via a GPU-scalar search, computes
+        whether to swap it to the end of active (Case 1: was active this
+        step) or pull it to the boundary (Case 2: was hidden), and
+        executes the swap entirely via GPU-scalar indexed ops.  When no
+        chunked request exists or no swap is needed, ``src == dst`` and
+        ``_swap_book_keeping_tensors`` is a self-swap no-op.
+
+        Adjusts ``_ur_new_total_gpu`` in-place (decrements by 1 for
+        Case 1 — hiding the active chunked request).
+        """
+        max_req = self.max_requests
+        slot_idx = self._ur_arange_long
+
+        # -- Find the chunked request across the full buffer --
+        chunked_mask = self.request_ids[:max_req] == self._ur_chunked_id_gpu
+        has_any = chunked_mask.any()
+        chunked_idx = chunked_mask.to(torch.int32).argmax().to(torch.int64)
+
+        total_cur = self._ur_new_total_gpu.view(())  # 0-d int64
+
+        # Case 1: chunked was active (index < total) → swap to total-1, hide
+        is_active_chunked = has_any & (chunked_idx < total_cur)
+        case1_dst = (total_cur - 1).clamp(min=0)
+        needs_case1 = is_active_chunked & (chunked_idx != case1_dst)
+
+        # Case 2: chunked was hidden (index >= total) → pull to boundary.
+        # Clamp dst so the swap can never index past the buffer when total_cur
+        # somehow saturates to max_requests (defensive; shouldn't occur because
+        # a hidden chunked implies at least one slot remains beyond total_cur).
+        is_hidden_chunked = has_any & ~is_active_chunked
+        case2_dst = total_cur.clamp(max=self.max_requests - 1)
+        needs_case2 = is_hidden_chunked & (chunked_idx != case2_dst)
+
+        # Unified src/dst: default to (0, 0) for identity no-op swap
+        needs_any = needs_case1 | needs_case2
+        zero = torch.zeros_like(chunked_idx)
+        src_val = torch.where(needs_any, chunked_idx, zero)
+        dst_val = torch.where(needs_case1, case1_dst, torch.where(needs_case2, case2_dst, zero))
+
+        self._ur_swap_src.copy_(src_val.view(1))
+        self._ur_swap_dst.copy_(dst_val.view(1))
+
+        self._swap_book_keeping_tensors(
+            src_idxs=self._ur_swap_src,
+            dst_idxs=self._ur_swap_dst,
+            next_tokens=self._ur_next_tokens,
+            new_speculative_tokens=self._ur_spec_tokens,
         )
-        net_block_counts = paused_block_counts_cumsum - remaining_paused_request_counts
-        evict_request_count = torch.nonzero(net_block_counts >= 0)[0].item() + 1
 
-        # Eviction index range: rightmost slots in [active | paused] are already at tail.
-        evict_start_idx = self.total_request_count - evict_request_count
-        evict_end_idx = self.total_request_count
-        evict_request_idxs = torch.arange(
-            evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
+        # Hide the active chunked request by decrementing total.
+        self._ur_new_total_gpu.sub_(is_active_chunked.to(torch.int64).view(1))
+
+    def _graphed_eviction_body(self) -> None:
+        """Graph-safe eviction: masked no-op when there is no overflow.
+
+        Layout: ``[active | paused | dead]``.
+        Reads ``_ur_new_active_gpu`` / ``_ur_new_total_gpu`` as the
+        current boundaries (written by the preceding resume body within
+        the same graph capture).  Computes the overflow and eviction
+        count as GPU scalars, packs evicted request IDs into
+        ``_ur_evict_ids_buf``, releases their blocks, and shrinks the
+        total boundary.
+
+        In ``[active | paused]`` layout the oldest paused requests are at
+        the rightmost end of the paused region (just before dead slots).
+        Eviction removes from the tail, so **no permutation is needed** --
+        we just release and decrement ``_ur_new_total_gpu``.
+
+        When ``overflow <= 0`` (the common case), ``evict_count == 0``
+        and every masked operation is a no-op.
+        """
+        max_req = self.max_requests
+        slot_idx = self._ur_arange_long
+        active_cur = self._ur_new_active_gpu  # (1,) int64
+        total_cur = self._ur_new_total_gpu  # (1,) int64
+        paused_count_const = self.kv_block_allocator.paused_count  # Python int const
+
+        # [active | paused]: paused at [active_cur, total_cur)
+        is_paused = (slot_idx >= active_cur) & (slot_idx < total_cur)
+
+        # -- Overflow --
+        paused_blocks = torch.where(
+            is_paused,
+            self.request_kv_block_counts.to(torch.int64),
+            torch.zeros_like(self.request_kv_block_counts, dtype=torch.int64),
         )
-        evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
+        paused_sum = paused_blocks.sum()
+        overflow = paused_sum - paused_count_const
+        has_overflow = overflow > 0
 
-        # Release memory.
-        self.release_memory_blocks_from_request_indexes(evict_request_idxs)
+        # -- Evict count: smallest k from the RIGHT of the paused region
+        #    whose cumulative block count >= overflow.
+        # reverse_from_right[i] = sum of paused_blocks from i to end.
+        # For paused slots: forward_cumsum gives left-to-right running sum.
+        # reverse = total - exclusive_cumsum.
+        forward_cumsum = paused_blocks.cumsum(dim=0)
+        exclusive_cumsum = forward_cumsum - paused_blocks
+        reverse_from_right = paused_sum - exclusive_cumsum
 
-        # In the [active | paused] layout, evicted requests are already at the
-        # tail of the buffer. No permutation needed — just shrink the counts.
-        self.paused_request_count -= evict_request_count
-        self.total_request_count -= evict_request_count
+        # Slots where evicting from this slot rightward covers the overflow.
+        sufficient = is_paused & (reverse_from_right >= overflow) & has_overflow
+        sufficient_idx = torch.where(sufficient, slot_idx, torch.full_like(slot_idx, -1))
+        rightmost_i = sufficient_idx.max()  # 0-d int64 — rightmost sufficient slot
 
-        return evict_request_ids
+        evict_count = torch.where(
+            has_overflow, total_cur.view(()) - rightmost_i, torch.zeros_like(total_cur.view(()))
+        )
+
+        # -- Eviction mask: rightmost `evict_count` paused slots --
+        evict_start = total_cur.view(()) - evict_count
+        evict_mask = is_paused & (slot_idx >= evict_start)
+
+        # -- Capture evicted IDs before release --
+        scatter_pack_valid(
+            self.request_ids[:max_req],
+            evict_mask,
+            self._ur_evict_ids_buf,
+            fill_value=-1,
+            sink_idx_value=max_req,
+        )
+
+        # -- Release blocks for evicted requests --
+        self._release_blocks_from_mask_gpu(evict_mask)
+
+        # -- Update boundaries --
+        # In [active | paused], evicted slots are already at the tail.
+        # No permutation needed — just shrink total. Active boundary unchanged.
+        self._ur_new_total_gpu.sub_(evict_count.view(1))
+        self._ur_evict_count_gpu.copy_(evict_count.view(1))
 
     def update_requests(
         self,
         active_requests_mask: Tensor,
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
-    ) -> Tensor:
+    ) -> Dict:
         """Update context state after calling engine.step().
 
-        This method is responsible for:
-        - Update prefill requests to decode requests.
-        - Persist decode requests as decode requests.
-        - Terminate requests by length or termination id.
+        Uses a **permutation-based reorder** to reclassify every request slot into
+        one of five buckets and apply a single ``argsort``-derived permutation to
+        every bookkeeping tensor.  This replaces the previous multi-pass
+        swap/move approach, cutting kernel-launch count significantly.
+        Steady-state GPU->CPU syncs are 1 per step: both graphs are
+        queued back-to-back and a single ``.cpu()`` on the combined
+        sync buffer reads all outputs.  Prefix caching adds a
+        conditional drain sync after the graphs.
 
-        *Note*: All bookkeeping tensors (i.e., `self.request_*`) are laid out
-        contiguously, with a conceptual division between active requests on the
-        'left' (or, lower indices) and paused requests in the 'middle' (or, middle
-        indices) and completed requests on the 'right' (or, higher indices). The integers
-        `paused_request_count` and `total_request_count`  are used to track the boundaries
-        between these request groups.
-        - 0:active_count -> active requests
-        - active_count:total_request_count -> paused requests
-        - total_request_count:max_requests -> completed requests are moved here.
-        The reason for maintaining contiguous tensors rather than multiple
-        smaller (e.g., per-group or per-request) tensors is for both 1) speed
-        (avoid unnecessary tensor allocations), and 2) compatibility with the
-        Flash Attention kernels, which packed contiguous tensors.
+        *Note*: All bookkeeping tensors (i.e., ``self.request_*``) are laid out
+        contiguously with ``[active | paused | dead]`` layout:
 
-        The following happens in this code :
-        1. The active token mask tells us which requests are still active and which are completed
-        2. If no paused requests are present and no active requests we release all memory and reset.
-        3. Concatenate the paused tokens to the active tokens
-        4. For the finished requests we release memory blocks and move them to the right
-        5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
-        6. Resume paused requests & evict overflowing paused requests.
-        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        8. We make relevant changes to the token bookkeeping tensors
+        - ``0:active_count`` -> active requests
+        - ``active_count:total_request_count`` -> paused requests
+        - ``total_request_count:max_requests`` -> dead/completed slots
+
+        Bucket assignment (lower = further left in the final layout):
+
+        ====== =============================== ================
+        Key    Semantics                        Final region
+        ====== =============================== ================
+        0      Active -> continues               ``[0, new_active - chunked)``
+        1      Active -> chunked prefill          rightmost active
+        2      Paused -> stays paused             ``[new_active, new_active + stayed_paused)``
+        3      Active -> newly paused (full blk)  ``[new_active + stayed_paused, new_total)``
+        4      Active -> finished                 ``[new_total, total_pre)``
+        ====== =============================== ================
+
+        After the permutation, the layout is ``[active | paused | finished]``.
+        The finished region is dead (blocks released, slots reusable).  The
+        graphed helpers ``_graphed_resume_body``, ``_graphed_eviction_body``,
+        and ``_graphed_chunked_positioning`` then adjust the active-paused
+        boundary via boundary shifts and masked swaps within the
+        already-sorted buffer.
 
         Args:
-            active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
-            new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
+            active_requests_mask (Tensor): 1D byte mask over active requests
+                (1 = continue, 0 = finished).
+            new_tokens (Tensor): Newly sampled tokens, one per active request.
             new_speculative_tokens (Tensor): Newly sampled speculative tokens,
                 with num_speculative tokens per active request.
                 (num_speculative_tokens, active_request_length)
 
         Return:
-            (Tensor) Newly paused request IDs.
+            Dict with ``newly_paused_request_ids`` and ``evict_request_ids``.
         """
-        # 1. The active token mask tells us which requests are still active and which are completed
-        # active_request_count -> This corresponds to requests that have not reached EOD or max length
-        # finished_request_count are requests that have reached the termination criterion
+        # Eager (non-graphed) path: prepare, run both bodies, finalize.
+        # The graphed path in TextGenerationController wraps the two body
+        # calls with CUDAGraphCache capture/replay; this method is the
+        # backward-compatible entry point used by tests and callers that
+        # don't need graph capture.
+        phase1 = self._prepare_update_requests(
+            active_requests_mask, new_tokens, new_speculative_tokens
+        )
+        self._classify_and_resume_body()
+        self._evict_resume_chunked_tokens_body()
+        return self._finalize_update_requests(**phase1)
 
-        self.num_prefill_requests = 0  # all turns to decode
-        # All request that were in prefill become decode requests.
-        # For the chunked prefill request we will overwrite this the next time add_request
-        # is called on that request.
+    def _prepare_update_requests(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Tensor = None,
+    ) -> Dict:
+        """Phase 1: copy inputs into static-address tensors for the graph bodies.
+
+        Returns a dict of host-side scalars needed by ``_finalize_update_requests``.
+        """
+        self.kv_block_allocator.lru_maybe_compact()
+
+        paused_pre = self.paused_request_count
+        total_pre = self.total_request_count
+        # [active | paused] layout: active at [0, active_pre), paused at [active_pre, total).
+        active_pre = total_pre - paused_pre
+
+        self.num_prefill_requests = 0
         self.request_in_prefill_status_tensor[self.request_in_prefill_status_tensor == 1] = 0
 
-        if (
-            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
-        ) != -1:
-            # Chunked prefill request was active this step.
-            # We must keep it active so that the next iteration will add a new chunk to it.
+        has_chunked = self.chunked_prefill_request_id != -1
+        if has_chunked and active_requests_mask.numel() > 0:
             active_requests_mask[-1] = 1
 
-        active_request_count = (active_requests_mask == 1).sum().item()
-        finished_request_count = (active_requests_mask == 0).sum().item()
-        assert (
-            active_request_count + finished_request_count + self.paused_request_count
-            == self.total_request_count
+        self._ur_active_mask.zero_()
+        self._ur_active_mask[:active_pre].copy_(active_requests_mask)
+        self._ur_active_pre_gpu.fill_(active_pre)
+        self._ur_total_pre_gpu.fill_(total_pre)
+        self._ur_chunked_id_gpu.fill_(self.chunked_prefill_request_id)
+
+        # [active | paused]: active tokens first, then paused tokens.
+        self._ur_next_tokens[:active_pre].copy_(new_tokens)
+        if paused_pre > 0:
+            self._ur_next_tokens[active_pre:total_pre].copy_(self.paused_tokens)
+        if new_speculative_tokens is not None and self._ur_spec_tokens is not None:
+            self._ur_spec_tokens[:, :active_pre].copy_(new_speculative_tokens)
+            if paused_pre > 0 and self.paused_speculative_tokens is not None:
+                self._ur_spec_tokens[:, active_pre:total_pre].copy_(self.paused_speculative_tokens)
+
+        return {"has_chunked": has_chunked}
+
+    def _classify_and_resume_body(self) -> None:
+        """Graph body 1: classify, permute, release finished, resume."""
+        slot_idx = self._ur_arange_long
+        max_req = self.max_requests
+        amask = self._ur_active_mask
+
+        # [active | paused] layout input.
+        is_active = slot_idx < self._ur_active_pre_gpu
+        is_paused = (slot_idx >= self._ur_active_pre_gpu) & (slot_idx < self._ur_total_pre_gpu)
+
+        finished_mask = is_active & (amask == 0)
+        nb_mask = (
+            is_active
+            & (
+                self.request_last_kv_block_offset[:max_req]
+                >= self.block_size_tokens - 1 - self.num_speculative_tokens
+            )
+            & ~finished_mask
+        )
+        chunked_mask = is_active & (self.request_ids[:max_req] == self._ur_chunked_id_gpu)
+        nb_mask = nb_mask & ~chunked_mask
+
+        would_continue = is_active & (amask != 0) & ~nb_mask & ~chunked_mask
+        continue_rank = would_continue.to(torch.int64).cumsum(dim=0)
+        has_any_chunked = chunked_mask.any()
+        excess_mask = (
+            would_continue & (continue_rank > self._ur_max_allowed_active) & ~has_any_chunked
+        )
+        nb_mask = nb_mask | excess_mask
+
+        # Build sort_key for [active | paused | dead] output layout.
+        # Bucket keys: 0=continues, 1=chunked, 2=stayed-paused, 3=newly-paused,
+        # 4=finished.  Later masked_fill_ wins, so effective precedence is
+        # chunked > finished > nb > active > paused > dead.
+        sort_key = self._ur_sort_key
+        sort_key.fill_(5)  # dead
+        sort_key.masked_fill_(is_paused, 2)   # stays paused
+        sort_key.masked_fill_(is_active, 0)   # continues active
+        sort_key.masked_fill_(nb_mask, 3)     # newly paused (needs new block)
+        sort_key.masked_fill_(finished_mask, 4)  # finished
+        sort_key.masked_fill_(chunked_mask, 1)   # chunked (rightmost active)
+
+        perm = sort_key.argsort(stable=True)
+        self._permute_book_keeping_tensors(perm, self._ur_next_tokens)
+
+        # Dead slots (key 5) are clamped to 4 so they share the finished
+        # bucket, which is never read.  This keeps _ur_bucket_counts at 5.
+        self._ur_bucket_counts.zero_()
+        self._ur_bucket_counts.index_add_(
+            0, sort_key.clamp(max=4).to(torch.int64), self._ur_ones_long
         )
 
-        # Reset attention state.
+        # [active | paused] output: active_count = bucket[0] + bucket[1]
+        self._ur_new_active_gpu.copy_(self._ur_bucket_counts[0:1] + self._ur_bucket_counts[1:2])
+        self._ur_new_total_gpu.copy_(
+            self._ur_bucket_counts[0:1]
+            + self._ur_bucket_counts[1:2]
+            + self._ur_bucket_counts[2:3]
+            + self._ur_bucket_counts[3:4]
+        )
+
+        finished_region_mask = (slot_idx >= self._ur_new_total_gpu) & (
+            slot_idx < self._ur_total_pre_gpu
+        )
+        self._release_blocks_from_mask_gpu(finished_region_mask)
+
+        if self.num_speculative_tokens > 0:
+            self._ur_prev_last_block_ids[:max_req].copy_(self.request_last_kv_block_id[:max_req])
+
+        # Newly paused are at [new_active + stayed_paused, new_total).
+        # stayed_paused_count = bucket[2].
+        newly_paused_start = self._ur_new_active_gpu + self._ur_bucket_counts[2:3]
+        newly_paused_mask = (slot_idx >= newly_paused_start) & (
+            slot_idx < self._ur_new_total_gpu
+        )
+        scatter_pack_valid(
+            self.request_ids[:max_req],
+            newly_paused_mask,
+            self._ur_newly_paused_ids_buf,
+            fill_value=-1,
+            sink_idx_value=max_req,
+        )
+
+        self._graphed_resume_body()
+
+        S = DynamicInferenceContext
+        self._ur_combined_sync[S._SYNC_BUCKET0 : S._SYNC_BUCKET3 + 1].copy_(
+            self._ur_bucket_counts[:4]
+        )
+        self._ur_combined_sync[S._SYNC_RESUME1 : S._SYNC_RESUME1 + 1].copy_(
+            self._ur_resume_count_gpu
+        )
+
+    def _evict_resume_chunked_tokens_body(self) -> None:
+        """Graph body 2: evict, resume, chunked positioning, token bookkeeping."""
+        self._graphed_eviction_body()
+        self._graphed_resume_body()
+        self._graphed_chunked_positioning()
+
+        max_req = self.max_requests
+        num_gen = self._ur_num_generated_tokens
+        slot_idx = self._ur_arange_long
+        device = slot_idx.device
+
+        # [active | paused]: active at [0, _ur_new_active_gpu).
+        is_active_post = slot_idx < self._ur_new_active_gpu
+        is_active_f = is_active_post.to(self.request_kv_length_offsets.dtype)
+
+        old_offsets = self.request_last_kv_block_offset[:max_req].clone()
+
+        is_alive = slot_idx < self._ur_new_total_gpu
+        is_alive_f = is_alive.to(self.request_kv_length_offsets.dtype)
+
+        self.request_kv_length_offsets.add_(self.request_query_lengths * is_active_f)
+        self.request_query_lengths.fill_(0)
+        self.request_query_lengths.masked_fill_(is_active_post, num_gen)
+        self.request_kv_length_offsets.mul_(is_alive_f)
+        self.request_output_lengths.mul_(is_alive_f.to(self.request_output_lengths.dtype))
+        self.request_last_kv_block_offset.copy_(
+            torch.where(
+                is_active_post,
+                (old_offsets + num_gen) % self.block_size_tokens,
+                old_offsets * is_alive.to(torch.int32),
+            )
+        )
+
+        # [active | paused]: active requests start at index 0, so slot_idx
+        # is the identity mapping — no offset needed.
+        if num_gen == 1:
+            max_tok = max_req
+            self.token_to_input_ids[:max_tok].copy_(self._ur_next_tokens[:max_tok])
+            self.token_to_request_idx[:max_tok].copy_(
+                slot_idx.to(self.token_to_request_idx.dtype)
+            )
+            self.token_to_pos_ids[:max_tok].copy_(self.request_kv_length_offsets[:max_tok])
+            self.token_to_position_in_request[:max_tok].copy_(
+                self.request_kv_length_offsets[:max_tok]
+            )
+            self.token_to_block_idx[:max_tok].copy_(self.request_last_kv_block_id[:max_tok])
+            self.token_to_local_position_within_kv_block[:max_tok].copy_(
+                self.request_last_kv_block_offset[:max_tok]
+            )
+        else:
+            max_tok = max_req * num_gen
+            base = self._ur_next_tokens[:max_req]
+            spec = self._ur_spec_tokens[:, :max_req]
+            interleaved = torch.cat([base.unsqueeze(0), spec], dim=0)
+            self.token_to_input_ids[:max_tok].copy_(interleaved.T.reshape(-1))
+
+            kv_offsets = self.request_kv_length_offsets[:max_req]
+            pos_base = kv_offsets.repeat_interleave(num_gen)
+            pos_ids = pos_base + self._ur_pos_offset_pattern
+            self.token_to_pos_ids[:max_tok].copy_(pos_ids)
+            self.token_to_position_in_request[:max_tok].copy_(pos_ids)
+
+            self.token_to_request_idx[:max_tok].copy_(
+                slot_idx.repeat_interleave(num_gen).to(self.token_to_request_idx.dtype)
+            )
+            self.token_to_local_position_within_kv_block[:max_tok].copy_(
+                self.token_to_pos_ids[:max_tok] % self.block_size_tokens
+            )
+
+            old_off = old_offsets[:max_req]
+            raw_positions = old_off[:, None] + 1 + self._ur_gen_arange[None, :]
+            crosses_boundary = raw_positions >= self.block_size_tokens
+            current_ids = self.request_last_kv_block_id[:max_req]
+            prev_ids = self._ur_prev_last_block_ids[:max_req]
+            request_has_crossing = crosses_boundary.any(dim=1)
+            use_prev = request_has_crossing[:, None] & ~crosses_boundary
+            block_idx_2d = torch.where(
+                use_prev,
+                prev_ids[:, None].expand(-1, num_gen),
+                current_ids[:, None].expand(-1, num_gen),
+            )
+            self.token_to_block_idx[:max_tok].copy_(block_idx_2d.reshape(-1))
+
+        S = DynamicInferenceContext
+        self._ur_combined_sync[S._SYNC_RESUME2 : S._SYNC_RESUME2 + 1].copy_(
+            self._ur_resume_count_gpu
+        )
+        self._ur_combined_sync[S._SYNC_ACTIVE_FINAL : S._SYNC_ACTIVE_FINAL + 1].copy_(
+            self._ur_new_active_gpu
+        )
+        self._ur_combined_sync[S._SYNC_TOTAL_FINAL : S._SYNC_TOTAL_FINAL + 1].copy_(
+            self._ur_new_total_gpu
+        )
+        self._ur_combined_sync[S._SYNC_TOTAL_AVAIL : S._SYNC_TOTAL_AVAIL + 1].copy_(
+            self.kv_block_allocator.total_avail_gpu.to(torch.int64)
+        )
+        if self.is_hybrid_model:
+            self._ur_combined_sync[S._SYNC_MAMBA_FREE : S._SYNC_MAMBA_FREE + 1].copy_(
+                self.mamba_metadata._free_slot_count_gpu.to(torch.int64)
+            )
+        self._ur_combined_sync[S._SYNC_EVICT_COUNT : S._SYNC_EVICT_COUNT + 1].copy_(
+            self._ur_evict_count_gpu
+        )
+
+    def _finalize_update_requests(self, has_chunked: bool) -> Dict:
+        """Phase 3: single GPU->CPU sync, then mirror state to host."""
+        sv = self._ur_combined_sync.cpu().tolist()
+        S = DynamicInferenceContext
+
+        # Newly-paused is bucket 3 in [active | paused] layout.
+        newly_paused_count = int(sv[S._SYNC_BUCKET3])
+        resume_count_1 = int(sv[S._SYNC_RESUME1])
+        resume_count_2 = int(sv[S._SYNC_RESUME2])
+        new_active_final = int(sv[S._SYNC_ACTIVE_FINAL])
+        new_total_final = int(sv[S._SYNC_TOTAL_FINAL])
+        evict_count = int(sv[S._SYNC_EVICT_COUNT])
+
         self.reset_attention_state()
 
-        # Update total_request_count.
-        self.total_request_count = active_request_count + self.paused_request_count
-
-        # 2. If no paused requests are present and no active requests we release memory and reset.
-        # Note that this requires no pending chunked prefill request
-        if (
-            active_request_count + self.paused_request_count == 0
-            and self.chunked_prefill_request_id == -1
-        ):
-            if finished_request_count > 0:
-                # In [active | paused] layout, active requests start at index 0.
-                finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-                self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            # Reset request/token counts.
+        if new_total_final == 0 and not has_chunked:
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
-
-            # Reset Mamba state.
+            self.paused_request_count = 0
             self.reset_mamba_state()
-            return
+            self.kv_block_allocator.total_avail = int(sv[S._SYNC_TOTAL_AVAIL])
+            return {"newly_paused_request_ids": None, "evict_request_ids": None}
 
-        # 3. Concatenate the active tokens with the paused tokens if present.
-        # Layout: [active | paused], so new_tokens first, then paused_tokens.
-        if self.paused_request_count != 0:
-            assert self.paused_tokens is not None
-            next_tokens = torch.cat((new_tokens, self.paused_tokens))
-            if new_speculative_tokens is not None and self.paused_speculative_tokens is not None:
-                new_speculative_tokens = torch.cat(
-                    (new_speculative_tokens, self.paused_speculative_tokens), dim=1
-                )
-        else:
-            next_tokens = new_tokens
+        # [active | paused]: paused_count = total - active.
+        new_paused_final = new_total_final - new_active_final
+        self.paused_request_count = new_paused_final
+        self.total_request_count = new_total_final
+        active_request_count = new_active_final
+        num_gen = self._ur_num_generated_tokens
+        self.active_token_count = active_request_count * num_gen
+        self.kv_block_allocator.total_avail = int(sv[S._SYNC_TOTAL_AVAIL])
+        if self.is_hybrid_model:
+            self.mamba_metadata.mamba_state_free_slot_count = int(sv[S._SYNC_MAMBA_FREE])
 
-        # 4. For the finished requests we release memory blocks and move them to the right:-
-        #       a) Release all their memory
-        #       b) Swap them to the right, so that we have this order [Active, Paused, Finished]
-        if finished_request_count > 0:
-            # In [active | paused] layout, active requests start at index 0.
-            finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
-            self.release_memory_blocks_from_request_indexes(finished_idxs)
-
-            if active_request_count > 0:
-                finished_idxs_on_left = torch.nonzero(
-                    active_requests_mask[:active_request_count] == 0, as_tuple=True
-                )[0]
-                active_idxs_on_right = (
-                    torch.nonzero(active_requests_mask[active_request_count:], as_tuple=True)[0]
-                    + active_request_count
-                )
-
-                self._move_book_keeping_tensors(
-                    src_idxs=active_idxs_on_right,
-                    dst_idxs=finished_idxs_on_left,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-
-                # Reset chunk ids for recently moved requests.
-                self.request_to_kv_block_ids[active_idxs_on_right] = -1
-                if self.is_hybrid_model:
-                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
-
-            # Relocate paused data to be adjacent to the surviving active requests.
-            # Before: [active(new) | stale | paused @ old_active_count]
-            # After:  [active(new) | paused @ active_request_count]
-            if self.paused_request_count > 0:
-                old_active_count = len(active_requests_mask)
-                paused_src = torch.arange(
-                    old_active_count,
-                    old_active_count + self.paused_request_count,
-                    device=self.request_ids.device,
-                )
-                paused_dst = torch.arange(
-                    active_request_count,
-                    active_request_count + self.paused_request_count,
-                    device=self.request_ids.device,
-                )
-                # Note: src and dst may overlap when paused_count > finished_count
-                # (dst starts before src ends). This is safe because PyTorch fancy
-                # indexing fully materialises the RHS before writing to the LHS.
-                self._move_book_keeping_tensors(
-                    src_idxs=paused_src,
-                    dst_idxs=paused_dst,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-                # Clear stale request IDs left behind so that
-                # get_index_of_chunked_prefill_request(safe=False) cannot match them.
-                stale_start = active_request_count + self.paused_request_count
-                stale_end = old_active_count + self.paused_request_count
-                if stale_start < stale_end:
-                    self.request_ids[stale_start:stale_end] = -1
-
-        # 5. Identify requests that require a new block and pause them.
-        #       a) Partition active region: staying-active on the left, pausing on the right
-        #       b) Update the paused request count and active_request_count
+        total_resumed = resume_count_1 + resume_count_2
+        final_newly_paused = max(0, newly_paused_count - total_resumed)
         newly_paused_request_ids = None
-        if active_request_count > 0:
-            num_tokens_in_last_block = self.request_last_kv_block_offset[:active_request_count]
-            active_requests_requiring_new_block = (
-                num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
-            ).byte()
+        if final_newly_paused > 0:
+            newly_paused_request_ids = self._ur_newly_paused_ids_buf[:final_newly_paused].clone()
+        evict_request_ids = None
+        if evict_count > 0:
+            evict_request_ids = self._ur_evict_ids_buf[:evict_count].clone()
 
-            # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
-            if (
-                chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
-            ) != -1:
-                active_requests_requiring_new_block[chunked_prefill_request_idx] = (
-                    0  # chunked prefill should not be paused
-                )
-            else:
-                max_allowed_active = min(
-                    self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
-                )
-                if active_request_count > max_allowed_active:
-                    # Force-pause excess requests in a decode-only batch
-                    active_requests_requiring_new_block[max_allowed_active:] = 1
-
-            active_requests_requiring_new_block_count = (
-                (active_requests_requiring_new_block == 1).sum().item()
+        # [active | paused]: paused tokens are at [new_active_final:new_total_final].
+        if new_paused_final > 0:
+            self._ur_paused_tokens_buf[:new_paused_final].copy_(
+                self._ur_next_tokens[new_active_final:new_total_final]
             )
-
-            # Partition active region: staying-active on the left, pausing on the right.
-            # Boundary = staying_active_count = active - pausing.
-            staying_active_count = active_request_count - active_requests_requiring_new_block_count
-            if (
-                active_requests_requiring_new_block_count > 0
-                and active_requests_requiring_new_block_count != active_request_count
-            ):
-                # Pausing requests that ended up on the left (should be on right).
-                pausing_idxs_on_left = torch.nonzero(
-                    active_requests_requiring_new_block[:staying_active_count], as_tuple=True
-                )[0]
-                # Staying-active requests that ended up on the right (should be on left).
-                active_idxs_on_right = (
-                    torch.nonzero(
-                        active_requests_requiring_new_block[staying_active_count:] == 0,
-                        as_tuple=True,
-                    )[0]
-                    + staying_active_count
+            self.paused_tokens = self._ur_paused_tokens_buf[:new_paused_final]
+            if self._ur_spec_tokens is not None:
+                self._ur_paused_spec_tokens_buf[:, :new_paused_final].copy_(
+                    self._ur_spec_tokens[:, new_active_final:new_total_final]
                 )
-                src_idxs = torch.cat((active_idxs_on_right, pausing_idxs_on_left))
-                dst_idxs = torch.cat((pausing_idxs_on_left, active_idxs_on_right))
-                self._swap_book_keeping_tensors(
-                    src_idxs=src_idxs,
-                    dst_idxs=dst_idxs,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
+                self.paused_speculative_tokens = self._ur_paused_spec_tokens_buf[
+                    :, :new_paused_final
+                ]
 
-            self.paused_request_count += active_requests_requiring_new_block_count
-            active_request_count -= active_requests_requiring_new_block_count
+        if self.enable_prefix_caching:
+            self.kv_block_allocator._pc_dereg_may_have_events = True
+        self.kv_block_allocator.drain_pending_dereg()
 
-            # Capture newly paused IDs AFTER the partition swap, in positional
-            # order. This ensures resume_paused_requests truncates the correct
-            # entries: the leftmost paused positions are resumed first (LIFO),
-            # so slicing off the first N entries removes exactly the resumed IDs.
-            if active_requests_requiring_new_block_count > 0:
-                newly_paused_request_ids = self.request_ids[
-                    active_request_count : active_request_count
-                    + active_requests_requiring_new_block_count
-                ].clone()
-
-        # 6. Now that we have the requests in following order [Active, Paused, Finished]
-        # We determine how many requests we can resume and resume them
-
-        # For multi-token generation: store previous block IDs BEFORE resume allocates new blocks.
-        # This allows us to know which block tokens should go to if they don't cross the boundary.
-        # After resume_paused_requests, request_last_kv_block_id will be updated to the NEW block
-        # for resumed requests, but we need the OLD block for tokens that don't cross.
-        prev_last_block_ids = None
-        if self.num_speculative_tokens > 0:
-            # Clone needed: resume_paused_requests mutates request_last_kv_block_id
-            # (assigns new block IDs), but we need the old values later to determine
-            # which block tokens should go to when they don't cross a block boundary.
-            prev_last_block_ids = self.request_last_kv_block_id.clone()
-
-        # 6.a. First, resume temporarily paused requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
-
-        # 6.b. Evict requests that overflow the paused buffer.
-        evict_request_ids = self.evict_overflow_paused_requests(
-            active_request_count, next_tokens, new_speculative_tokens
-        )
-
-        # 6.c. Resume any additional requests.
-        active_request_count, newly_paused_request_ids = self.resume_paused_requests(
-            active_request_count, newly_paused_request_ids
-        )
-
-        assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
-            "active_request_count == %d with no hidden chunked prefill." % active_request_count
-        )
-
-        # 6.d. Hide the chunked prefill request just past total_request_count.
-        # It will be re-added through add_request on the next iteration.
-        if (
-            chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=False)
-        ) != -1:
-            if chunked_prefill_request_idx < self.total_request_count:
-                # Chunked prefill request was active this step.
-                # Save it to the hidden slot (just past total), fill the gap
-                # in the active region, and shift the paused region left by 1.
-                device = self.request_ids.device
-                hidden_idx = torch.tensor([self.total_request_count], device=device)
-                chunked_idx = torch.tensor([chunked_prefill_request_idx], device=device)
-
-                # 1. Save chunked request to hidden slot.
-                self._move_book_keeping_tensors(
-                    src_idxs=chunked_idx,
-                    dst_idxs=hidden_idx,
-                    next_tokens=next_tokens,
-                    new_speculative_tokens=new_speculative_tokens,
-                )
-
-                # 2. Fill the gap: move the last active request into the hole.
-                if chunked_prefill_request_idx != active_request_count - 1:
-                    last_active_idx = torch.tensor([active_request_count - 1], device=device)
-                    self._move_book_keeping_tensors(
-                        src_idxs=last_active_idx,
-                        dst_idxs=chunked_idx,
-                        next_tokens=next_tokens,
-                        new_speculative_tokens=new_speculative_tokens,
-                    )
-
-                # 3. Shift paused region left by 1 to stay adjacent to active.
-                if self.paused_request_count > 0:
-                    paused_src = torch.arange(
-                        active_request_count, self.total_request_count, device=device
-                    )
-                    paused_dst = torch.arange(
-                        active_request_count - 1, self.total_request_count - 1, device=device
-                    )
-                    self._move_book_keeping_tensors(
-                        src_idxs=paused_src,
-                        dst_idxs=paused_dst,
-                        next_tokens=next_tokens,
-                        new_speculative_tokens=new_speculative_tokens,
-                    )
-
-                active_request_count -= 1
-                self.total_request_count -= 1
-            else:
-                # Chunked prefill request was inactive/hidden this step.
-                # Pull it to the new boundary so it doesn't drift.
-                if chunked_prefill_request_idx != self.total_request_count:
-                    self._swap_book_keeping_tensors(
-                        src_idxs=torch.tensor(
-                            [chunked_prefill_request_idx], device=self.request_ids.device
-                        ),
-                        dst_idxs=torch.tensor(
-                            [self.total_request_count], device=self.request_ids.device
-                        ),
-                        next_tokens=None,  # Do not swap next_tokens as these indices are out of bounds
-                        new_speculative_tokens=None,
-                    )
-
-        # 7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        assert self.total_request_count == active_request_count + self.paused_request_count
-
-        if self.paused_request_count > 0:
-            # Clone needed: next_tokens is a shared buffer that will be overwritten in
-            # the next iteration; paused_tokens must persist independently.
-            # In [active | paused] layout, paused tokens are at [active_count:total].
-            self.paused_tokens = next_tokens[
-                active_request_count : self.total_request_count
-            ].clone()
-            if new_speculative_tokens is not None:
-                # Clone needed: same reason as paused_tokens above.
-                self.paused_speculative_tokens = new_speculative_tokens[
-                    :, active_request_count : self.total_request_count
-                ].clone()
-
-        # add_ and fill_ calls seems to work as intended with sliced indexing
-        # (i.e. x[3:5].add(...) or x[3:5].fill_) but when another tensor is used
-        # for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
-        self.request_kv_length_offsets[:active_request_count].add_(
-            self.request_query_lengths[:active_request_count]
-        )
-
-        num_generated_tokens = 1 + self.num_speculative_tokens
-        self.request_query_lengths[:active_request_count].fill_(num_generated_tokens)
-
-        # Clone needed: old_offsets is reused later to compute raw_positions
-        # for block-boundary detection. The write-back on the next line overwrites the
-        # underlying tensor, so without clone the boundary-crossing logic would see the
-        # new offsets instead of the pre-update values.
-        old_offsets = self.request_last_kv_block_offset[:active_request_count].clone()
-
-        self.request_last_kv_block_offset[:active_request_count] = (
-            old_offsets + num_generated_tokens
-        ) % self.block_size_tokens
-
-        self.active_token_count = active_request_count * num_generated_tokens
-        sampled_tokens = next_tokens[:active_request_count]
-
-        if self.num_speculative_tokens > 0:
-            # new_speculative_tokens has shape [num_spec_tokens, num_requests],
-            # slice the request dimension (dim 1)
-            sampled_speculative_tokens = new_speculative_tokens[:, :active_request_count]
-            # This will become [sampled, spec1, spec2, sampled, spec1, spec2 ...]
-            # For every request we will have the sampled token followed by the
-            # speculative tokens (i.e next indices)
-            next_tokens = torch.vstack(
-                [sampled_tokens.unsqueeze(0), sampled_speculative_tokens]
-            ).T.reshape(-1)
-        else:
-            next_tokens = sampled_tokens
-
-        self.token_to_input_ids[: self.active_token_count] = next_tokens
-
-        # Req kv length offsets : [0, 5, 10 ... ]
-        # For num spec tokens = 2 , this will become [0, 1, 2, 5, 6, 7 10, 11, 12 ...]
-        self.token_to_pos_ids[: self.active_token_count] = self.request_kv_length_offsets[
-            :active_request_count
-        ].repeat_interleave(num_generated_tokens) + torch.arange(
-            num_generated_tokens, device=torch.cuda.current_device()
-        ).repeat(
-            active_request_count
-        )
-        #
-        # Token to request idx : [0, 0, 0, 1, 1, 1, 2, 2, 2 ...]
-        self.token_to_request_idx[: self.active_token_count] = torch.arange(
-            active_request_count, device=torch.cuda.current_device()
-        ).repeat_interleave(num_generated_tokens)
-
-        self.token_to_position_in_request[: self.active_token_count] = self.token_to_pos_ids[
-            : self.active_token_count
-        ]
-
-        self.token_to_local_position_within_kv_block[: self.active_token_count] = (
-            self.token_to_pos_ids[: self.active_token_count] % self.block_size_tokens
-        )
-
-        current_block_ids = self.request_last_kv_block_id[:active_request_count]
-
-        # raw positions shape : [active_request_count, num_generated_tokens]
-        # e.g block size 6, old_offsets = [1,5,2] , num_generated_tokens = 3
-        # raw_positions = [[1, 2, 3], [5, 6, 7], [2, 3, 4]]
-        # crosses_boundary = [[False, False, False], [False, True, True], [False, False, False]]
-        raw_positions = (
-            old_offsets[:, None]
-            + 1  # Offset by 1 because old_offsets points to the LAST token
-            + torch.arange(num_generated_tokens, device=torch.cuda.current_device())[None, :]
-        )
-        #
-        # A token crosses to the next block if its raw_position >= block_size
-        crosses_boundary = raw_positions >= self.block_size_tokens
-
-        if not crosses_boundary.any() or self.num_speculative_tokens == 0:
-            # Fast path: no tokens cross block boundary, all use current block
-            self.token_to_block_idx[: self.active_token_count] = self.request_last_kv_block_id[
-                :active_request_count
-            ].repeat_interleave(num_generated_tokens)
-        else:
-
-            # Some tokens cross to the next block (this happens for resumed requests)
-            #
-            # When a request is paused and resumed:
-            # 1. It was paused because remaining_space < num_tokens_per_step
-            # 2. A NEW block is allocated in resume_paused_requests
-            # 3. request_last_kv_block_id is updated to the NEW block
-            # 4. The old offset is preserved (wasn't reset)
-            #
-            # So for resumed requests:
-            # - Tokens before the boundary (raw_pos < block_size): go to PREVIOUS block
-            # - Tokens at/after the boundary (raw_pos >= block_size): go to CURRENT (new) block
-            #
-            # For non-resumed requests (no boundary crossing): all go to current block
-            #
-            # We use prev_last_block_ids which was stored BEFORE resume_paused_requests
-            # was called, so it contains the OLD block IDs before new blocks were allocated.
-
-            # Get previous block IDs (stored before resume_paused_requests)
-            prev_block_ids = prev_last_block_ids[:active_request_count]  # [active_count]
-
-            # For each request, check if ANY token crosses (i.e., request was resumed)
-            request_has_crossing = crosses_boundary.any(dim=1)  # [active_count]
-
-            # Build block_idx: [active_count, N]
-            # Start with current (new) block for all
-            # Lets say current block ids is [a1, a2 , a3] and num generated_tokens is 3
-            # This will be [[a1, a1, a1], [a2, a2, a2], [a3, a3, a3]]
-            # No clone needed: expand() returns a read-only view, and downstream
-            # torch.where() and .flatten() both return new tensors without in-place mutation.
-            block_idx = current_block_ids[:, None].expand(
-                -1, num_generated_tokens
-            )  # [active_count, N]
-
-            # For requests that have crossing, tokens BEFORE boundary use prev block
-            # crosses_boundary is False for tokens before boundary
-            # So: where request_has_crossing AND NOT crosses_boundary, use prev_block
-            use_prev_block = request_has_crossing[:, None] & ~crosses_boundary  # [active_count, N]
-
-            # Apply previous block IDs where needed
-            prev_block_ids_expanded = prev_block_ids[:, None].expand(-1, num_generated_tokens)
-            block_idx = torch.where(use_prev_block, prev_block_ids_expanded, block_idx)
-
-            # Convert back to 1d tensor
-            self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+        if __debug__:
+            assert active_request_count > 0 or self.chunked_prefill_request_id != -1, (
+                "active_request_count == %d with no hidden chunked prefill." % active_request_count
+            )
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
