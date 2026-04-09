@@ -365,6 +365,10 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    rl_offload_optimizer_during_inference: bool = False
+    """When True, optimizer tensors are allocated inside a torch_memory_saver region so that
+    offload/restore avoids .cpu()/.cuda(), keeping them out of the CUDA-graph memory pool."""
+
     ################
     # Miscellaneous
     ################

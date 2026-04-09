@@ -37,6 +37,11 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
+
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -96,6 +101,8 @@ def _multi_tensor_copy_this_to_that(
 
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
 
+_OPTIMIZER_TMS_TAG = "optimizer_offload"
+
 
 class MegatronOptimizer(ABC):
     """
@@ -124,6 +131,9 @@ class MegatronOptimizer(ABC):
                 "This may be expected if you have frozen sub-models."
             )
         self.config = config
+        config.rl_offload_optimizer_during_inference = (
+            HAVE_TORCH_MEMORY_SAVER and config.rl_offload_optimizer_during_inference
+        )
         self.init_state_fn = init_state_fn
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
@@ -360,16 +370,27 @@ class MegatronOptimizer(ABC):
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[OFFLOAD] moving optimizer state to CPU')
-            # Move all optimizer tensors to CPU while keeping the optimizer instance
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and p.is_cuda:
-                        p.data = p.data.cpu()
 
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
-                        state_dict[k] = v.cpu()
+            if self.config.rl_offload_optimizer_during_inference:
+                # Pause the TMS region: frees physical pages for all TMS-managed tensors
+                # (fp32 master weights and Adam state) while preserving virtual addresses.
+                torch_memory_saver.pause(_OPTIMIZER_TMS_TAG)
+
+                # View tensors (shard_fp32) are not in TMS; fall back to .cpu().
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and p.is_cuda and p._is_view():
+                            p.data = p.data.cpu()
+            else:
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and p.is_cuda:
+                            p.data = p.data.cpu()
+
+                for state_dict in self.optimizer.state.values():
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor) and v.is_cuda:
+                            state_dict[k] = v.cpu()
 
             torch.cuda.empty_cache()
 
@@ -380,16 +401,26 @@ class MegatronOptimizer(ABC):
             self, 'is_stub_optimizer', False
         ):
             log_single_rank(logger, logging.INFO, '[RESTORE] moving optimizer state back to GPU')
-            # Move all optimizer tensors back to GPU
-            for param_group in self.optimizer.param_groups:
-                for p in param_group['params']:
-                    if isinstance(p, torch.Tensor) and not p.is_cuda:
-                        p.data = p.data.cuda()
 
-            for state_dict in self.optimizer.state.values():
-                for k, v in state_dict.items():
-                    if isinstance(v, torch.Tensor) and not v.is_cuda:
-                        state_dict[k] = v.cuda()
+            if self.config.rl_offload_optimizer_during_inference:
+                # Resume the TMS region: restores physical pages for TMS-managed tensors.
+                torch_memory_saver.resume(_OPTIMIZER_TMS_TAG)
+
+                # Restore view tensors from CPU.
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and not p.is_cuda:
+                            p.data = p.data.cuda()
+            else:
+                for param_group in self.optimizer.param_groups:
+                    for p in param_group['params']:
+                        if isinstance(p, torch.Tensor) and not p.is_cuda:
+                            p.data = p.data.cuda()
+
+                for state_dict in self.optimizer.state.values():
+                    for k, v in state_dict.items():
+                        if isinstance(v, torch.Tensor) and not v.is_cuda:
+                            state_dict[k] = v.cuda()
 
     @staticmethod
     def _filter_and_reorder_param_groups(
