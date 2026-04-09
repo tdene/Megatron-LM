@@ -486,9 +486,9 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_k", torch.int32, False),  # CPU for torch sampling
             ("top_p", torch.float32, False),  # CPU for torch sampling
             ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("return_log_probs", torch.bool, True),
+            ("skip_prompt_log_probs", torch.bool, True),
+            ("top_n_logprobs", torch.int32, True),
         ]
 
     def add_event(
