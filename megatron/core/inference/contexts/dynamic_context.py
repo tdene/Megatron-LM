@@ -1137,6 +1137,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Request-level padding.
         active_request_count = self.total_request_count - self.paused_request_count
         padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+        self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
+        self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
+        self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
         self.active_request_query_lengths[padding_request_slice].fill_(
             self.num_speculative_tokens + 1
         )
