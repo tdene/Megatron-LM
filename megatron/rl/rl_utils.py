@@ -772,6 +772,55 @@ def colocated_inference(model, inference_model, optimizer, n_prompts, samples_pe
     return rollouts
 
 
+def get_environment_rollouts(
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int,
+    run_inference: bool,
+):
+    """Collect rollouts and broadcast to all ranks.
+
+    When `run_inference` is True, uses colocated_inference to collect rollouts through inference.
+    Otherwise, obtains buffered rollouts from the RolloutStream.
+
+    Args:
+        model: Model to sample from.
+        inference_model: Inference model to use for inference.
+        n_prompts: Number of prompts to sample for across *all* data parallel workers.
+        samples_per_group: Amount of trajectories per prompt.
+        run_inference: Whether to run colocated inference or consume buffered rollouts.
+
+    Returns:
+        GroupedRollouts object which is a nested list
+        where each element being a list of rollouts of a group.
+    """
+    nvtx_range = get_nvtx_range()
+    # NOTE(jbarker): we need to double check this when using PP>1
+    rank = torch.distributed.get_rank()
+
+    if run_inference:
+        rollouts = colocated_inference(
+            model, inference_model, optimizer, n_prompts, samples_per_group, rank
+        )
+    else:
+        loop = get_asyncio_loop()
+        rollouts = None
+        if rank == 0:
+            rollouts = [
+                loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
+            ]
+
+    if rank != 0:
+        rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
+    with nvtx_range("rl/sync-rollouts", time=True):
+        torch.distributed.broadcast_object_list(rollouts, src=0)
+    logger.debug(f"Got rollouts on rank {rank}")
+
+    return rollouts
+
+
 def selective_log_softmax(logits, index):
     """Taken from: https://github.com/huggingface/trl/blob/26d86757a7c7e24e397ea44f57ecce6031dfac01/trl/trainer/utils.py#L1659.
 

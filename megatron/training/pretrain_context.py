@@ -150,7 +150,8 @@ class PretrainContext:
         """Write context-specific per-iteration metrics to tensorboard/wandb."""
         pass
 
-    def extra_log_string(self) -> str:
+    def extra_log_string(self, batch_size: int = 0, elapsed_time_per_iteration: float = 0.0,
+                         iteration: int = 0, wandb_writer=None) -> str:
         """Extra text appended to the per-iteration training log line."""
         return ""
 

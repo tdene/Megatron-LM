@@ -2051,7 +2051,12 @@ def training_log(
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
         if context is not None:
-            log_string += context.extra_log_string()
+            log_string += context.extra_log_string(
+                batch_size=batch_size,
+                elapsed_time_per_iteration=elapsed_time_per_iteration,
+                iteration=iteration,
+                wandb_writer=wandb_writer,
+            )
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -2219,12 +2224,6 @@ def training_log(
             total_loss_dict[skipped_iters_key]
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
-
-        # RL token throughput metrics.
-        if args.perform_rl_step:
-            log_string += rl_utils.log_rl_throughput_metrics(
-                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
-            )
 
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
