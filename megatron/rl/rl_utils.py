@@ -760,54 +760,14 @@ def colocated_inference(model, inference_model, optimizer, n_prompts, samples_pe
             with nvtx_range("rl/restore/optimizer-state", time=True):
                 optimizer.restore_from_cpu()
 
-    return rollouts
-
-
-def get_environment_rollouts(
-    model: LanguageModule,
-    inference_model: LanguageModule,
-    optimizer: MegatronOptimizer,
-    n_prompts: int,
-    samples_per_group: int,
-    run_inference: bool,
-):
-    """Collect rollouts and broadcast to all ranks.
-
-    When `run_inference` is True, uses colocated_inference to collect rollouts through inference.
-    Otherwise, obtains buffered rollouts from the RolloutStream.
-
-    Args:
-        model: Model to sample from.
-        inference_model: Inference model to use for inference.
-        n_prompts: Number of prompts to sample for across *all* data parallel workers.
-        samples_per_group: Amount of trajectories per prompt.
-        run_inference: Whether to run colocated inference or consume buffered rollouts.
-
-    Returns:
-        GroupedRollouts object which is a nested list
-        where each element being a list of rollouts of a group.
-    """
-    nvtx_range = get_nvtx_range()
-    # NOTE(jbarker): we need to double check this when using PP>1
-    rank = torch.distributed.get_rank()
-
-    if run_inference:
-        rollouts = colocated_inference(
-            model, inference_model, optimizer, n_prompts, samples_per_group, rank
-        )
-    else:
-        loop = get_asyncio_loop()
-        rollouts = None
-        if rank == 0:
-            rollouts = [
-                loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
-            ]
-
-    if rank != 0:
-        rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
-    with nvtx_range("rl/sync-rollouts", time=True):
-        torch.distributed.broadcast_object_list(rollouts, src=0)
-    logger.debug(f"Got rollouts on rank {rank}")
+    if lang_rl_log_dir and rank == get_pg_rank(inference_pg_collection.tp):
+        with open(
+            lang_rl_log_dir
+            + f'/rollouts_rank{rank}_iteration{args.curr_iteration}_'
+            + f'{Path(args.langrl_env_config).stem}.json',
+            'w',
+        ) as f:
+            json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
     return rollouts
 
@@ -1809,6 +1769,7 @@ def get_grpo_data_iterator(
     sequence_packing: bool,
     is_correction: bool,
     buffered_rollouts: RerunDataIterator | None = None,
+    optimizer_is_on_cpu: bool = False,
 ) -> RerunDataIterator:
     """
     Get the data iterator for GRPO training.
@@ -1828,6 +1789,7 @@ def get_grpo_data_iterator(
         sequence_packing: Use sequence packing if True.
         is_correction: Use IS correction if True.
         buffered_rollouts: Previously collected rollouts (if any)
+        optimizer_is_on_cpu: If True, the optimizer was offloaded to CPU and must be restored.
 
     Returns:
         RerunDataIterator for the current training step
@@ -1872,6 +1834,13 @@ def get_grpo_data_iterator(
             sequence_packing=sequence_packing,
             is_correction=is_correction,
         )
+        if optimizer_is_on_cpu:
+            nvtx_range = get_nvtx_range()
+            with nvtx_range("rl/restore-optimizer-after-inference", time=True):
+                with nvtx_range("rl/restore/grad-buffers", time=True):
+                    model[0].restore_grad_buffers()
+                with nvtx_range("rl/restore/optimizer-state", time=True):
+                    optimizer.restore_from_cpu()
         runtime_state.group_stats = group_stats
         runtime_state.example_groups = example_groups
         runtime_state.reset_iteration_counters(iteration)
