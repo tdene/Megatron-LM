@@ -376,10 +376,14 @@ class RLPretrainContext(PretrainContext):
                 {'grpo_collection_iteration': grpo_collection_iteration}, iteration
             )
 
-    def extra_log_string(self) -> str:
+    def extra_log_string(self, batch_size: int = 0, elapsed_time_per_iteration: float = 0.0,
+                         iteration: int = 0, wandb_writer=None) -> str:
+        log_string = rl_utils.log_rl_throughput_metrics(
+            self.args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer,
+        )
         if self.args.rl_use_sequence_packing:
-            return rl_utils.get_sequence_packing_log_info(self.args)
-        return ""
+            log_string += rl_utils.get_sequence_packing_log_info(self.args)
+        return log_string
 
     def shutdown(self) -> None:
         rl_utils.rl_inference_interface_shutdown()
