@@ -732,7 +732,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_slice = slice(0, active_request_count)
 
         # Get the accepted token counts for each request
         # Note: _accepted_token_counts is indexed from 0 to active_request_count-1
@@ -774,7 +774,7 @@ class TextGenerationController:
             # Get indices of requests that need to release a block (relative to active requests)
             requests_needing_release = torch.nonzero(remove_allocated_blocks_mask, as_tuple=True)[0]
             # Convert to absolute indices in the context tensors
-            absolute_indices = requests_needing_release + context.paused_request_count
+            absolute_indices = requests_needing_release  # active starts at 0
 
             # No clone needed: advanced (fancy) indexing with a tensor already returns
             # a copy, not a view.
@@ -866,7 +866,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_slice = slice(context.paused_request_count, context.total_request_count)
+        active_slice = slice(0, active_request_count)
 
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
 
@@ -1117,7 +1117,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1338,7 +1338,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1446,7 +1446,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1798,9 +1798,7 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
+        finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
