@@ -1407,7 +1407,7 @@ class TextGenerationController:
         log_prob_request_count = self._log_prob_count_pinned.item()
         top_n_max = self._top_n_max_pinned.item()
         if log_prob_request_count == 0 and top_n_max == 0:
-            return None, None
+            return None
 
         context = self.inference_wrapped_model.inference_context
 
@@ -1437,7 +1437,7 @@ class TextGenerationController:
     def _calculate_log_probs_decode(
         self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
-        """Run decode softmax kernel (post-forward) and extract results."""
+        """Run decode softmax kernel (post-forward). Returns a deferred extract callable."""
         padded_count = context.padded_active_request_count
         ri, padded_arange = self._log_prob_graph_outputs[("log_probs_decode_idx", padded_count)]
 
@@ -1450,14 +1450,21 @@ class TextGenerationController:
             )
 
         slp, sl = self._log_prob_graph_outputs[graph_key_sm]
-        return context.log_probs_decode_extract(
-            ri, slp, log_prob_request_count, selected_logits=sl, top_n_max=top_n_max
+        active_request_count = context.total_request_count - context.paused_request_count
+        return functools.partial(
+            context.log_probs_decode_extract,
+            ri,
+            slp,
+            log_prob_request_count,
+            active_request_count,
+            selected_logits=sl,
+            top_n_max=top_n_max,
         )
 
     def _calculate_log_probs_prefill(
         self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
-        """Run prefill softmax kernel (post-forward) and extract results."""
+        """Run prefill softmax kernel (post-forward). Returns a deferred extract callable."""
         padded_request_count = context.padded_active_request_count
         padded_token_count = context.padded_active_token_count
 
@@ -1476,11 +1483,14 @@ class TextGenerationController:
             )
 
         (slp,) = self._log_prob_graph_outputs[graph_key_sm]
-        return context.log_probs_prefill_extract(
+        active_request_count = context.total_request_count - context.paused_request_count
+        return functools.partial(
+            context.log_probs_prefill_extract,
             ri,
             cu_ml,
             slp,
             log_prob_request_count,
+            active_request_count,
             top_n_max=top_n_max,
             logits=logits,
             logit_indices=li,
@@ -1489,12 +1499,10 @@ class TextGenerationController:
     def _calculate_log_probs_speculative(
         self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
     ):
-        """Wrap speculative kernels in CUDA graphs and extract results."""
+        """Run speculative gather kernel (post-verification). Returns a deferred extract callable."""
         active_request_count = context.total_request_count - context.paused_request_count
-        num_decode = context.num_decode_requests
-        num_prefill = active_request_count - num_decode
+        num_prefill = active_request_count - context.num_decode_requests
         only_last = context.config.materialize_only_last_token_logits
-        result: List[Optional[List[float]]] = [None] * active_request_count
 
         # Speculative gather: runs post-verification.
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
@@ -1517,21 +1525,15 @@ class TextGenerationController:
             )
 
         decode_gathered, prefill_gathered = self._log_prob_graph_outputs[graph_key_ga]
-        top_n_dict = context.log_probs_speculative_extract(
-            decode_gathered,
-            prefill_gathered,
-            self._accepted_token_counts_per_request,
-            result,
-            logits=logits,
-            top_n_max=top_n_max,
-        )
 
-        # Full prefill overwrites materialized-prefill results when needed.
+        # Full prefill softmax (if needed) — runs post-verification, before extract.
+        fp_slp = None
+        fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
         if not only_last and num_prefill > 0:
             padded_request_count = context.padded_active_request_count
             padded_token_count = context.padded_active_token_count
 
-            ri, cu_ml, li, li_range, mt, count_gpu = self._log_prob_graph_outputs[
+            fp_ri, fp_cu_ml, fp_li, li_range, mt, fp_count_gpu = self._log_prob_graph_outputs[
                 ("log_probs_spec_fp_idx", padded_request_count, padded_token_count)
             ]
 
@@ -1541,30 +1543,46 @@ class TextGenerationController:
             ):
                 self._log_prob_graph_outputs[graph_key_fp_sm] = (
                     context.log_probs_prefill_softmax_kernel(
-                        logits, new_tokens, ri, cu_ml, li, li_range, mt
+                        logits, new_tokens, fp_ri, fp_cu_ml, fp_li, li_range, mt
                     ),
                 )
 
-            (slp,) = self._log_prob_graph_outputs[graph_key_fp_sm]
-            prefill_result, prefill_top_n = context.log_probs_prefill_extract(
-                ri,
-                cu_ml,
-                slp,
-                count_gpu.item(),
-                top_n_max=top_n_max,
-                logits=logits,
-                logit_indices=li,
-            )
-            for i, lp in enumerate(prefill_result):
-                if lp is not None:
-                    result[i] = lp
-            if prefill_top_n:
-                if top_n_dict is None:
-                    top_n_dict = prefill_top_n
-                else:
-                    top_n_dict.update(prefill_top_n)
+            (fp_slp,) = self._log_prob_graph_outputs[graph_key_fp_sm]
 
-        return result, top_n_dict
+        def extract():
+            result: List[Optional[List[float]]] = [None] * active_request_count
+            top_n_dict = context.log_probs_speculative_extract(
+                decode_gathered,
+                prefill_gathered,
+                self._accepted_token_counts_per_request,
+                result,
+                logits=logits,
+                top_n_max=top_n_max,
+            )
+
+            if fp_slp is not None:
+                prefill_result, prefill_top_n = context.log_probs_prefill_extract(
+                    fp_ri,
+                    fp_cu_ml,
+                    fp_slp,
+                    fp_count_gpu.item(),
+                    active_request_count,
+                    top_n_max=top_n_max,
+                    logits=logits,
+                    logit_indices=fp_li,
+                )
+                for i, lp in enumerate(prefill_result):
+                    if lp is not None:
+                        result[i] = lp
+                if prefill_top_n:
+                    if top_n_dict is None:
+                        top_n_dict = prefill_top_n
+                    else:
+                        top_n_dict.update(prefill_top_n)
+
+            return result, top_n_dict
+
+        return extract
 
     def graph_capture_variants(self) -> Generator[Callable, None, None]:
         """Yield context-setup callables for each graph-capture variant.
@@ -1862,7 +1880,7 @@ class TextGenerationController:
 
             # GPU-side ordering: main stream waits for post-forward bookkeeping stream.
             torch.cuda.current_stream().wait_event(self._post_forward_bookkeeping_event)
-            log_probs, top_n_logprobs = self._dynamic_step_calculate_log_probs()
+            log_probs_extract = self._dynamic_step_calculate_log_probs()
 
             if skip_bookkeeping:
                 request_bookkeeping = {}
@@ -1878,8 +1896,7 @@ class TextGenerationController:
                     if self.num_speculative_tokens > 0
                     else None
                 ),
-                "log_probs": log_probs,
-                "top_n_logprobs": top_n_logprobs,
+                "log_probs_extract": log_probs_extract,
                 "routing_indices_per_request": routing_indices_per_request,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
