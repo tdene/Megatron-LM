@@ -490,9 +490,9 @@ class DynamicInferenceRequest(InferenceRequest):
             ("top_k", torch.int32, False),
             ("top_p", torch.float32, False),
             ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),
-            ("skip_prompt_log_probs", torch.bool, False),
-            ("top_n_logprobs", torch.int32, False),
+            ("return_log_probs", torch.bool, True),
+            ("skip_prompt_log_probs", torch.bool, True),
+            ("top_n_logprobs", torch.int32, True),
         ]
         if sampling_backend == 'flashinfer':
             gpu_fields = {"temperature", "top_k", "top_p"}
