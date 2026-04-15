@@ -364,6 +364,10 @@ class DynamicInferenceEngine(AbstractEngine):
         context = self.context
         controller = self.controller
 
+        # Avoid running sampling during warmup.
+        # TODO: Disable this once sampling is also graphed.
+        controller._sampled_tokens_cuda.zero_()
+
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
@@ -397,6 +401,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
+            # Force all dummy requests to request log probs so graphs cover
+            # the full padded shape.
+            active_request_count = context.total_request_count - context.paused_request_count
+            context.active_request_metadata["return_log_probs"][:active_request_count] = True
+
+            controller._dynamic_step_log_probs_bookkeeping()
+            controller._dynamic_step_log_probs_indexing()
+
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
             if model_config.moe_enable_routing_replay:
@@ -413,7 +425,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+                # Capture speculative softmax graph post-forward.
+                controller._post_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(controller._post_forward_bookkeeping_stream):
+                    controller._dynamic_step_log_probs_softmax()
+                    controller._post_forward_bookkeeping_event.record()
+
                 controller._pre_forward_bookkeeping_event.synchronize()
+
+            # Capture remaining log-prob graphs (gather, extract).
+            controller._dynamic_step_calculate_log_probs()
 
             context.reset()
 
@@ -1751,8 +1772,12 @@ class DynamicInferenceEngine(AbstractEngine):
             evict_request_ids = step_result.get("evict_request_ids")
             sample = step_result["sample"]
             accepted_tokens = step_result["accepted_tokens"]
-            log_probs = step_result["log_probs"]
-            top_n_logprobs = step_result.get("top_n_logprobs", None)
+            # The controller returned a callable to allow for deferred extraction of GPU log probs.
+            log_probs_extract = step_result.get("log_probs_extract")
+            if log_probs_extract is not None:
+                log_probs, top_n_logprobs = log_probs_extract()
+            else:
+                log_probs, top_n_logprobs = None, None
             routing_indices_per_request = step_result.get("routing_indices_per_request", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
