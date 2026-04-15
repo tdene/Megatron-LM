@@ -1875,18 +1875,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.build_active_slices(self.padded_active_request_count)
         self.pad_active_slices()
 
-        batch_size = self.total_request_count - self.paused_request_count
+        # attn_dimensions.req_count may include phantom requests for Mamba + MoE,
+        # so we must pass that many elements to mha_metadata.update.
+        attn_req_count = attn_dimensions.req_count
         assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=self.active_request_query_lengths[:batch_size],
-            request_kv_length_offsets=self.active_request_kv_length_offsets[:batch_size],
-            request_to_kv_block_ids=self.active_request_to_kv_block_ids[:batch_size],
+            request_query_lengths=self.active_request_query_lengths[:attn_req_count],
+            request_kv_length_offsets=self.active_request_kv_length_offsets[:attn_req_count],
+            request_to_kv_block_ids=self.active_request_to_kv_block_ids[:attn_req_count],
             batch_dimensions=attn_dimensions,
             padded_batch_dimensions=self.padded_batch_dimensions,
             num_speculative_tokens=self.num_speculative_tokens,
         )
 
         if self.is_hybrid_model:
+            batch_size = self.total_request_count - self.paused_request_count
             token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
             cu_seqlens = self.active_attn_metadata["mha_metadata"].state_data[
                 "cu_query_seq_lengths"
