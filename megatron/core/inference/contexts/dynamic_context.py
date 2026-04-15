@@ -852,6 +852,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
 
+        # Derived tensors (computed, not copied).
         self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
@@ -1067,40 +1068,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
-    def build_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step.
-
-        If the context is reordered to active -> paused -> finished, this can be graphed.
-        """
-        # TODO: Graph this method to eliminate launch overhead once the condition above is met.
-
-        # The following tensor slices are used in various kernels.
-        self.active_request_query_lengths[:batch_size].copy_(
-            self.request_query_lengths[:batch_size]
-        )
-        self.active_request_to_kv_block_ids[:batch_size].copy_(
-            self.request_to_kv_block_ids[:batch_size]
-        )
-
-        self.cu_active_request_query_lengths[0] = 0
-        torch.cumsum(
-            self.active_request_query_lengths[:batch_size],
-            dim=0,
-            out=self.cu_active_request_query_lengths[1 : batch_size + 1],
-        )
-        self.active_request_last_token_idxs[:batch_size].copy_(
-            self.cu_active_request_query_lengths[1 : batch_size + 1]
-        )
-        self.active_request_last_token_idxs[:batch_size] -= 1
-
-        self.build_active_kv_slices(batch_size)
-
-        if self.is_hybrid_model:
-            self.active_mamba_indices[:batch_size].copy_(
-                self.mamba_metadata.request_to_mamba_state_idx[:batch_size]
-            )
-
-
     def build_active_kv_slices(self, batch_size: int):
         """Build active slices of tensors mutated by `_rewind_kv_cache`.
 
@@ -1120,21 +1087,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def pad_active_slices(self):
-        """Pad the active slices of specific tensors."""
+        """Build and pad the active slices of specific tensors.
 
+        MHAMetadata.update copies source data, computes kv_seq_lengths and cumsums,
+        and pads all request-level buffers in a single pass.
+        """
         # Token-level padding.
         padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
         self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[padding_token_slice] = 0
         self.token_to_position_in_request[padding_token_slice] = 0
 
-        # Other tensors need to be padded at the request level.
+        # Request-level: copy source data, compute derived values, and pad.
+        active_request_count = self.total_request_count - self.paused_request_count
         assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
+            request_query_lengths=self.request_query_lengths[:active_request_count],
+            request_kv_length_offsets=self.request_kv_length_offsets[:active_request_count],
+            request_to_kv_block_ids=self.request_to_kv_block_ids[:active_request_count],
             batch_dimensions=self.attn_dimensions,
             padded_batch_dimensions=self.padded_batch_dimensions,
             num_speculative_tokens=self.num_speculative_tokens,
         )
+
+        # Derive last-token indices from the cumulative query lengths just computed.
+        pbs = self.padded_active_request_count
+        self.active_request_last_token_idxs[:pbs].copy_(
+            self.cu_active_request_query_lengths[1 : pbs + 1]
+        )
+        self.active_request_last_token_idxs[:pbs] -= 1
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1650,7 +1631,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         if self.is_hybrid_model:
-            # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
+            # 4. token_to_request_idx: needed by hybrid model forward pass layers.
             self.token_to_request_idx[0:T] = torch.repeat_interleave(
                 torch.arange(
                     0,
@@ -1769,6 +1750,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 decode_req_count=padded_decode_req_count,
             )
 
+        self.padded_active_token_count = self.padded_batch_dimensions.token_count
+        self.padded_active_request_count = self.padded_batch_dimensions.req_count
+
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
             if self.using_cuda_graph_this_step()
@@ -1789,16 +1773,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         self.attn_dimensions = attn_dimensions
-        self.padded_active_token_count = self.padded_batch_dimensions.token_count
-        self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_active_slices(self.padded_active_request_count)
         self.pad_active_slices()
 
+        active_request_count = self.total_request_count - self.paused_request_count
         if self.is_hybrid_model:
-            batch_size = self.total_request_count - self.paused_request_count
-            token_to_request_idx_view = self.token_to_request_idx[: self.active_token_count]
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
             if self.mamba_slot_allocator is not None:
@@ -1806,8 +1786,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.mamba_slot_allocator.get_intermediate_gpu_data()
                 )
             self.mamba_metadata.update(
-                self.mamba_metadata.request_to_mamba_state_idx[:batch_size],
-                token_to_request_idx_view,
+                self.mamba_metadata.request_to_mamba_state_idx[:active_request_count],
                 self.cu_active_request_query_lengths,
                 batch_dimensions=attn_dimensions,
                 padded_batch_dimensions=self.padded_batch_dimensions,
@@ -1821,6 +1800,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
+
+        # On non-graphed steps, NonGraphedMHAMetadata.update() stored 0-d GPU
+        # tensors from torch.max() in state_data. Resolve them to Python ints
+        # here, after all GPU work is enqueued, so the .item() sync is free.
+        if not self.using_cuda_graph_this_step():
+            state_data = self.active_attn_metadata["mha_metadata"].state_data
+            if isinstance(state_data.get("max_seqlen_q"), torch.Tensor):
+                state_data["max_seqlen_q"] = state_data["max_seqlen_q"].item()
+                state_data["max_seqlen_k"] = state_data["max_seqlen_k"].item()
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
