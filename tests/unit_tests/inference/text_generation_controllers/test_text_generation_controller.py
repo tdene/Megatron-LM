@@ -377,17 +377,22 @@ class TestTextGenerationController:
             top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_gpu.unsqueeze(1))
             scaled_probs.masked_fill_(top_k_mask, 0.0)
 
+            row_sums = scaled_probs.sum(dim=-1, keepdim=True).clamp(min=1e-10)
+            scaled_probs.div_(row_sums)
+
             top_p_gpu = top_p_values.cuda()
-            top_p_mask = scaled_probs.cumsum(dim=-1) > top_p_gpu.unsqueeze(1)
-            first_excluded = torch.where(
-                top_p_mask.any(dim=-1),
-                top_p_mask.float().argmax(dim=-1),
-                torch.full((batch_size,), self.vocab_size, device=device),
+            top_p_safe = top_p_gpu.clone()
+            top_p_safe[top_p_safe == 0.0] = 1.0
+            threshold = (1.0 - top_p_safe).unsqueeze(1)
+            nucleus_mask = scaled_probs.cumsum(dim=-1) > threshold
+            first_in_nucleus = torch.where(
+                nucleus_mask.any(dim=-1),
+                nucleus_mask.float().argmax(dim=-1),
+                torch.zeros(batch_size, device=device),
             )
-            last_included = torch.clamp(first_excluded - 1, min=0)
             start_idx = torch.clamp(self.vocab_size - top_k_gpu, min=0).long()
-            last_included = torch.max(last_included, start_idx)
-            expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
+            first_in_nucleus = torch.max(first_in_nucleus, start_idx.float()).long()
+            expected_min_values = l.gather(1, first_in_nucleus.unsqueeze(1)).squeeze(1)
             assert torch.all(
                 sampled >= expected_min_values
             ), f"Sampled below expected min: sampled {sampled}, expected_min {expected_min_values}"
