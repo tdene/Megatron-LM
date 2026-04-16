@@ -6,13 +6,13 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from itertools import accumulate
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
 def serialize_tensor(tensor: torch.Tensor) -> List:
@@ -24,12 +24,12 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
     Returns:
         (List) Tensor as a list
     """
-    torch.cuda.nvtx.range_push("serialize_tensor")
+    nvtx_range_push("serialize_tensor")
 
     # simply convert tensor into a list
     tensor = tensor.cpu().tolist()
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("serialize_tensor")
     return tensor
 
 
@@ -299,7 +299,7 @@ class DynamicInferenceEvent:
         Returns:
             dict: Full event dict.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
+        nvtx_range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()
@@ -315,7 +315,7 @@ class DynamicInferenceEvent:
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceEvent.serialize")
         return obj
 
     @classmethod
@@ -429,7 +429,7 @@ class DynamicInferenceRequest(InferenceRequest):
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        nvtx_range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
@@ -444,63 +444,13 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
 
     def _post_deserialize(self, obj):
         super()._post_deserialize(obj)
         self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
 
-    @property
-    def tracked_metadata(self) -> List[Any]:
-        """Obtain an ordered list of all request metadata to be tracked by the context.
-
-        This consists of metadata that is used to inform text generation.
-        The values of such fields are tensorized and kept aligned with the current active batch.
-
-        Note that while the general request object is mutable, this metadata is
-        inherently assumed to remain immutable once the request becomes active.
-        """
-        sp = self.sampling_params
-        if sp.termination_id is None:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    f"DynamicInferenceRequest {self.request_id} has no termination_id set "
-                    "in its sampling_params. Defaulting to -1."
-                )
-            sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
-
-    @staticmethod
-    def get_metadata_types(sampling_backend: str = 'torch') -> List[Tuple[str, torch.dtype, bool]]:
-        """Keeps track of all request metadata names, dtypes, and target device.
-
-        Args:
-            sampling_backend: Which sampling backend is in use.
-                FlashInfer needs sampling parameters directly on GPU.
-
-        Returns:
-            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
-                name (str) - The name of the metadata field.
-                dtype (torch.dtype) - The datatype of the metadata.
-                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
-        """
-        types = [
-            ("temperature", torch.float32, False),
-            ("top_k", torch.int32, False),
-            ("top_p", torch.float32, False),
-            ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),
-            ("skip_prompt_log_probs", torch.bool, False),
-            ("top_n_logprobs", torch.int32, False),
-        ]
-        if sampling_backend == 'flashinfer':
-            gpu_fields = {"temperature", "top_k", "top_p"}
-            types = [
-                (label, dtype, True if label in gpu_fields else on_gpu)
-                for label, dtype, on_gpu in types
-            ]
-        return types
 
     def add_event(
         self, type: DynamicInferenceEventType, payload: Optional[Any] = None
@@ -752,10 +702,10 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
+        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
         obj = self.__dict__.copy()  # shallow dict copy
         obj["requests"] = [r.serialize() for r in obj["requests"]]
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
         return obj
 
     @classmethod

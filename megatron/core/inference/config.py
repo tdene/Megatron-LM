@@ -6,7 +6,6 @@ from typing import List, Literal, Optional, Tuple
 
 import torch
 
-from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
@@ -301,12 +300,6 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
-    request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
-    """
-    A list of the per-request metadata types to track. Each entry is a tuple
-    consisting of the string label, the target dtype, and whether to store the data on GPU.
-    """
-
     use_synchronous_zmq_collectives: bool = False
     """Whether to use synchronous ZMQ collectives for inference. If True, the
     all_reduce_max operation will be performed synchronously, which can help reduce
@@ -333,7 +326,3 @@ class InferenceConfig:
                     "sampling_backend='flashinfer' requires flashinfer to be installed."
                 )
 
-        if self.request_metadata_types is None:
-            self.request_metadata_types = DynamicInferenceRequest.get_metadata_types(
-                sampling_backend=self.sampling_backend
-            )

@@ -345,24 +345,15 @@ class TestTextGenerationController:
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
         if use_cuda_graph:
             controller._all_logits_cuda[:, :batch_size, :].copy_(logits)
-        elif controller._sampling_backend == "flashinfer":
+        elif backend == "flashinfer":
             controller._all_logits_cuda = logits.contiguous()
         else:
             controller._all_logits_cuda = logits
 
-        expected_any_filtered = sampling_profile == "mixed"
-
         # Two passes so graph mode exercises both capture and replay. Eager mode
         # runs twice harmlessly.
         for _ in range(2):
-            controller._dynamic_step_sample_bookkeeping()
-            if backend == "flashinfer":
-                controller._pre_forward_bookkeeping_event.synchronize()
-                actual_any_filtered = bool(controller._fi_any_filtered_pinned.item())
-                assert actual_any_filtered == expected_any_filtered, (
-                    f"any-filtered flag: expected {expected_any_filtered}, "
-                    f"got {actual_any_filtered}"
-                )
+            controller._sampling.pre_forward_bookkeeping(context)
             controller._dynamic_step_sample_logits()
             sampled = controller._sampled_tokens_cuda[:batch_size]
 
@@ -401,11 +392,11 @@ class TestTextGenerationController:
                 sampled >= expected_min_values
             ), f"Sampled below expected min: sampled {sampled}, expected_min {expected_min_values}"
 
-        if use_cuda_graph:
-            # After two passes exactly one graph should be captured for this
-            # (padded_n, filtered) pair; the second pass hits the cache.
-            cache = controller._sampling_cuda_graphs
-            expected_key = (padded_n, expected_any_filtered)
+        if use_cuda_graph and backend == "flashinfer":
+            # After two passes exactly one graph should be captured;
+            # the second pass hits the cache.
+            cache = controller._sampling._graphs
+            expected_key = ("sample", padded_n)
             assert (
                 len(cache) == 1
             ), f"Expected exactly one captured sampling graph, got {len(cache)}"
@@ -1500,7 +1491,7 @@ class TestTextGenerationController:
         ctx.active_request_metadata["temperature"][:2].fill_(1.0)
         ctx.active_request_metadata["top_k"][:2].fill_(1)
         ctx.active_request_metadata["top_p"][:2].fill_(0.0)
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
+        self.text_generation_controller._sampling.pre_forward_bookkeeping(ctx)
 
         self.text_generation_controller._compute_serial_mtp_and_sample()
 
