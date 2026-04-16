@@ -24,12 +24,17 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    CUDAGraphCache,
+    get_attention_mask,
+    set_decode_expert_padding,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -165,6 +170,8 @@ class TextGenerationController:
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
+
+        self._init_attn_graphs = CUDAGraphCache()
 
         self._init_mtp_sampling_tensor()
 
@@ -587,10 +594,20 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
+        if context.prepare_attn_init(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        )
+        ):
+            pbd = context.padded_batch_dimensions
+            for _ in self._init_attn_graphs(
+                pbd.decode_req_count,
+                pbd.prefill_req_count,
+                pbd.token_count,
+                eager=not context.using_cuda_graph_this_step(),
+                pool=CudaGraphManager.global_mempool,
+            ):
+                context.run_attn_init_graph_body()
+            context.finalize_attn_init()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -705,9 +722,9 @@ class TextGenerationController:
             bucket_map = defaultdict(list)
 
             # Shorthands for the dictionary comprehension.
-            temp = context.active_request_metadata["temperature"][:active_request_count].tolist()
-            top_k = context.active_request_metadata["top_k"][:active_request_count].tolist()
-            top_p = context.active_request_metadata["top_p"][:active_request_count].tolist()
+            temp = context.request_metadata["temperature"][:active_request_count].tolist()
+            top_k = context.request_metadata["top_k"][:active_request_count].tolist()
+            top_p = context.request_metadata["top_p"][:active_request_count].tolist()
 
             for request_index, (t, k, p) in enumerate(zip(temp, top_k, top_p)):
                 sampling_params = (t, k, p)
@@ -735,7 +752,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Get the accepted token counts for each request
         # Note: _accepted_token_counts is indexed from 0 to active_request_count-1
@@ -746,23 +762,23 @@ class TextGenerationController:
 
         # For prefill requests, no speculative tokens were forwarded through the model,
         # so there is nothing to rewind.
-        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        request_in_prefill_status = context.request_in_prefill_status_tensor[:active_request_count]
         num_tokens_to_rewind[request_in_prefill_status == 1] = 0
 
         # Save the original offset BEFORE modifying to correctly detect block boundary crossing
-        original_offset = context.request_last_kv_block_offset[active_request_slice].clone()
+        original_offset = context.request_last_kv_block_offset[:active_request_count].clone()
 
         # Check which requests need to rewind to a previous block BEFORE modifying
         # A request crosses back to a previous block if: original_offset - num_tokens_to_rewind < 0
         remove_allocated_blocks_mask = (original_offset - num_tokens_to_rewind) < 0
 
         # Update the offsets
-        context.request_last_kv_block_offset[active_request_slice] = (
+        context.request_last_kv_block_offset[:active_request_count] = (
             original_offset - num_tokens_to_rewind
         ) % context.block_size_tokens
 
-        context.request_kv_length_offsets[active_request_slice] = (
-            context.request_kv_length_offsets[active_request_slice] - num_tokens_to_rewind
+        context.request_kv_length_offsets[:active_request_count] = (
+            context.request_kv_length_offsets[:active_request_count] - num_tokens_to_rewind
         )
 
         # No need to update request_query_lengths (It will be set correctly in the next iteration)
@@ -777,7 +793,7 @@ class TextGenerationController:
             # Get indices of requests that need to release a block (relative to active requests)
             requests_needing_release = torch.nonzero(remove_allocated_blocks_mask, as_tuple=True)[0]
             # Convert to absolute indices in the context tensors
-            absolute_indices = requests_needing_release + context.paused_request_count
+            absolute_indices = requests_needing_release  # active starts at 0
 
             # No clone needed: advanced (fancy) indexing with a tensor already returns
             # a copy, not a view.
@@ -809,9 +825,9 @@ class TextGenerationController:
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
             active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
+                :active_request_count
             ]
-            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
+            is_decode_mask = context.request_in_prefill_status_tensor[:active_request_count] == 0
             decode_mamba_indices = active_mamba_indices[is_decode_mask]
             accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
 
@@ -869,7 +885,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_slice = slice(context.paused_request_count, context.total_request_count)
 
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
 
@@ -898,8 +913,8 @@ class TextGenerationController:
         # After rewind, request_kv_length_offsets has been adjusted. The actual
         # KV cache length is: adjusted_offset + processed_tokens.
         # The next position to predict starts at that cache length.
-        adjusted_offsets = context.request_kv_length_offsets[active_slice]
-        processed_tokens = context.request_query_lengths[active_slice]
+        adjusted_offsets = context.request_kv_length_offsets[:active_request_count]
+        processed_tokens = context.request_query_lengths[:active_request_count]
         base_position = adjusted_offsets + processed_tokens
 
         # Start with the freshly sampled base token.
@@ -1120,7 +1135,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1240,8 +1255,8 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         return (
-            (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
-            (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
+            (context.request_metadata["return_log_probs"][:active_request_count]).any(),
+            (context.request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
         )
 
     def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
@@ -1273,7 +1288,7 @@ class TextGenerationController:
 
         # Get active request info from context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_ids = context.active_request_ids[:active_request_count].tolist()
+        active_request_ids = context.request_ids[:active_request_count].tolist()
         active_query_lengths = context.active_request_query_lengths[:active_request_count].tolist()
         active_token_count = context.active_token_count
 
@@ -1341,7 +1356,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1449,7 +1464,7 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         request_in_prefill_status_tensor = context.request_in_prefill_status_tensor[
-            context.paused_request_count : context.total_request_count
+            :active_request_count
         ]
         request_query_lengths = context.active_request_query_lengths[:active_request_count]
 
@@ -1464,9 +1479,7 @@ class TextGenerationController:
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
             accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
-            top_n_per_request = context.active_request_metadata["top_n_logprobs"][
-                :num_decode_requests
-            ]
+            top_n_per_request = context.request_metadata["top_n_logprobs"][:num_decode_requests]
             max_top_n = int(top_n_per_request.max().item())
 
             if max_top_n > 0:
@@ -1493,7 +1506,7 @@ class TextGenerationController:
             prefill_log_probs = log_probs_tensor[decode_len:]
 
             # Batch metadata reads: single CPU transfer for all prefill requests.
-            prefill_top_n = context.active_request_metadata["top_n_logprobs"][
+            prefill_top_n = context.request_metadata["top_n_logprobs"][
                 num_decode_requests:active_request_count
             ].tolist()
             max_top_n_prefill = int(max(prefill_top_n)) if prefill_top_n else 0
@@ -1521,7 +1534,7 @@ class TextGenerationController:
                     prefill_log_probs_per_request = prefill_log_probs.split(
                         prefill_query_lengths.tolist(), dim=0
                     )
-                    prefill_skip_prompt = context.active_request_metadata["skip_prompt_log_probs"][
+                    prefill_skip_prompt = context.request_metadata["skip_prompt_log_probs"][
                         num_decode_requests:active_request_count
                     ].tolist()
 
@@ -1578,7 +1591,7 @@ class TextGenerationController:
 
             top_n_results = {}
             for req_idx in range(active_request_count):
-                top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+                top_n = int(context.request_metadata["top_n_logprobs"][req_idx].item())
                 if top_n > 0:
                     # Get top-n logprobs and indices for this request (single token)
                     top_n_logits = torch.topk(log_probs[req_idx], k=top_n)
@@ -1600,13 +1613,13 @@ class TextGenerationController:
 
         top_n_results = {}
         for req_idx in range(active_request_count):
-            top_n = int(context.active_request_metadata["top_n_logprobs"][req_idx].item())
+            top_n = int(context.request_metadata["top_n_logprobs"][req_idx].item())
             if top_n > 0:
                 request_log_probs = log_probs_per_request[
                     req_idx
                 ]  # [num_tokens_for_request, vocab_size]
                 skip_prompt = bool(
-                    context.active_request_metadata["skip_prompt_log_probs"][req_idx].item()
+                    context.request_metadata["skip_prompt_log_probs"][req_idx].item()
                 )
 
                 # If skip_prompt_log_probs is True, only compute for last token
@@ -1784,12 +1797,12 @@ class TextGenerationController:
         # Note: termination_id tensor has per-request termination IDs from mixed sampling
         active_request_mask = (
             self._sampled_tokens_cuda[:active_request_count]
-            != context.active_request_metadata["termination_id"][:active_request_count]
+            != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(
-            active_sequence_lengths, context.active_request_output_lengths[:active_request_count]
+            active_sequence_lengths, context.request_output_lengths[:active_request_count]
         ).byte()
 
-        active_request_ids = context.active_request_ids[:active_request_count]
+        active_request_ids = context.request_ids[:active_request_count]
 
         # Mark requests as finished if they hit stop words
         # (detected in previous step's post_process_requests)
@@ -1801,9 +1814,7 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
+        finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,

@@ -12,93 +12,70 @@ class MHAMetadata(MetadataBase):
     """
 
     def __init__(
-        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
+        self,
+        max_requests: int,
+        max_seqlen: int,
+        *,
+        query_lengths_buf: torch.Tensor,
+        cu_query_seq_lengths_buf: torch.Tensor,
+        kv_seq_lengths_buf: torch.Tensor,
+        cu_kv_seq_lengths_buf: torch.Tensor,
+        block_table_buf: torch.Tensor,
     ):
         super().__init__()
-        device = torch.cuda.current_device()
-        self.device = device
-        self.max_blocks = block_count_total
-        self.max_kv_blocks = max_kv_block_count
         self.max_bs = max_requests
         self.max_seqlen = max_seqlen
-        self._query_lengths_buf = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
-        self._cu_query_seq_lengths_buf = torch.zeros(
-            self.max_bs + 1, dtype=torch.int32, device=device
-        )
-        self._cu_kv_seq_lengths_buf = torch.zeros(self.max_bs + 1, dtype=torch.int32, device=device)
-        self._kv_seq_lengths_buf = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
-        self._block_table_buf = torch.zeros(
-            (self.max_bs, self.max_kv_blocks), dtype=torch.int32, device=device
-        )
+
+        self._query_lengths_buf = query_lengths_buf
+        self._cu_query_seq_lengths_buf = cu_query_seq_lengths_buf
+        self._kv_seq_lengths_buf = kv_seq_lengths_buf
+        self._cu_kv_seq_lengths_buf = cu_kv_seq_lengths_buf
+        self._block_table_buf = block_table_buf
+
         self._max_seqlen_q = 0
         self._max_seqlen_k = 0
-        self.state_data = {}
 
     def update(
         self,
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
+        real_request_count_gpu: torch.Tensor,
+        arange_buf: torch.Tensor,
         padded_batch_dimensions: InferenceBatchDimensions,
         num_speculative_tokens: int = 0,
     ):
-        """
-        Args:
-            request_query_lengths: (>real_batch_size,)
-            request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
-            num_speculative_tokens: Number of speculative tokens
-        """
-        # Extract values from configs
-        real_batch_size = batch_dimensions.req_count
-        padded_active_token_count = padded_batch_dimensions.token_count
-        padded_active_request_count = padded_batch_dimensions.req_count
+        """Copy source data into metadata buffers, compute derived values, and pad.
 
-        assert real_batch_size <= padded_active_request_count <= self.max_bs
-        assert request_query_lengths.shape[0] == real_batch_size
-        assert request_kv_length_offsets.shape[0] == real_batch_size
-        assert request_to_kv_block_ids.shape[0] == real_batch_size
+        All ops use fixed-shape slices with `real_request_count_gpu` and `arange_buf` as
+        the real/padding boundary, so shapes and addresses are static.
+        """
+        pbs = padded_batch_dimensions.req_count
 
-        self.tensor_copy_and_pad(
-            self._query_lengths_buf,
-            request_query_lengths,
-            real_batch_size,
-            padded_active_request_count,
-        )
-        self._cu_query_seq_lengths_buf[0] = 0
-        self.tensor_copy_and_pad(
-            self._cu_query_seq_lengths_buf[1:],
-            torch.cumsum(request_query_lengths, dim=0),
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
-        )
-        self.tensor_copy_and_pad(
-            self._kv_seq_lengths_buf,
-            request_kv_length_offsets + request_query_lengths,
-            real_batch_size,
-            padded_active_request_count,
-        )
-        self.tensor_copy_and_pad(
-            self._block_table_buf,
-            request_to_kv_block_ids,
-            real_batch_size,
-            padded_active_request_count,
-            pad_value=torch.tensor(self.max_kv_blocks, dtype=torch.int32, device=self.device).fill_(
-                -1
-            ),
-        )
-        self._cu_kv_seq_lengths_buf[0] = 0
-        self.tensor_copy_and_pad(
-            self._cu_kv_seq_lengths_buf[1:],
-            torch.cumsum(self._kv_seq_lengths_buf, dim=0),
-            real_batch_size,
-            padded_active_request_count,
-            is_cumulative_tensor=True,
-        )
+        if pbs > 0:
+            mask = arange_buf[:pbs] < real_request_count_gpu
+
+            self._query_lengths_buf[:pbs] = torch.where(mask, request_query_lengths[:pbs], 0)
+            self._kv_seq_lengths_buf[:pbs] = torch.where(
+                mask, request_kv_length_offsets[:pbs] + request_query_lengths[:pbs], 0
+            )
+            self._block_table_buf[:pbs] = torch.where(
+                mask.unsqueeze(1), request_to_kv_block_ids[:pbs], -1
+            )
+
+            self._cu_query_seq_lengths_buf[0] = 0
+            torch.cumsum(
+                self._query_lengths_buf[:pbs],
+                dim=0,
+                out=self._cu_query_seq_lengths_buf[1 : pbs + 1],
+            )
+            self._cu_kv_seq_lengths_buf[0] = 0
+            torch.cumsum(
+                self._kv_seq_lengths_buf[:pbs], dim=0, out=self._cu_kv_seq_lengths_buf[1 : pbs + 1]
+            )
+        else:
+            self._cu_query_seq_lengths_buf[0] = 0
+            self._cu_kv_seq_lengths_buf[0] = 0
 
         if padded_batch_dimensions.prefill_req_count == 0:
             self._max_seqlen_q = num_speculative_tokens + 1
@@ -109,71 +86,14 @@ class MHAMetadata(MetadataBase):
         self._max_seqlen_k = self.max_seqlen
 
         self.state_data = {
-            "query_lengths": self._query_lengths_buf[:padded_active_request_count],
-            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[
-                : padded_active_request_count + 1
-            ],
-            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: padded_active_request_count + 1],
-            "kv_seq_lengths": self._kv_seq_lengths_buf[:padded_active_request_count],
-            "block_table": self._block_table_buf[0:padded_active_request_count, :],
+            "query_lengths": self._query_lengths_buf[:pbs],
+            "cu_query_seq_lengths": self._cu_query_seq_lengths_buf[: pbs + 1],
+            "cu_kv_seq_lengths": self._cu_kv_seq_lengths_buf[: pbs + 1],
+            "kv_seq_lengths": self._kv_seq_lengths_buf[:pbs],
+            "block_table": self._block_table_buf[:pbs, :],
             "max_seqlen_q": self._max_seqlen_q,
             "max_seqlen_k": self._max_seqlen_k,
         }
-
-    def reset(self):
-        """
-        Reset the metadata for the next batch.
-        """
-        self._query_lengths_buf.fill_(0)
-        self._cu_query_seq_lengths_buf.fill_(0)
-        self._cu_kv_seq_lengths_buf.fill_(0)
-        self._kv_seq_lengths_buf.fill_(0)
-        self._block_table_buf.fill_(0)
-        self._max_seqlen_q = 0
-        self._max_seqlen_k = 0
-
-
-class GraphedMHAMetadata(MHAMetadata):
-    """
-    Metadata for MHA layer using flash-attention with CUDA graphs.
-    """
-
-    def __init__(
-        self, block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
-    ):
-        super().__init__(
-            block_count_total, max_kv_block_count, max_requests, block_size_tokens, max_seqlen
-        )
-
-    def update(
-        self,
-        request_query_lengths: torch.Tensor,
-        request_kv_length_offsets: torch.Tensor,
-        request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
-        padded_batch_dimensions: InferenceBatchDimensions,
-        num_speculative_tokens: int = 0,
-    ):
-        """
-        Args:
-            request_query_lengths: (>real_batch_size,)
-            request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
-            num_speculative_tokens: Number of speculative tokens
-        """
-        super().update(
-            request_query_lengths,
-            request_kv_length_offsets,
-            request_to_kv_block_ids,
-            batch_dimensions,
-            padded_batch_dimensions,
-            num_speculative_tokens,
-        )
-
-    def reset(self):
-        super().reset()
 
 
 class NonGraphedMHAMetadata(MHAMetadata):
@@ -186,30 +106,36 @@ class NonGraphedMHAMetadata(MHAMetadata):
         request_query_lengths: torch.Tensor,
         request_kv_length_offsets: torch.Tensor,
         request_to_kv_block_ids: torch.Tensor,
-        batch_dimensions: InferenceBatchDimensions,
+        real_request_count_gpu: torch.Tensor,
+        arange_buf: torch.Tensor,
         padded_batch_dimensions: InferenceBatchDimensions,
         num_speculative_tokens: int = 0,
     ):
         """
         Args:
-            request_query_lengths: (>real_batch_size,)
-            request_kv_length_offsets: (>real_batch_size,)
-            request_to_kv_block_ids: (>real_batch_size, max_kv_blocks)
-            batch_dimensions: Configuration object containing real batch settings
-            padded_batch_dimensions: Configuration object containing padded batch settings
-            num_speculative_tokens: Number of speculative tokens
+            request_query_lengths (Tensor): per-request query lengths.
+            request_kv_length_offsets (Tensor): per-request KV length offsets.
+            request_to_kv_block_ids (Tensor): per-request block-table rows.
+            real_request_count_gpu (Tensor): GPU scalar with the unpadded request count.
+            arange_buf (Tensor): Pre-allocated arange buffer.
+            padded_batch_dimensions (InferenceBatchDimensions): Padded decode/prefill/token counts.
+            num_speculative_tokens (int): Speculative-decode depth.
         """
         super().update(
             request_query_lengths,
             request_kv_length_offsets,
             request_to_kv_block_ids,
-            batch_dimensions,
+            real_request_count_gpu,
+            arange_buf,
             padded_batch_dimensions,
             num_speculative_tokens,
         )
-        if len(self.state_data["query_lengths"]) > 0:
-            self.state_data["max_seqlen_q"] = torch.max(self.state_data["query_lengths"]).item()
-            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"]).item()
+        query_lengths = self.state_data["query_lengths"]
+        if len(query_lengths) > 0:
+            self.state_data["max_seqlen_q"] = torch.max(query_lengths)
+            self.state_data["max_seqlen_k"] = torch.max(self.state_data["kv_seq_lengths"])
         else:
-            self.state_data["max_seqlen_q"] = num_speculative_tokens + 1
-            self.state_data["max_seqlen_k"] = 1
+            # Empty-batch fallback: stay tensor-valued so the caller's
+            # post-forward resolution can unconditionally .item().
+            self.state_data["max_seqlen_q"] = query_lengths.new_full((), num_speculative_tokens + 1)
+            self.state_data["max_seqlen_k"] = query_lengths.new_full((), 1)

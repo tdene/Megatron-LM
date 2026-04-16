@@ -2739,11 +2739,12 @@ class TestDynamicContext:
         # Both blocks should be safely shared with ref count 2
         assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
 
-        # Mock the state to make req1 paused and req2 active
+        # Mock the state to make req2 active and req1 paused.
+        # Layout: [active | paused] => request_ids[0] = active (req2), request_ids[1] = paused (req1).
         ctx.paused_request_count = 1
         ctx.total_request_count = 2
-        ctx.request_ids[0] = 1
-        ctx.request_ids[1] = 2
+        ctx.request_ids[0] = 2
+        ctx.request_ids[1] = 1
         ctx.request_kv_block_counts[0] = 2
         ctx.request_kv_block_counts[1] = 2
 
