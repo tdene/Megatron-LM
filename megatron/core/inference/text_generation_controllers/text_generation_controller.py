@@ -24,12 +24,17 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    CUDAGraphCache,
+    get_attention_mask,
+    set_decode_expert_padding,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -165,6 +170,8 @@ class TextGenerationController:
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
+
+        self._init_attn_graphs = CUDAGraphCache()
 
         self._init_mtp_sampling_tensor()
 
@@ -587,10 +594,20 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
+        if context.prepare_attn_init(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        )
+        ):
+            pbd = context.padded_batch_dimensions
+            for _ in self._init_attn_graphs(
+                pbd.decode_req_count,
+                pbd.prefill_req_count,
+                pbd.token_count,
+                eager=not context.using_cuda_graph_this_step(),
+                pool=CudaGraphManager.global_mempool,
+            ):
+                context.run_attn_init_graph_body()
+            context.finalize_attn_init()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -735,7 +752,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(0, active_request_count)
 
         # Get the accepted token counts for each request
         # Note: _accepted_token_counts is indexed from 0 to active_request_count-1
@@ -746,23 +762,23 @@ class TextGenerationController:
 
         # For prefill requests, no speculative tokens were forwarded through the model,
         # so there is nothing to rewind.
-        request_in_prefill_status = context.request_in_prefill_status_tensor[active_request_slice]
+        request_in_prefill_status = context.request_in_prefill_status_tensor[:active_request_count]
         num_tokens_to_rewind[request_in_prefill_status == 1] = 0
 
         # Save the original offset BEFORE modifying to correctly detect block boundary crossing
-        original_offset = context.request_last_kv_block_offset[active_request_slice].clone()
+        original_offset = context.request_last_kv_block_offset[:active_request_count].clone()
 
         # Check which requests need to rewind to a previous block BEFORE modifying
         # A request crosses back to a previous block if: original_offset - num_tokens_to_rewind < 0
         remove_allocated_blocks_mask = (original_offset - num_tokens_to_rewind) < 0
 
         # Update the offsets
-        context.request_last_kv_block_offset[active_request_slice] = (
+        context.request_last_kv_block_offset[:active_request_count] = (
             original_offset - num_tokens_to_rewind
         ) % context.block_size_tokens
 
-        context.request_kv_length_offsets[active_request_slice] = (
-            context.request_kv_length_offsets[active_request_slice] - num_tokens_to_rewind
+        context.request_kv_length_offsets[:active_request_count] = (
+            context.request_kv_length_offsets[:active_request_count] - num_tokens_to_rewind
         )
 
         # No need to update request_query_lengths (It will be set correctly in the next iteration)
@@ -809,9 +825,9 @@ class TextGenerationController:
         # Mamba speculative rewind state update
         if context.is_hybrid_model:
             active_mamba_indices = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
+                :active_request_count
             ]
-            is_decode_mask = context.request_in_prefill_status_tensor[active_request_slice] == 0
+            is_decode_mask = context.request_in_prefill_status_tensor[:active_request_count] == 0
             decode_mamba_indices = active_mamba_indices[is_decode_mask]
             accepted_tokens_per_decode_request = accepted_tokens_per_request[is_decode_mask]
 
@@ -869,7 +885,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_slice = slice(0, active_request_count)
 
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
 
@@ -898,8 +913,8 @@ class TextGenerationController:
         # After rewind, request_kv_length_offsets has been adjusted. The actual
         # KV cache length is: adjusted_offset + processed_tokens.
         # The next position to predict starts at that cache length.
-        adjusted_offsets = context.request_kv_length_offsets[active_slice]
-        processed_tokens = context.request_query_lengths[active_slice]
+        adjusted_offsets = context.request_kv_length_offsets[:active_request_count]
+        processed_tokens = context.request_query_lengths[:active_request_count]
         base_position = adjusted_offsets + processed_tokens
 
         # Start with the freshly sampled base token.
@@ -1464,9 +1479,7 @@ class TextGenerationController:
                 num_decode_requests, self.num_speculative_tokens + 1, -1
             )
             accepted_counts = self._accepted_token_counts_per_request[:num_decode_requests]
-            top_n_per_request = context.request_metadata["top_n_logprobs"][
-                :num_decode_requests
-            ]
+            top_n_per_request = context.request_metadata["top_n_logprobs"][:num_decode_requests]
             max_top_n = int(top_n_per_request.max().item())
 
             if max_top_n > 0:

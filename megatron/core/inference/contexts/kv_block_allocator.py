@@ -88,11 +88,7 @@ class KVBlockAllocator:
         """Compute number of active blocks used."""
         active_count = self.context.total_request_count - self.context.paused_request_count
         if not self.enable_prefix_caching:
-            return (
-                self.context.request_kv_block_counts[:active_count]
-                .sum()
-                .item()
-            )
+            return self.context.request_kv_block_counts[:active_count].sum().item()
 
         if active_count > 0:
             active_rows = self.context.request_to_kv_block_ids[:active_count]
@@ -106,11 +102,7 @@ class KVBlockAllocator:
         active_count = self.context.total_request_count - self.context.paused_request_count
         paused_end = self.context.total_request_count
         if not self.enable_prefix_caching:
-            return (
-                self.context.request_kv_block_counts[active_count:paused_end]
-                .sum()
-                .item()
-            )
+            return self.context.request_kv_block_counts[active_count:paused_end].sum().item()
 
         if self.context.paused_request_count > 0:
             paused_rows = self.context.request_to_kv_block_ids[active_count:paused_end]

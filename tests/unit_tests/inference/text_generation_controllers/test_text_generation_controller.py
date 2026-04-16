@@ -837,9 +837,7 @@ class TestTextGenerationController:
         # Prepare sampling params
         top_n = 5
         context.request_metadata["top_n_logprobs"][:batch_size].fill_(top_n)
-        context.request_metadata["skip_prompt_log_probs"][:batch_size].fill_(
-            skip_prompt_log_probs
-        )
+        context.request_metadata["skip_prompt_log_probs"][:batch_size].fill_(skip_prompt_log_probs)
 
         if materialize_only_last_token_logits:
             # Decode mode: logits for last tokens only

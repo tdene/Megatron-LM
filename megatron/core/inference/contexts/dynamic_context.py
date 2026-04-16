@@ -556,6 +556,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         self.num_prefill_requests = 0
+
         # Populated in initialize_all_tensors once the shared active_* tensors exist.
         self.graph_attn_metadata = {}
         self.non_graph_attn_metadata = {}
@@ -840,9 +841,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
 
         # Static-address buffers for the active slice of each forward step.
-        # Only tensors that MHAMetadata pads (writing beyond real_batch_size)
-        # need separate buffers; everything else is read directly from the
-        # source tensors now that active requests start at index 0.
+        # Only tensors that MHAMetadata pads (writing beyond real_batch_size) need separate buffers;
+        # everything else is read directly from the source tensors.
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_to_kv_block_ids = torch.empty_like(self.request_to_kv_block_ids)
 
@@ -857,6 +857,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cu_active_sequence_lengths = torch.empty(
             (self.max_requests + 1,), dtype=torch.int32, device=torch.cuda.current_device()
         )
+
+        # GPU scalars for freely-varying counts. Written from Python ints each
+        # step; used by graphable ops via torch.where so slice shapes stay fixed.
+        self._real_request_count_gpu = torch.zeros(
+            1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._real_token_count_gpu = torch.zeros(
+            1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._real_decode_count_gpu = torch.zeros(
+            1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._real_prefill_count_gpu = torch.zeros(
+            1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+
+        # Pre-allocated index tensors for graphable ops (static addresses).
+        self._arange_requests = torch.arange(self.max_requests, dtype=torch.int32, device=device)
+        self._arange_tokens = torch.arange(self.max_tokens, dtype=torch.int32, device=device)
 
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
@@ -1083,23 +1102,29 @@ class DynamicInferenceContext(BaseInferenceContext):
     def pad_active_slices(self):
         """Build and pad the active slices of specific tensors.
 
-        MHAMetadata.update copies source data, computes kv_seq_lengths and cumsums,
-        and pads all request-level buffers in a single pass.
+        All ops are keyed on padded dimensions with GPU scalars for the active/padding boundary.
         """
-        # Token-level padding.
-        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
-        self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
-        self.token_to_local_position_within_kv_block[padding_token_slice] = 0
-        self.token_to_position_in_request[padding_token_slice] = 0
+        # Token-level padding via torch.where with GPU scalar boundary.
+        ptc = self.padded_active_token_count
+        tok_pad_mask = self._arange_tokens[:ptc] >= self._real_token_count_gpu
+        self.token_to_block_idx[:ptc] = torch.where(
+            tok_pad_mask, self.kv_block_allocator.dummy_block_idx, self.token_to_block_idx[:ptc]
+        )
+        self.token_to_local_position_within_kv_block[:ptc] = torch.where(
+            tok_pad_mask, 0, self.token_to_local_position_within_kv_block[:ptc]
+        )
+        self.token_to_position_in_request[:ptc] = torch.where(
+            tok_pad_mask, 0, self.token_to_position_in_request[:ptc]
+        )
 
         # Request-level: copy source data, compute derived values, and pad.
-        active_request_count = self.total_request_count - self.paused_request_count
         assert self.active_attn_metadata is not None
         self.active_attn_metadata["mha_metadata"].update(
-            request_query_lengths=self.request_query_lengths[:active_request_count],
-            request_kv_length_offsets=self.request_kv_length_offsets[:active_request_count],
-            request_to_kv_block_ids=self.request_to_kv_block_ids[:active_request_count],
-            batch_dimensions=self.attn_dimensions,
+            request_query_lengths=self.request_query_lengths,
+            request_kv_length_offsets=self.request_kv_length_offsets,
+            request_to_kv_block_ids=self.request_to_kv_block_ids,
+            real_request_count_gpu=self._real_request_count_gpu,
+            arange_buf=self._arange_requests,
             padded_batch_dimensions=self.padded_batch_dimensions,
             num_speculative_tokens=self.num_speculative_tokens,
         )
@@ -1110,6 +1135,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cu_active_request_query_lengths[1 : pbs + 1]
         )
         self.active_request_last_token_idxs[:pbs] -= 1
+
+    def run_attn_init_graph_body(self) -> None:
+        """Graphable portion of `initialize_attention_state`."""
+        self.pad_active_slices()
+
+        if self.is_hybrid_model:
+            slot_alloc = self.mamba_slot_allocator
+            self.mamba_metadata.update(
+                self.mamba_metadata.request_to_mamba_state_idx,
+                self.cu_active_request_query_lengths,
+                real_decode_count_gpu=self._real_decode_count_gpu,
+                real_prefill_count_gpu=self._real_prefill_count_gpu,
+                arange_buf=self._arange_requests,
+                padded_batch_dimensions=self.padded_batch_dimensions,
+                intermediate_offsets_gpu=(
+                    slot_alloc._intermediate_offsets_gpu if slot_alloc is not None else None
+                ),
+                intermediate_counts_gpu=(
+                    slot_alloc._intermediate_counts_gpu if slot_alloc is not None else None
+                ),
+            )
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1657,6 +1703,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
+        if self.prepare_attn_init(
+            construct_graph_dimensions=construct_graph_dimensions,
+            is_expert_parallel_dummy_cuda_graph_step=is_expert_parallel_dummy_cuda_graph_step,
+        ):
+            self.run_attn_init_graph_body()
+            self.finalize_attn_init()
+
+    def prepare_attn_init(
+        self,
+        *,
+        construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
+        is_expert_parallel_dummy_cuda_graph_step: bool = False,
+    ) -> bool:
+        """Pre-graph phase of `initialize_attention_state`.
+
+        Resolves batch/padded dimensions, selects the attention metadata dict for this step,
+        and fills the real-count GPU scalars.
+        Returns True if the body + finalize phases should still run, or False for the
+        EP-dummy fast-path where no more work is needed.
+        """
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
@@ -1701,7 +1767,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # could not find a compatible cuda graph for the dummy forward step.
             # Now, we need not do the remaining setup. The controller
             # will directly call the model forward pass with a single token.
-            return
+            return False
 
         # Add dummy requests AFTER the EP sync so they match the resolved graph.
         if is_expert_parallel_dummy_cuda_graph_step:
@@ -1747,62 +1813,42 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_token_count = self.padded_batch_dimensions.token_count
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
 
+        active_request_count = self.total_request_count - self.paused_request_count
+
         self.active_attn_metadata = (
             self.graph_attn_metadata  # type: ignore[assignment]
             if self.using_cuda_graph_this_step()
             else self.non_graph_attn_metadata  # type: ignore[assignment]
         )
 
-        attn_dimensions = batch_dimensions
-        if self.using_cuda_graph_this_step():
-            # Treat some decode requests as prefill requests to fit the cuda graph batch dimension.
-            if batch_dimensions.decode_req_count > self.padded_batch_dimensions.decode_req_count:
-                total_req = batch_dimensions.req_count
-                adjusted_decode_req_count = self.padded_batch_dimensions.decode_req_count
-                adjusted_prefill_req_count = total_req - adjusted_decode_req_count
-                attn_dimensions = InferenceBatchDimensions(
-                    token_count=batch_dimensions.token_count,
-                    prefill_req_count=adjusted_prefill_req_count,
-                    decode_req_count=adjusted_decode_req_count,
-                )
-
-        self.attn_dimensions = attn_dimensions
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.pad_active_slices()
+        # Write GPU scalars before the body so a captured body reads updated values on replay.
+        self._real_request_count_gpu.fill_(active_request_count)
+        self._real_token_count_gpu.fill_(self.active_token_count)
+        self._real_decode_count_gpu.fill_(batch_dimensions.decode_req_count)
+        self._real_prefill_count_gpu.fill_(batch_dimensions.prefill_req_count)
 
-        active_request_count = self.total_request_count - self.paused_request_count
-        if self.is_hybrid_model:
-            intermediate_offsets_gpu = None
-            intermediate_counts_gpu = None
-            if self.mamba_slot_allocator is not None:
-                intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_gpu_data()
-                )
-            self.mamba_metadata.update(
-                self.mamba_metadata.request_to_mamba_state_idx[:active_request_count],
-                self.cu_active_request_query_lengths,
-                batch_dimensions=attn_dimensions,
-                padded_batch_dimensions=self.padded_batch_dimensions,
-                enable_chunked_prefill=self.is_chunked_prefill_enabled(),
-                intermediate_offsets_gpu=intermediate_offsets_gpu,
-                intermediate_counts_gpu=intermediate_counts_gpu,
-            )
+        return True
 
+    def finalize_attn_init(self) -> None:
+        """Post-graph phase of `initialize_attention_state`.
+
+        CPU-only bookkeeping that must happen after the graphable body,
+        plus resolving deferred GPU / CPU syncs that were staged during the graphable body.
+        """
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
                 self.moe_routing_metadata.enable_static_buffer_recording()
             else:
                 self.moe_routing_metadata.disable_static_buffer_recording()
 
-        # On non-graphed steps, NonGraphedMHAMetadata.update() stored 0-d GPU
-        # tensors from torch.max() in state_data. Resolve them to Python ints
-        # here, after all GPU work is enqueued, so the .item() sync is free.
+        # Resolve deferred max_seqlen .item() calls staged by `NonGraphedMHAMetadata.update()`.
+        # Graph-mode metadata already stores Python ints; nothing to resolve on that path.
         if not self.using_cuda_graph_this_step():
             state_data = self.active_attn_metadata["mha_metadata"].state_data
-            if isinstance(state_data.get("max_seqlen_q"), torch.Tensor):
-                state_data["max_seqlen_q"] = state_data["max_seqlen_q"].item()
-                state_data["max_seqlen_k"] = state_data["max_seqlen_k"].item()
+            state_data["max_seqlen_q"] = state_data["max_seqlen_q"].item()
+            state_data["max_seqlen_k"] = state_data["max_seqlen_k"].item()
 
     def reset_tensors(self) -> None:
         """Fill all GPU tensors with sentinel values."""
@@ -2564,7 +2610,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Overflow paused block count.
         # Layout: [active | paused]. Paused at [active_count, total).
         active_count = self.total_request_count - self.paused_request_count
-        paused_block_counts = self.request_kv_block_counts[active_count:self.total_request_count]
+        paused_block_counts = self.request_kv_block_counts[active_count : self.total_request_count]
         paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
         valid_paused_request_count = torch.nonzero(
             paused_block_counts_cumsum <= self.kv_block_allocator.paused_count
@@ -2581,7 +2627,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # paused requests are at the RIGHT (tail). Evict from the tail.
         # We flip the overflow portion (rightmost paused) to count evicted
         # blocks from the rightmost side.
-        paused_block_counts_tail = paused_block_counts[-overflow_paused_request_count:].flip(dims=[0])
+        paused_block_counts_tail = paused_block_counts[-overflow_paused_request_count:].flip(
+            dims=[0]
+        )
         paused_block_counts_cumsum = paused_block_counts_tail.cumsum(dim=0)
         remaining_paused_request_counts = torch.arange(
             overflow_paused_request_count - 1,
@@ -2599,6 +2647,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         evict_request_idxs = torch.arange(
             evict_start_idx, evict_end_idx, device=torch.cuda.current_device()
         )
+        # Clone needed: the returned ids must outlive this call, but the slots
+        # [evict_start_idx:evict_end_idx] become dead after the counts shrink
+        # below and may be overwritten by a later add_request.
         evict_request_ids = self.request_ids[evict_start_idx:evict_end_idx].clone()
 
         # Release memory.
@@ -2764,9 +2815,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             if (
                 chunked_prefill_request_idx := self.get_index_of_chunked_prefill_request(safe=True)
             ) != -1:
-                active_requests_requiring_new_block[
-                    chunked_prefill_request_idx
-                ] = 0  # chunked prefill should not be paused
+                active_requests_requiring_new_block[chunked_prefill_request_idx] = (
+                    0  # chunked prefill should not be paused
+                )
             else:
                 max_allowed_active = min(
                     self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
@@ -2791,9 +2842,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and active_requests_requiring_new_block_count != active_request_count
             ):
                 active_request_ids_on_left = torch.nonzero(
-                    active_requests_requiring_new_block[
-                        :active_requests_requiring_new_block_count
-                    ]
+                    active_requests_requiring_new_block[:active_requests_requiring_new_block_count]
                     == 0,
                     as_tuple=True,
                 )[0]
@@ -2897,7 +2946,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Clone needed: next_tokens is a shared buffer that will be overwritten in
             # the next iteration; paused_tokens must persist independently.
             # In [active | paused] layout, paused tokens are at [active_count:total].
-            self.paused_tokens = next_tokens[active_request_count : self.total_request_count].clone()
+            self.paused_tokens = next_tokens[
+                active_request_count : self.total_request_count
+            ].clone()
             if new_speculative_tokens is not None:
                 # Clone needed: same reason as paused_tokens above.
                 self.paused_speculative_tokens = new_speculative_tokens[
