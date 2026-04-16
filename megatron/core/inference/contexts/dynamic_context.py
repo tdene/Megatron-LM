@@ -88,7 +88,6 @@ DEPRECATED_ARGS = [
     "cuda_graph_max_tokens",
     "cuda_graph_mixed_prefill_count",
     "metrics_writer",
-    "request_metadata_types",
     "persist_cuda_graphs",
     "offload_kv_cache",
 ]
@@ -511,12 +510,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
 
-        # Track request metadata.
-        request_metadata_types = inference_config.request_metadata_types
-        if request_metadata_types is None:
-            request_metadata_types = DynamicInferenceRequest.get_metadata_types()
-        self.request_metadata_types = request_metadata_types
-
         # Initialize context state.
         self.params_dtype = model_config.params_dtype
         self.max_sequence_length = inference_config.max_sequence_length
@@ -833,17 +826,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # Track request metadata.
+        # Track request metadata — all tensors live on GPU.
+        device = torch.cuda.current_device()
         self.request_metadata = {
-            label: torch.empty(
-                (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
-            )
-            for label, dtype, _ in self.request_metadata_types
+            "temperature": torch.empty((self.max_requests,), dtype=torch.float32, device=device),
+            "top_k": torch.empty((self.max_requests,), dtype=torch.int32, device=device),
+            "top_p": torch.empty((self.max_requests,), dtype=torch.float32, device=device),
+            "termination_id": torch.empty((self.max_requests,), dtype=torch.int64, device=device),
+            "return_log_probs": torch.empty((self.max_requests,), dtype=torch.bool, device=device),
+            "skip_prompt_log_probs": torch.empty((self.max_requests,), dtype=torch.bool, device=device),
+            "top_n_logprobs": torch.empty((self.max_requests,), dtype=torch.int32, device=device),
+        }
+        self.active_request_metadata = {
+            label: torch.empty_like(tensor) for label, tensor in self.request_metadata.items()
         }
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+            (self.max_tokens,), 0, dtype=torch.long, device=device
         )
         self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
         self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
@@ -853,17 +853,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_block = torch.empty_like(self.token_to_input_ids)
-
-        # Static tensor addresses of active slices to enable fast inference kernels.
-        self.active_request_metadata: Dict[str, Tensor] = {}
-        for label, _, on_gpu in self.request_metadata_types:
-            if on_gpu:
-                tensor = torch.empty_like(self.request_metadata[label])
-            else:
-                tensor = torch.empty_like(
-                    self.request_metadata[label], device="cpu", pin_memory=True
-                )
-            self.active_request_metadata[label] = tensor
 
         self.active_request_ids = torch.empty_like(self.request_ids, dtype=torch.int64)
         self.active_request_query_lengths = torch.empty_like(self.request_query_lengths)
@@ -1077,7 +1066,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_slice = slice(self.paused_request_count, self.paused_request_count + batch_size)
 
         # Request metadata all needs to be sliced.
-        for label, _, _ in self.request_metadata_types:
+        for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][padded_slice], non_blocking=True
             )
@@ -1127,27 +1116,23 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def pad_active_slices(self):
         """Pad the active slices of specific tensors."""
-        # Some tensors need to be padded at the token level.
-        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
+        n = self.total_request_count - self.paused_request_count
+        padded_n = self.padded_active_request_count
 
+        # Token-level padding.
+        padding_token_slice = slice(self.active_token_count, self.padded_active_token_count)
         self.token_to_block_idx[padding_token_slice] = self.kv_block_allocator.dummy_block_idx
         self.token_to_local_position_within_kv_block[padding_token_slice] = 0
         self.token_to_position_in_request[padding_token_slice] = 0
 
-        # Pad request-level sampling metadata for FlashInfer.  Padded slots
-        # must contain disabled-filter sentinels so the kernel doesn't trip on
-        # stale values.  The last-token gather also reads padded slots when
-        # materialize_only_last_token_logits is False; index 0 is always
-        # in-bounds for the logits buffer.
-        if self.config.sampling_backend == 'flashinfer':
-            n = self.total_request_count - self.paused_request_count
-            padded_n = self.padded_active_request_count
-            if padded_n > n:
-                self.active_request_metadata["temperature"][n:padded_n].fill_(1.0)
-                self.active_request_metadata["top_k"][n:padded_n].fill_(0)
-                self.active_request_metadata["top_p"][n:padded_n].fill_(0.0)
-                if not self.config.materialize_only_last_token_logits:
-                    self.active_request_last_token_idxs[n:padded_n].fill_(0)
+        # Request-level padding — fill padded slots with neutral sentinel values
+        # so CUDA-graphed kernels don't read stale data.
+        if padded_n > n:
+            self.active_request_metadata["temperature"][n:padded_n].fill_(1.0)
+            self.active_request_metadata["top_k"][n:padded_n].fill_(0)
+            self.active_request_metadata["top_p"][n:padded_n].fill_(0.0)
+            if not self.config.materialize_only_last_token_logits:
+                self.active_request_last_token_idxs[n:padded_n].fill_(0)
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1425,7 +1410,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_tokens_to_generate: List[int] = []
         request_ids: List[int] = []
         prompt_tokens: List[Tensor] = []
-        metadata_cols: List[List] = [[] for _ in self.request_metadata_types]
+        metadata_cols: Dict[str, List] = {label: [] for label in self.request_metadata}
 
         for req in requests:
             assert isinstance(
@@ -1446,8 +1431,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                     device=self.token_to_input_ids.device, dtype=self.token_to_input_ids.dtype
                 )
             )
-            for i, m in enumerate(req.tracked_metadata):
-                metadata_cols[i].append(m)
+            sp = req.sampling_params
+            if sp.termination_id is None:
+                sp.termination_id = -1
+            for label in self.request_metadata:
+                metadata_cols[label].append(getattr(sp, label))
 
         total_new_tokens = sum(lengths)
         if self.active_token_count + total_new_tokens > self.max_tokens:
@@ -1478,9 +1466,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
-            self.request_metadata[label][request_slice] = torch.tensor(
-                metadata_cols[i], dtype=dtype, device=torch.cuda.current_device()
+        for label, tensor in self.request_metadata.items():
+            tensor[request_slice] = torch.tensor(
+                metadata_cols[label], dtype=tensor.dtype, device=tensor.device
             )
 
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
@@ -2247,23 +2235,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.request_ids[current_id] = req.request_id
 
-        # Handle request metadata.
-        assert (
-            req.get_metadata_types(sampling_backend=self.config.sampling_backend)
-            == self.request_metadata_types
-        ), "Request added to context with invalid metadata types"
-        metadata = req.tracked_metadata
-        metadata_types = req.get_metadata_types(sampling_backend=self.config.sampling_backend)
-        for m, m_type in zip(metadata, metadata_types):
-            label, _, _ = m_type
-            if not isinstance(m, torch.Tensor):
-                m = torch.as_tensor(
-                    m,
-                    device=self.request_metadata[label].device,
-                    dtype=self.request_metadata[label].dtype,
-                )
-
-            self.request_metadata[label][current_id] = m
+        # Copy sampling params into metadata tensors.
+        sp = req.sampling_params
+        if sp.termination_id is None:
+            sp.termination_id = -1
+        for label, tensor in self.request_metadata.items():
+            value = getattr(sp, label)
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value, device=tensor.device, dtype=tensor.dtype)
+            tensor[current_id] = value
 
         # Handle length and block assignments.
         self.request_query_lengths[current_id] = effective_prefill_chunk_length

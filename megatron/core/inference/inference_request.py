@@ -6,7 +6,7 @@ import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from itertools import accumulate
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -451,56 +451,6 @@ class DynamicInferenceRequest(InferenceRequest):
         super()._post_deserialize(obj)
         self.events = [DynamicInferenceEvent.deserialize(e) for e in obj.get("events", [])]
 
-    @property
-    def tracked_metadata(self) -> List[Any]:
-        """Obtain an ordered list of all request metadata to be tracked by the context.
-
-        This consists of metadata that is used to inform text generation.
-        The values of such fields are tensorized and kept aligned with the current active batch.
-
-        Note that while the general request object is mutable, this metadata is
-        inherently assumed to remain immutable once the request becomes active.
-        """
-        sp = self.sampling_params
-        if sp.termination_id is None:
-            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-                warnings.warn(
-                    f"DynamicInferenceRequest {self.request_id} has no termination_id set "
-                    "in its sampling_params. Defaulting to -1."
-                )
-            sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
-
-    @staticmethod
-    def get_metadata_types(sampling_backend: str = 'torch') -> List[Tuple[str, torch.dtype, bool]]:
-        """Keeps track of all request metadata names, dtypes, and target device.
-
-        Args:
-            sampling_backend: Which sampling backend is in use.
-                FlashInfer needs sampling parameters directly on GPU.
-
-        Returns:
-            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
-                name (str) - The name of the metadata field.
-                dtype (torch.dtype) - The datatype of the metadata.
-                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
-        """
-        types = [
-            ("temperature", torch.float32, False),
-            ("top_k", torch.int32, False),
-            ("top_p", torch.float32, False),
-            ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),
-            ("skip_prompt_log_probs", torch.bool, False),
-            ("top_n_logprobs", torch.int32, False),
-        ]
-        if sampling_backend == 'flashinfer':
-            gpu_fields = {"temperature", "top_k", "top_p"}
-            types = [
-                (label, dtype, True if label in gpu_fields else on_gpu)
-                for label, dtype, on_gpu in types
-            ]
-        return types
 
     def add_event(
         self, type: DynamicInferenceEventType, payload: Optional[Any] = None

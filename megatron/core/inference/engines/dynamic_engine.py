@@ -388,20 +388,9 @@ class DynamicInferenceEngine(AbstractEngine):
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Capture all relevant graphs in the pipeline.
-            # Note that some steps of the pipeline may capture multiple different variant graphs.
-            for setup_variant in controller.graph_capture_variants():
-                setup_variant(context)
-                controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-                # Launch bookkeeping on a side stream so it overlaps with forward.
-                with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
-                    controller._dynamic_step_sample_bookkeeping()
-                    controller._pre_forward_bookkeeping_event.record()
-
-                controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                controller._pre_forward_bookkeeping_event.synchronize()
-                controller._dynamic_step_sample_logits()
+            controller._sampling.pre_forward_bookkeeping(context)
+            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            controller._dynamic_step_sample_logits()
 
             context.reset()
 
