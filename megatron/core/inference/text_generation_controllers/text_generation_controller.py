@@ -24,12 +24,17 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import (
+    CUDAGraphCache,
+    get_attention_mask,
+    set_decode_expert_padding,
+)
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -165,6 +170,8 @@ class TextGenerationController:
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
             self._torch_sampling_buckets: List[Tuple] = []
+
+        self._init_attn_graphs = CUDAGraphCache()
 
         self._init_mtp_sampling_tensor()
 
@@ -587,10 +594,20 @@ class TextGenerationController:
         model_config = get_model_config(unwrapped_model)
 
         # Initialize attention state.
-        context.initialize_attention_state(
+        if context.prepare_attn_init(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
-        )
+        ):
+            pbd = context.padded_batch_dimensions
+            for _ in self._init_attn_graphs(
+                pbd.decode_req_count,
+                pbd.prefill_req_count,
+                pbd.token_count,
+                eager=not context.using_cuda_graph_this_step(),
+                pool=CudaGraphManager.global_mempool,
+            ):
+                context.run_attn_init_graph_body()
+            context.finalize_attn_init()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
