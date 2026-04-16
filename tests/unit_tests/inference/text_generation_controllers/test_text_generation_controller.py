@@ -1172,46 +1172,33 @@ class TestTextGenerationController:
         """Test consecutive token acceptance logic for speculative decoding."""
         self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
 
-        # Enable speculative decoding
-        self.text_generation_controller.num_speculative_tokens = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.total_request_count = 2
-        ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor = torch.tensor(
-            [0, 0], device='cuda'
-        )  # Decode requests
-        ctx.request_query_lengths = torch.tensor(
-            [3, 3], dtype=torch.int32, device='cuda'
-        )  # 1 sampled + 2 spec
 
-        # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensor()
 
-        # Mock inputs: [Req 1 sampled, Req 1 spec1, Req 1 spec2, Req 2 sampled, Req 2 spec1, Req 2 spec2]
-        # Target tokens (what the model was fed): [T0, T1, T2, T3, T4, T5]
+        # Add 2 decode requests with greedy sampling (top_k=1) via the public API.
+        # Each decode request has (num_speculative_tokens + 1) query tokens.
+        device = torch.cuda.current_device()
+        decode_tokens = torch.zeros(3, dtype=torch.long, device=device)
+        sp = SamplingParams(top_k=1, num_tokens_to_generate=1, termination_id=-1)
+        requests = [
+            DynamicInferenceRequest(request_id=i, prompt_tokens=decode_tokens, sampling_params=sp)
+            for i in range(2)
+        ]
+        ctx.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        ctx.build_active_slices(2)
+        self.text_generation_controller._sampling.pre_forward_bookkeeping(ctx)
+
+        # Inputs: [Req1 base, Req1 spec1, Req1 spec2, Req2 base, Req2 spec1, Req2 spec2]
         input_ids = torch.tensor([[10, 11, 12, 20, 21, 22]], device='cuda')
 
-        # We need the sampling function to return a 1D tensor for base logits,
-        # and a 1D tensor for the flattened MTP logits.
-        def mock_sampling_func(logits, *args, **kwargs):
-            if logits.shape[0] == 6:
-                # Base logits -> return 1D tensor of shape [6]
-                # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects T3. -> Accepts 2 spec tokens.
-                # Req 2: Predicts [99, 22, 23]. Fails at first spec token (99 != 21). -> Accepts 0 spec tokens.
-                return torch.tensor([11, 12, 99, 99, 22, 23], dtype=torch.long, device='cuda')
-            else:
-                # MTP logits -> return 1D tensor of shape [12]
-                # The verification logic only uses base tokens, so we can return zeros here.
-                return torch.zeros((12,), dtype=torch.long, device='cuda')
-
-        # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
-            side_effect=mock_sampling_func
-        )
-
-        # Mock logits matching input shape
-        logits = torch.randn(1, 6, self.vocab_size, device='cuda')
+        # Craft logits so greedy (argmax) sampling produces the desired tokens:
+        # Req 1: Predicts [11, 12, 99]. Matches T1, T2. Rejects at spec2. -> Accepts 2.
+        # Req 2: Predicts [99, 22, 23]. Fails at spec1 (99 != 21). -> Accepts 0.
+        desired_tokens = [11, 12, 99, 99, 22, 23]
+        logits = torch.zeros(1, 6, self.vocab_size, device='cuda')
+        for i, t in enumerate(desired_tokens):
+            logits[0, i, t] = 100.0
         self.text_generation_controller._all_logits_cuda = logits
 
         self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
@@ -1222,9 +1209,7 @@ class TestTextGenerationController:
 
         # Verify accepted tokens tensor
         accepted_tokens = self.text_generation_controller._accepted_tokens_per_request[:2]
-        # Req 1 accepted 2 tokens: 11, 12
         assert torch.equal(accepted_tokens[0], torch.tensor([11, 12], device='cuda'))
-        # Req 2 accepted 0 tokens, should remain -1
         assert torch.equal(accepted_tokens[1], torch.tensor([-1, -1], device='cuda'))
 
     @pytest.mark.internal
@@ -1238,7 +1223,6 @@ class TestTextGenerationController:
             block_size_tokens=4,
             max_requests=16,
         )
-        self.text_generation_controller.num_speculative_tokens = 3
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
@@ -1311,30 +1295,26 @@ class TestTextGenerationController:
             torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=2
         )
 
-        # Enable speculative decoding
-        self.text_generation_controller.num_speculative_tokens = num_spec
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.total_request_count = 2
-        ctx.paused_request_count = 0
-        ctx.request_in_prefill_status_tensor = torch.tensor(
-            [0, 0], device='cuda'
-        )  # Decode requests
-        # query lengths for decode with spec tokens is (1 + num_spec) = 4
-        ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
+        self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Add 2 decode requests with multinomial sampling (top_p=0.9) via the public API.
+        device = torch.cuda.current_device()
+        decode_tokens = torch.zeros(num_spec + 1, dtype=torch.long, device=device)
+        sp = SamplingParams(top_p=0.9, num_tokens_to_generate=1, termination_id=-1)
+        requests = [
+            DynamicInferenceRequest(request_id=i, prompt_tokens=decode_tokens, sampling_params=sp)
+            for i in range(2)
+        ]
+        ctx.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        ctx.build_active_slices(2)
+        self.text_generation_controller._sampling.pre_forward_bookkeeping(ctx)
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
 
-        # Create random logits
         # Base logits shape: [1, 8, vocab_size]
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
-
-        # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
-
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
@@ -1452,23 +1432,35 @@ class TestTextGenerationController:
     def test_speculative_mtp_position_ids_with_prefill(self):
         """Test that _compute_serial_mtp_and_sample uses the correct position IDs
         for a mixed batch of prefill and decode requests."""
-        self.setup_model(torch.float32, static=False, num_speculative_tokens=2, max_requests=2)
+        self.setup_model(
+            torch.float32, static=False, num_speculative_tokens=2, max_requests=2, mtp_num_layers=2
+        )
 
-        self.text_generation_controller.num_speculative_tokens = 2
-        self.text_generation_controller.num_mtp_heads = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
-        ctx.total_request_count = 2
-        ctx.paused_request_count = 0
-
-        # Req 0: Decode, Req 1: Prefill
-        ctx.request_in_prefill_status_tensor = torch.tensor([0, 1], device='cuda')
-
-        # Req 0 has 10 previous tokens, just processed 3 (1 base + 2 spec)
-        # Req 1 has 0 previous tokens, just processed 15 (prefill)
-        ctx.request_kv_length_offsets[:2] = torch.tensor([10, 0], dtype=torch.int32, device='cuda')
-        ctx.request_query_lengths[:2] = torch.tensor([3, 15], dtype=torch.int32, device='cuda')
 
         self.text_generation_controller._init_mtp_sampling_tensor()
+
+        # Req 0: Decode (3 query tokens = 1 base + 2 spec)
+        # Req 1: Prefill (15 query tokens)
+        device = torch.cuda.current_device()
+        sp = SamplingParams(top_k=1, num_tokens_to_generate=1, termination_id=-1)
+        decode_req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.zeros(3, dtype=torch.long, device=device),
+            sampling_params=sp,
+        )
+        prefill_req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.zeros(15, dtype=torch.long, device=device),
+            sampling_params=sp,
+        )
+        ctx.add_dummy_requests_parallel([decode_req], count_as_prefill=False)
+        # Req 0 has 10 previous KV tokens — the public API defaults to 0, so override.
+        ctx.request_kv_length_offsets[0] = 10
+        ctx.add_dummy_requests_parallel([prefill_req], count_as_prefill=True)
+        ctx.build_active_slices(2)
+        self.text_generation_controller._sampling.pre_forward_bookkeeping(ctx)
+
         # Mock base token sampling (the first tokens fed into MTP)
         self.text_generation_controller._sampled_tokens_cuda[:2] = torch.tensor(
             [100, 200], device='cuda'
@@ -1490,13 +1482,6 @@ class TestTextGenerationController:
         unwrapped_model.compute_mtp_single_step = mock.MagicMock(
             side_effect=mock_compute_mtp_single_step
         )
-
-        # Set up real sampling: populate metadata with default params and run
-        # bookkeeping so _sample_logits uses the real torch sampling path.
-        ctx.active_request_metadata["temperature"][:2].fill_(1.0)
-        ctx.active_request_metadata["top_k"][:2].fill_(1)
-        ctx.active_request_metadata["top_p"][:2].fill_(0.0)
-        self.text_generation_controller._sampling.pre_forward_bookkeeping(ctx)
 
         self.text_generation_controller._compute_serial_mtp_and_sample()
 

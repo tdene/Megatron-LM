@@ -128,8 +128,9 @@ class TextGenerationController:
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
+        num_spec = context.num_speculative_tokens if context.num_speculative_tokens else 0
         if context.config.materialize_only_last_token_logits:
-            max_logits = max_requests
+            max_logits = max_requests * (num_spec + 1)
         else:
             max_logits = context.max_tokens
 
@@ -646,11 +647,17 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        logits_seq_len = (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
+
+        if context.config.materialize_only_last_token_logits:
+            if self.num_speculative_tokens > 0:
+                logits_seq_len = (
+                    context.num_decode_requests * (self.num_speculative_tokens + 1)
+                    + context.num_prefill_requests
+                )
+            else:
+                logits_seq_len = active_request_count
+        else:
+            logits_seq_len = context.padded_active_token_count
 
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
@@ -658,28 +665,12 @@ class TextGenerationController:
             )
             # logits shape: [1, seq_len, vocab_size]
 
-        assert logits_seq_len == (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else input_ids.shape[1]
-        )
-
         # Note: When speculative decoding is active (num_speculative_tokens > 0),
         # the model skips MTP computation during the forward pass. MTP logits
         # will be computed serially after verification to ensure they are
         # conditioned on verified tokens only.
 
         if self.model_is_pipeline_parallel:
-            if context.config.materialize_only_last_token_logits:
-                if self.num_speculative_tokens > 0:
-                    logits_seq_len = (
-                        context.num_decode_requests * (self.num_speculative_tokens + 1)
-                        + context.num_prefill_requests
-                    )
-                else:
-                    logits_seq_len = active_request_count
-            else:
-                logits_seq_len = input_ids.shape[1]
             logits_shape = [1, logits_seq_len, self.vocab_size]
 
             if is_pipeline_last_stage(self.pp_group):
