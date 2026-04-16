@@ -1887,17 +1887,42 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
 
         # Handle phantom tokens and requests added for Mamba + MoE.
+        # In the [active | paused] layout, phantoms must sit contiguously
+        # with active requests so MHA sees them as real (i.e. within the
+        # range masked by `_real_request_count_gpu`). We write phantoms at
+        # [active_count, active_count + phantom_count), which may overlap
+        # the start of the paused region; we save and restore that paused
+        # data in `finalize_attn_init`. Mamba ignores phantoms via its own
+        # pre-phantom `_real_prefill_count_gpu` / `_real_decode_count_gpu`.
         mamba_dimensions = attn_dimensions
         phantom_count = self.padded_batch_dimensions.req_count - attn_dimensions.req_count
         phantom_tokens = self.padded_batch_dimensions.token_count - attn_dimensions.token_count
+        self._phantom_saved_query_lengths = None
+        self._phantom_saved_kv_length_offsets = None
+        self._phantom_saved_to_kv_block_ids = None
         if phantom_count > 0 and phantom_tokens > 0:
             per_phantom = phantom_tokens // phantom_count
             rem_phantom = phantom_tokens % phantom_count
-            end = self.total_request_count
-            phantom_slice = slice(end, end + phantom_count)
+            phantom_start = active_request_count
+            phantom_end = phantom_start + phantom_count
+            phantom_slice = slice(phantom_start, phantom_end)
+
+            # Save any paused-request data that will be overwritten so we can
+            # restore it in `finalize_attn_init`.
+            overlap = min(phantom_count, self.paused_request_count)
+            if overlap > 0:
+                save_slice = slice(phantom_start, phantom_start + overlap)
+                self._phantom_saved_query_lengths = self.request_query_lengths[save_slice].clone()
+                self._phantom_saved_kv_length_offsets = self.request_kv_length_offsets[
+                    save_slice
+                ].clone()
+                self._phantom_saved_to_kv_block_ids = self.request_to_kv_block_ids[
+                    save_slice
+                ].clone()
+
             self.request_query_lengths[phantom_slice] = per_phantom
             if rem_phantom > 0:
-                self.request_query_lengths[end : end + rem_phantom] += 1
+                self.request_query_lengths[phantom_start : phantom_start + rem_phantom] += 1
             self.request_kv_length_offsets[phantom_slice] = 0
             self.request_to_kv_block_ids[phantom_slice] = (
                 self.kv_block_allocator.dummy_block_idx
@@ -1915,7 +1940,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
         # Write GPU scalars before the body so a captured body reads updated values on replay.
-        self._real_request_count_gpu.fill_(active_request_count)
+        # `_real_request_count_gpu` includes phantoms so MHA's mask lets phantom query
+        # lengths contribute to cu_query_seq_lengths up to padded_active_token_count.
+        # `_real_token_count_gpu` stays pre-phantom so phantom tokens are still padded with
+        # dummy block indices at the token level (safe "null" attention via dummy blocks).
+        # `_real_decode_count_gpu` / `_real_prefill_count_gpu` stay pre-phantom so Mamba
+        # does not process phantom requests (they have no Mamba state slot).
+        self._real_request_count_gpu.fill_(active_request_count + phantom_count)
         self._real_token_count_gpu.fill_(self.active_token_count)
         self._real_decode_count_gpu.fill_(batch_dimensions.decode_req_count)
         self._real_prefill_count_gpu.fill_(batch_dimensions.prefill_req_count)
@@ -1928,13 +1959,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         CPU-only bookkeeping that must happen after the graphable body,
         plus resolving deferred GPU / CPU syncs that were staged during the graphable body.
         """
-        # Clean up phantom data from request-level buffers now that the metadata is built.
+        # Undo the phantom writes in the request-level buffers. The phantom data
+        # was placed at [active_count, active_count + phantom_count), which may
+        # overlap the start of the paused region; restore any overlapping paused
+        # data we saved in `prepare_attn_init`, then clear the remainder.
         if self._phantom_count > 0 and self._phantom_tokens > 0:
-            end = self.total_request_count
-            phantom_slice = slice(end, end + self._phantom_count)
-            self.request_to_kv_block_ids[phantom_slice] = -1
-            self.request_query_lengths[phantom_slice] = 0
-            self.request_kv_length_offsets[phantom_slice] = 0
+            active_request_count = self.total_request_count - self.paused_request_count
+            phantom_start = active_request_count
+            phantom_end = phantom_start + self._phantom_count
+
+            overlap = min(self._phantom_count, self.paused_request_count)
+            if overlap > 0:
+                restore_slice = slice(phantom_start, phantom_start + overlap)
+                self.request_query_lengths[restore_slice] = self._phantom_saved_query_lengths
+                self.request_kv_length_offsets[restore_slice] = (
+                    self._phantom_saved_kv_length_offsets
+                )
+                self.request_to_kv_block_ids[restore_slice] = self._phantom_saved_to_kv_block_ids
+
+            if phantom_end > phantom_start + overlap:
+                clear_slice = slice(phantom_start + overlap, phantom_end)
+                self.request_query_lengths[clear_slice] = 0
+                self.request_kv_length_offsets[clear_slice] = 0
+                self.request_to_kv_block_ids[clear_slice] = -1
+
+            self._phantom_saved_query_lengths = None
+            self._phantom_saved_kv_length_offsets = None
+            self._phantom_saved_to_kv_block_ids = None
 
         if self.moe_enable_routing_replay:
             if self.using_cuda_graph_this_step():
