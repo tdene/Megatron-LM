@@ -53,6 +53,16 @@ class Sampling(ABC):
         """
         ...
 
+    def warmup_graphs(self, context, logits, output, **kwargs) -> None:
+        """Pre-capture CUDA graphs for all known batch dimensions.
+
+        The default implementation is a no-op.  Subclasses that support CUDA
+        graph capture (e.g. :class:`FlashInferSampling`) override this to
+        iterate over ``context.cuda_graph_batch_dimensions_list`` and record
+        each graph variant up-front, rather than relying on lazy capture at
+        the first inference step.
+        """
+
     # ------------------------------------------------------------------
     # Speculative decoding
     # ------------------------------------------------------------------

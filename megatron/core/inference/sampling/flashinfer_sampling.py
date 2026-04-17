@@ -161,19 +161,103 @@ class FlashInferSampling(Sampling):
             kernel()
 
     # ------------------------------------------------------------------
-    # CUDA graph cache
+    # CUDA graph warmup & cache
     # ------------------------------------------------------------------
 
-    def _run_in_graph(self, key: tuple, fn) -> None:
-        if key in self._graphs:
-            self._graphs[key].replay()
+    def warmup_graphs(
+        self,
+        context,
+        logits: Tensor,
+        output: Tensor,
+        *,
+        gather_indices: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        num_speculative_tokens: int = 0,
+        sampled_tokens: Optional[Tensor] = None,
+        last_accepted_indices: Optional[Tensor] = None,
+        accepted_tokens: Optional[Tensor] = None,
+        accepted_counts: Optional[Tensor] = None,
+    ) -> None:
+        """Pre-capture CUDA graphs for all known batch dimensions.
+
+        Must be called during initialization with the persistent tensor
+        buffers that will be reused at inference time.  After this method
+        returns, every ``sample()`` / ``sample_and_verify()`` call with
+        ``use_graph=True`` will replay a pre-captured graph.
+        """
+        if not self._enable_cuda_graph:
             return
 
-        # Warmup run.
-        fn()
+        md = context.active_request_metadata
+        max_n = max(bd.req_count for bd in context.cuda_graph_batch_dimensions_list)
 
-        # Capture run.
+        # Fill metadata with safe dummy values for capture.
+        md["temperature"][:max_n].fill_(1.0)
+        md["top_k"][:max_n].fill_(0)
+        md["top_p"][:max_n].fill_(0.0)
+
+        if gather_indices is not None:
+            gather_indices[:max_n].copy_(
+                torch.arange(max_n, device=gather_indices.device)
+            )
+
+        seen_sample_keys: set[int] = set()
+        seen_verify_keys: set[tuple[int, int]] = set()
+
+        for batch_dim in context.cuda_graph_batch_dimensions_list:
+            padded_n = batch_dim.req_count
+
+            # -- sample graph --
+            if padded_n not in seen_sample_keys:
+                seen_sample_keys.add(padded_n)
+
+                def _sample_kernel(_n=padded_n):
+                    self._sample_impl(
+                        logits, _n, output, context, gather_indices=gather_indices,
+                    )
+
+                self._capture_graph(("sample", padded_n), _sample_kernel)
+
+            # -- verify graph (speculative decoding) --
+            if num_speculative_tokens > 0 and input_ids is not None:
+                nd = batch_dim.decode_req_count
+                np_ = batch_dim.prefill_req_count
+                if (nd, np_) not in seen_verify_keys:
+                    seen_verify_keys.add((nd, np_))
+
+                    ql = context.active_request_query_lengths
+                    ql[:nd].fill_(num_speculative_tokens + 1)
+                    ql[nd : nd + np_].fill_(1)
+
+                    def _verify_kernel(_nd=nd, _np=np_):
+                        self._sample_and_verify_core(
+                            self._sample_impl,
+                            logits,
+                            input_ids,
+                            num_speculative_tokens,
+                            _nd,
+                            _np,
+                            context,
+                            sampled_tokens=sampled_tokens,
+                            last_accepted_indices=last_accepted_indices,
+                            accepted_tokens=accepted_tokens,
+                            accepted_counts=accepted_counts,
+                        )
+
+                    self._capture_graph(("verify", nd, np_), _verify_kernel)
+
+    def _capture_graph(self, key: tuple, fn) -> None:
+        """Run one warmup iteration of *fn*, then capture it as a CUDA graph."""
+        fn()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=CudaGraphManager.global_mempool):
             fn()
         self._graphs[key] = g
+
+    def _run_in_graph(self, key: tuple, fn) -> None:
+        """Replay a previously captured graph, falling back to capture on miss."""
+        if key in self._graphs:
+            self._graphs[key].replay()
+            return
+
+        self._capture_graph(key, fn)

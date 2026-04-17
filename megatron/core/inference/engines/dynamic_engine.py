@@ -367,6 +367,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         model_config = controller.inference_wrapped_model.model.config
 
+        # Pre-capture sampling CUDA graphs for all batch dimensions before
+        # the per-dimension forward-pass warmup loop.
+        controller.warmup_sampling_cuda_graphs()
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))

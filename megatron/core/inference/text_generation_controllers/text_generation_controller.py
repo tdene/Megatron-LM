@@ -194,6 +194,37 @@ class TextGenerationController:
                 max_requests, dtype=torch.long, device=device
             )
 
+    def warmup_sampling_cuda_graphs(self) -> None:
+        """Pre-capture CUDA graphs for the sampling backend."""
+        context = self.inference_wrapped_model.inference_context
+        if self._all_logits_cuda is None:
+            return
+
+        gather_indices = (
+            None
+            if context.config.materialize_only_last_token_logits
+            else context.active_request_last_token_idxs
+        )
+
+        kwargs: dict = {}
+        if self.num_speculative_tokens and self.num_speculative_tokens > 0:
+            kwargs.update(
+                input_ids=context.token_to_input_ids.unsqueeze(0),
+                num_speculative_tokens=self.num_speculative_tokens,
+                sampled_tokens=self._sampled_tokens_cuda,
+                last_accepted_indices=self._last_accepted_seq_indices,
+                accepted_tokens=self._accepted_tokens_per_request,
+                accepted_counts=self._accepted_token_counts_per_request,
+            )
+
+        self._sampling.warmup_graphs(
+            context,
+            self._all_logits_cuda.squeeze(0),
+            self._sampled_tokens_cuda,
+            gather_indices=gather_indices,
+            **kwargs,
+        )
+
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
         """Utility to tokenize the input prompts.
