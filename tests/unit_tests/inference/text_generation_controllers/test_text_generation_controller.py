@@ -350,19 +350,10 @@ class TestTextGenerationController:
         else:
             controller._all_logits_cuda = logits
 
-        expected_any_filtered = sampling_profile == "mixed"
-
         # Two passes so graph mode exercises both capture and replay. Eager mode
         # runs twice harmlessly.
         for _ in range(2):
             controller._dynamic_step_sample_bookkeeping()
-            if backend == "flashinfer":
-                controller._pre_forward_bookkeeping_event.synchronize()
-                actual_any_filtered = bool(controller._sampling._fi_any_filtered_pinned.item())
-                assert actual_any_filtered == expected_any_filtered, (
-                    f"any-filtered flag: expected {expected_any_filtered}, "
-                    f"got {actual_any_filtered}"
-                )
             controller._dynamic_step_sample_logits()
             sampled = controller._sampled_tokens_cuda[:batch_size]
 
@@ -403,13 +394,12 @@ class TestTextGenerationController:
 
         if use_cuda_graph:
             # After two passes exactly one graph should be captured for this
-            # (padded_n, filtered) pair; the second pass hits the cache.
+            # padded_n; the second pass hits the cache.
             cache = controller._sampling._sampling_cuda_graphs
-            expected_key = (padded_n, expected_any_filtered)
             assert (
                 len(cache) == 1
             ), f"Expected exactly one captured sampling graph, got {len(cache)}"
-            assert expected_key in cache, f"Expected key {expected_key} not found in graph cache"
+            assert padded_n in cache, f"Expected key {padded_n} not found in graph cache"
 
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     def test_add_request_metadata_compatibility(self, backend: str):

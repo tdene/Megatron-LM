@@ -993,16 +993,14 @@ class TextGenerationController:
             num_decode_request = context.padded_batch_dimensions.decode_req_count
             num_prefill_request = context.padded_batch_dimensions.prefill_req_count
             active_request_count = num_decode_request + num_prefill_request
-            filtered = bool(self._fi_any_filtered_pinned.item())
         else:
             num_decode_request = context.num_decode_requests
             num_prefill_request = context.num_prefill_requests
             active_request_count = active_request_count
-            filtered = None
 
         pool = CudaGraphManager.global_mempool if use_graph else None
         for _ in self._verification_cuda_graphs(
-            num_decode_request, num_prefill_request, filtered, pool=pool, eager=not use_graph
+            num_decode_request, num_prefill_request, pool=pool, eager=not use_graph
         ):
             logits = self._all_logits_cuda
             device = logits.device
@@ -1487,27 +1485,13 @@ class TextGenerationController:
         """Yield context-setup callables for each graph-capture variant.
 
         During CUDA-graph warmup the engine runs the full step pipeline once per yielded callable.
-        Each callable exercises a distinct kernel path (e.g. filtered vs. unfiltered sampling).
+        Each callable exercises a distinct kernel path.
         """
         if not self._enable_cuda_graph:
             yield lambda context: None
             return
 
-        if self._sampling_backend == "flashinfer":
-            # FlashInfer sampling has two kernel variants (plain and top-k/top-p filtered).
-            # Capture both by driving the flag through metadata values.
-            for filtered in (False, True):
-
-                def _setup(ctx, _filtered=filtered):
-                    n = ctx.padded_active_request_count
-                    md = ctx.active_request_metadata
-                    md["temperature"][:n].fill_(1.0)
-                    md["top_p"][:n].fill_(0.0)
-                    md["top_k"][:n].fill_(1 if _filtered else 0)
-
-                yield _setup
-        else:
-            yield lambda context: None
+        yield lambda context: None
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
