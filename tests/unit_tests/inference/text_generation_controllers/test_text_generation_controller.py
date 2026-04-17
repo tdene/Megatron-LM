@@ -358,7 +358,7 @@ class TestTextGenerationController:
             controller._dynamic_step_sample_bookkeeping()
             if backend == "flashinfer":
                 controller._pre_forward_bookkeeping_event.synchronize()
-                actual_any_filtered = bool(controller._fi_any_filtered_pinned.item())
+                actual_any_filtered = bool(controller._sampling._fi_any_filtered_pinned.item())
                 assert actual_any_filtered == expected_any_filtered, (
                     f"any-filtered flag: expected {expected_any_filtered}, "
                     f"got {actual_any_filtered}"
@@ -404,7 +404,7 @@ class TestTextGenerationController:
         if use_cuda_graph:
             # After two passes exactly one graph should be captured for this
             # (padded_n, filtered) pair; the second pass hits the cache.
-            cache = controller._sampling_cuda_graphs
+            cache = controller._sampling._sampling_cuda_graphs
             expected_key = (padded_n, expected_any_filtered)
             assert (
                 len(cache) == 1
@@ -1209,8 +1209,8 @@ class TestTextGenerationController:
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1334,11 +1334,10 @@ class TestTextGenerationController:
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+        # Bucket format: (indices, temp, top_k, top_p)
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 0, 0.9)]
 
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+        # We want _sampling_func to run natively to prove it doesn't crash.
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
@@ -1573,7 +1572,7 @@ class TestTextGenerationController:
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
