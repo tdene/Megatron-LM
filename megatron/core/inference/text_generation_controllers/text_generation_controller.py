@@ -981,59 +981,35 @@ class TextGenerationController:
     def _dynamic_step_sample_logits_and_verify_tokens(self, input_ids: Tensor):
         """Sample and verify speculative tokens."""
         context = self.inference_wrapped_model.inference_context
-        active_request_count = context.total_request_count - context.paused_request_count
 
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
             and context.using_cuda_graph_this_step()
         )
-
         if use_graph:
-            num_decode_request = context.padded_batch_dimensions.decode_req_count
-            num_prefill_request = context.padded_batch_dimensions.prefill_req_count
-            active_request_count = num_decode_request + num_prefill_request
+            num_decode = context.padded_batch_dimensions.decode_req_count
+            num_prefill = context.padded_batch_dimensions.prefill_req_count
         else:
-            num_decode_request = context.num_decode_requests
-            num_prefill_request = context.num_prefill_requests
-            active_request_count = active_request_count
+            num_decode = context.num_decode_requests
+            num_prefill = context.num_prefill_requests
 
         pool = CudaGraphManager.global_mempool if use_graph else None
         for _ in self._verification_cuda_graphs(
-            num_decode_request, num_prefill_request, pool=pool, eager=not use_graph
+            num_decode, num_prefill, pool=pool, eager=not use_graph
         ):
-            logits = self._all_logits_cuda
-            device = logits.device
-
-            decode_token_count = num_decode_request * (self.num_speculative_tokens + 1)
-            decode_indices = torch.arange(decode_token_count, device=device)
-            query_lengths = context.active_request_query_lengths[:active_request_count]
-            cumsum = torch.cumsum(query_lengths, dim=0)
-            prefill_last_indices = cumsum[num_decode_request:] - 1
-            required_logit_indices = torch.cat([decode_indices, prefill_last_indices])
-
-            if context.config.materialize_only_last_token_logits:
-                required_logits = logits.squeeze(0)
-            else:
-                required_logits = logits.squeeze(0)[required_logit_indices, :]
-
-            output_tokens = self._sample_speculative_logits(
-                required_logits, num_decode_request, num_prefill_request
+            self._sampling.sample_and_verify(
+                self._all_logits_cuda,
+                input_ids,
+                self.num_speculative_tokens,
+                num_decode,
+                num_prefill,
+                context,
+                sampled_tokens=self._sampled_tokens_cuda,
+                last_accepted_indices=self._last_accepted_seq_indices,
+                accepted_tokens=self._accepted_tokens_per_request,
+                accepted_counts=self._accepted_token_counts_per_request,
             )
-
-            input_tokens_required = input_ids[0, required_logit_indices]
-            last_one_indices = self._verify_speculative_tokens(
-                output_tokens,
-                input_tokens_required,
-                num_decode_request,
-                num_prefill_request,
-                active_request_count,
-            )
-
-            self._sampled_tokens_cuda[:active_request_count] = output_tokens[last_one_indices]
-            self._last_accepted_seq_indices[:active_request_count] = required_logit_indices[
-                last_one_indices
-            ]
 
     def _sample_logits(
         self,

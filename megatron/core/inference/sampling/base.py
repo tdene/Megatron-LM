@@ -148,3 +148,55 @@ class Sampling(ABC):
         accepted_counts_buffer.copy_((accepted_tokens_buffer != -1).sum(dim=1))
 
         return last_one_indices
+
+    def sample_and_verify(
+        self,
+        logits: Tensor,
+        input_ids: Tensor,
+        num_speculative_tokens: int,
+        num_decode: int,
+        num_prefill: int,
+        context,
+        *,
+        sampled_tokens: Tensor,
+        last_accepted_indices: Tensor,
+        accepted_tokens: Tensor,
+        accepted_counts: Tensor,
+    ) -> None:
+        """Sample from speculative logits, verify, and store results.
+
+        Subclasses may override to wrap in CUDA graphs.
+        """
+        active_request_count = num_decode + num_prefill
+        device = logits.device
+
+        decode_token_count = num_decode * (num_speculative_tokens + 1)
+        decode_indices = torch.arange(decode_token_count, device=device)
+        query_lengths = context.active_request_query_lengths[:active_request_count]
+        cumsum = torch.cumsum(query_lengths, dim=0)
+        prefill_last_indices = cumsum[num_decode:] - 1
+        required_logit_indices = torch.cat([decode_indices, prefill_last_indices])
+
+        if context.config.materialize_only_last_token_logits:
+            required_logits = logits.squeeze(0)
+        else:
+            required_logits = logits.squeeze(0)[required_logit_indices, :]
+
+        output_tokens = self.sample_speculative(
+            required_logits, num_decode, num_prefill, num_speculative_tokens, context
+        )
+
+        input_tokens_required = input_ids[0, required_logit_indices]
+        last_one_indices = self.verify_speculative_tokens(
+            output_tokens,
+            input_tokens_required,
+            num_decode,
+            num_prefill,
+            active_request_count,
+            num_speculative_tokens,
+            accepted_tokens,
+            accepted_counts,
+        )
+
+        sampled_tokens[:active_request_count] = output_tokens[last_one_indices]
+        last_accepted_indices[:active_request_count] = required_logit_indices[last_one_indices]
