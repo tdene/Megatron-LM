@@ -619,7 +619,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When offloading optimizer during RL, allocate fp32 master weights inside a TMS region
         # to keep these tensors out of the CUDA-graph memory pool.
         tms_ctx = (
-            torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+            torch_memory_saver.region(  # pylint: disable=possibly-used-before-assignment
+                tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True
+            )
             if config.rl_offload_optimizer_during_inference
             else nullcontext()
         )

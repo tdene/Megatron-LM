@@ -390,7 +390,9 @@ class MegatronOptimizer(ABC):
             if self.config.rl_offload_optimizer_during_inference:
                 # Pause the TMS region: frees physical pages for all TMS-managed tensors
                 # (fp32 master weights and Adam state) while preserving virtual addresses.
-                torch_memory_saver.pause(_OPTIMIZER_TMS_TAG)
+                torch_memory_saver.pause(  # pylint: disable=possibly-used-before-assignment
+                    _OPTIMIZER_TMS_TAG
+                )
 
                 # View tensors (shard_fp32) are not in TMS; fall back to .cpu().
                 for param_group in self.optimizer.param_groups:
