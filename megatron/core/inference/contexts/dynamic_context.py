@@ -2769,12 +2769,21 @@ class DynamicInferenceContext(BaseInferenceContext):
                     active_request_count + self.paused_request_count,
                     device=self.request_ids.device,
                 )
+                # Note: src and dst may overlap when paused_count > finished_count
+                # (dst starts before src ends). This is safe because PyTorch fancy
+                # indexing fully materialises the RHS before writing to the LHS.
                 self._move_book_keeping_tensors(
                     src_idxs=paused_src,
                     dst_idxs=paused_dst,
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
+                # Clear stale request IDs left behind so that
+                # get_index_of_chunked_prefill_request(safe=False) cannot match them.
+                stale_start = active_request_count + self.paused_request_count
+                stale_end = old_active_count + self.paused_request_count
+                if stale_start < stale_end:
+                    self.request_ids[stale_start:stale_end] = -1
 
         # 5. Identify requests that require a new block and pause them.
         #       a) Partition active region: staying-active on the left, pausing on the right
@@ -2881,27 +2890,41 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) != -1:
             if chunked_prefill_request_idx < self.total_request_count:
                 # Chunked prefill request was active this step.
-                # Copy it to the hidden slot (just past total), then compact
-                # the gap by shifting all subsequent requests left by 1.
+                # Save it to the hidden slot (just past total), fill the gap
+                # in the active region, and shift the paused region left by 1.
                 device = self.request_ids.device
                 hidden_idx = torch.tensor([self.total_request_count], device=device)
                 chunked_idx = torch.tensor([chunked_prefill_request_idx], device=device)
+
+                # 1. Save chunked request to hidden slot.
                 self._move_book_keeping_tensors(
                     src_idxs=chunked_idx,
                     dst_idxs=hidden_idx,
                     next_tokens=next_tokens,
                     new_speculative_tokens=new_speculative_tokens,
                 )
-                if chunked_prefill_request_idx < self.total_request_count - 1:
-                    shift_src = torch.arange(
-                        chunked_prefill_request_idx + 1, self.total_request_count, device=device
+
+                # 2. Fill the gap: move the last active request into the hole.
+                if chunked_prefill_request_idx != active_request_count - 1:
+                    last_active_idx = torch.tensor([active_request_count - 1], device=device)
+                    self._move_book_keeping_tensors(
+                        src_idxs=last_active_idx,
+                        dst_idxs=chunked_idx,
+                        next_tokens=next_tokens,
+                        new_speculative_tokens=new_speculative_tokens,
                     )
-                    shift_dst = torch.arange(
-                        chunked_prefill_request_idx, self.total_request_count - 1, device=device
+
+                # 3. Shift paused region left by 1 to stay adjacent to active.
+                if self.paused_request_count > 0:
+                    paused_src = torch.arange(
+                        active_request_count, self.total_request_count, device=device
+                    )
+                    paused_dst = torch.arange(
+                        active_request_count - 1, self.total_request_count - 1, device=device
                     )
                     self._move_book_keeping_tensors(
-                        src_idxs=shift_src,
-                        dst_idxs=shift_dst,
+                        src_idxs=paused_src,
+                        dst_idxs=paused_dst,
                         next_tokens=next_tokens,
                         new_speculative_tokens=new_speculative_tokens,
                     )
