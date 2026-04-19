@@ -40,6 +40,7 @@ class GroupedRolloutRequest(Request):
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
+    streaming: bool = False
     enforce_order: bool = False
 
 
@@ -206,9 +207,10 @@ class GroupedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        # Use buffer_size to create backpressure for balanced generation in a multi-task setting.
+        # When streaming, use buffer_size to create backpressure
+        # for balanced generation in a multi-task setting.
         grouped_rollouts: asyncio_Queue[RolloutGroup] = asyncio_Queue(
-            maxsize=self.buffer_size
+            maxsize=self.buffer_size if request.streaming else 0
         )
         submitted_groups = 0
 
@@ -245,7 +247,7 @@ class GroupedRolloutGenerator(Agent, ABC):
         @trace_async_exceptions(verbose=True)
         async def generate_task():
             nonlocal submitted_groups
-            while True:
+            while request.streaming or submitted_groups < request.num_groups:
                 await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker

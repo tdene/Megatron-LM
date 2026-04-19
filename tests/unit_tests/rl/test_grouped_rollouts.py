@@ -50,28 +50,29 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "num_slow_calls, num_groups, expected_count, expected_batch_ids",
+        "num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids",
         [
-            pytest.param(0, 8, 8, None, id="non_batched"),
-            pytest.param(0, 4, 4, None, id="fewer_than_parallel"),
-            pytest.param(4, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
-            pytest.param(0, 1, 10, None, id="single_group"),
+            pytest.param(0, False, 8, 8, None, id="non_batched"),
+            pytest.param(0, False, 4, 4, None, id="non_streaming_fewer_than_parallel"),
+            pytest.param(4, True, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
+            pytest.param(0, True, 1, 10, None, id="streaming"),
         ],
     )
     async def test_get_grouped_rollouts(
-        self, num_slow_calls, num_groups, expected_count, expected_batch_ids
+        self, num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids
     ):
         gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
         request = GroupedRolloutRequest(
             num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=streaming,
             enforce_order=num_groups > 1,
         )
         groups = []
         async for group in gen.get_grouped_rollouts(request):
             groups.append(group)
-            if len(groups) >= expected_count:
+            if request.streaming and len(groups) >= expected_count:
                 break
 
         assert len(groups) == expected_count
@@ -80,25 +81,34 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "agents, num_groups, pgt, enforce_order, expected_count, expected_env_ids",
+        "agents, num_groups, pgt, streaming, enforce_order, expected_count, expected_env_ids",
         [
             pytest.param(
                 [("a", 0.1), ("b", 0.2), ("c", 0.7)],
-                1,
+                10,
                 100,
-                False,
+                True,
+                True,
                 10,
                 ["a", "b", "b", "c", "c", "c", "c", "c", "c", "c"],
                 id="inexact_float_weights",
             ),
             pytest.param(
-                [("a", 3), ("b", 1)], 4, 100, True, 4, ["a", "a", "a", "b"], id="fixed_unequal_w"
+                [("a", 3), ("b", 1)],
+                4,
+                100,
+                False,
+                True,
+                4,
+                ["a", "a", "a", "b"],
+                id="fixed_unequal_w",
             ),
             pytest.param(
                 [("a", 1.0), ("b", 1.0)],
-                1,
+                2,
                 100,
-                False,
+                True,
+                True,
                 2,
                 ["a", "b"],
                 id="divide_by_zero_regression",
@@ -106,7 +116,7 @@ class TestGroupedRollouts:
         ],
     )
     async def test_weighted_multi_task(
-        self, agents, num_groups, pgt, enforce_order, expected_count, expected_env_ids
+        self, agents, num_groups, pgt, streaming, enforce_order, expected_count, expected_env_ids
     ):
         configs = [
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
@@ -119,6 +129,7 @@ class TestGroupedRollouts:
             num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=streaming,
             enforce_order=enforce_order,
         )
         groups = []
@@ -145,6 +156,7 @@ class TestGroupedRollouts:
             num_groups=4,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=True,
             enforce_order=True,
         )
 
@@ -171,24 +183,23 @@ class TestGroupedRollouts:
                     ), f"Step {step}, agent {env_id}: possible cross-step leakage"
                 prev_max_per_agent[env_id] = max(rewards)
 
-        # 12 groups = 4 complete slot cycles of [1, 2] -> exactly 4 "a" + 8 "b".
-        assert sorted(all_env_ids) == ["a"] * 4 + ["b"] * 8
+        # 12 groups = 3 batches of [1a, 3b] (weights 1:2 rounded into batch of 4).
+        assert sorted(all_env_ids) == ["a"] * 3 + ["b"] * 9
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "agents, num_groups, pgt, enforce_order, match",
+        "agents, num_groups, pgt, match",
         [
             pytest.param(
                 [("a", 0.01), ("b", 0.01), ("c", 0.98)],
                 3,
                 100,
-                True,
-                "would not appear in every batch",
-                id="fixed_extreme",
-            )
+                "would receive 0",
+                id="extreme_weights",
+            ),
         ],
     )
-    async def test_weighted_multi_task_error(self, agents, num_groups, pgt, enforce_order, match):
+    async def test_weighted_multi_task_error(self, agents, num_groups, pgt, match):
         configs = [
             AgentConfig(agent_type=MockGenerator, agent_args={"env_id": env_id}, weight=weight)
             for env_id, weight in agents
@@ -200,8 +211,9 @@ class TestGroupedRollouts:
             num_groups=num_groups,
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
-            enforce_order=enforce_order,
+            enforce_order=True,
         )
         with pytest.raises(ValueError, match=match):
             async for _ in mt.get_grouped_rollouts(request):
                 pass
+
