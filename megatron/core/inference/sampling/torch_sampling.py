@@ -1,6 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-
-"""PyTorch-based sampling backend with per-bucket parameter grouping."""
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from collections import defaultdict
 from typing import List, Optional, Tuple
@@ -12,10 +10,9 @@ from megatron.core.inference.sampling.base import Sampling
 
 
 class TorchSampling(Sampling):
-    """Sampling via bucketed :func:`torch.multinomial`.
+    """Sampling via bucketed `torch.multinomial`.
 
-    Groups requests by ``(temperature, top_k, top_p)`` so that each unique
-    parameter combination is sampled in a single kernel launch.
+    Groups requests into unique buckets by `(temperature, top_k, top_p)` for separate launches.
     """
 
     def __init__(self, rng: torch.Generator, vocab_size: int) -> None:
@@ -23,11 +20,12 @@ class TorchSampling(Sampling):
         self._vocab_size = vocab_size
         self._buckets: List[Tuple] = []
 
-    # ------------------------------------------------------------------
-    # Sampling interface
-    # ------------------------------------------------------------------
-
     def pre_forward_bookkeeping(self, context) -> None:
+        """Group active requests into sampling buckets by (temperature, top_k, top_p).
+
+        Args:
+            context: The active DynamicInferenceContext.
+        """
         active_request_count = context.total_request_count - context.paused_request_count
         md = context.active_request_metadata
 
@@ -41,17 +39,26 @@ class TorchSampling(Sampling):
 
         self._buckets = [(indices, *params) for params, indices in bucket_map.items()]
 
-    def sample(
+    def sample_kernel(
         self,
         logits: Tensor,
         n: int,
         output: Tensor,
         context,
         *,
-        eager: bool = False,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
     ) -> None:
+        """Sample tokens by iterating over pre-computed sampling buckets.
+
+        Args:
+            logits: Logits tensor of shape `[>=n, vocab_size]`.
+            n: Number of rows to sample.
+            output: Destination buffer for sampled token ids.
+            context: The active DynamicInferenceContext.
+            gather_indices: If provided, only sample from `logits[gather_indices[:n], :]`.
+            token_to_request_index: Per-token request mapping used by the speculative path.
+        """
         if gather_indices is not None:
             logits = logits[gather_indices[:n], :]
 
@@ -68,23 +75,19 @@ class TorchSampling(Sampling):
         sampled_indices = torch.cat(indices_list, dim=0)
         output[sampled_indices] = sampled_tokens
 
-    # ------------------------------------------------------------------
-    # Core sampling kernel
-    # ------------------------------------------------------------------
-
     def _sampling_func(
         self, last_token_logits: Tensor, temperature: float, top_k: int, top_p: float
     ) -> Tensor:
         """Sample tokens from logits with temperature, top-k, and top-p filtering.
 
         Args:
-            last_token_logits: Logits of shape ``[batch_size, vocab_size]``.
+            last_token_logits: Logits of shape `[batch_size, vocab_size]`.
             temperature: Temperature scaling factor.
             top_k: Top-k filtering value (0 = disabled).
             top_p: Top-p (nucleus) filtering value (0.0 = disabled).
 
         Returns:
-            Sampled token ids of shape ``[batch_size]``.
+            Sampled token ids of shape `[batch_size]`.
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)

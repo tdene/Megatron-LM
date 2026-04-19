@@ -52,8 +52,6 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
-from megatron.core.inference.utils import CUDAGraphCache
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 
 # pylint: disable=line-too-long
@@ -196,7 +194,6 @@ class TextGenerationController:
             self._last_accepted_seq_indices = torch.zeros(
                 max_requests, dtype=torch.long, device=device
             )
-            self._verification_cuda_graphs = CUDAGraphCache()
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -994,22 +991,19 @@ class TextGenerationController:
             num_decode = context.num_decode_requests
             num_prefill = context.num_prefill_requests
 
-        pool = CudaGraphManager.global_mempool if use_graph else None
-        for _ in self._verification_cuda_graphs(
-            num_decode, num_prefill, pool=pool, eager=not use_graph
-        ):
-            self._sampling.sample_and_verify(
-                self._all_logits_cuda,
-                input_ids,
-                self.num_speculative_tokens,
-                num_decode,
-                num_prefill,
-                context,
-                sampled_tokens=self._sampled_tokens_cuda,
-                last_accepted_indices=self._last_accepted_seq_indices,
-                accepted_tokens=self._accepted_tokens_per_request,
-                accepted_counts=self._accepted_token_counts_per_request,
-            )
+        self._sampling.sample_and_verify(
+            self._all_logits_cuda,
+            input_ids,
+            self.num_speculative_tokens,
+            num_decode,
+            num_prefill,
+            context,
+            eager=not use_graph,
+            sampled_tokens=self._sampled_tokens_cuda,
+            last_accepted_indices=self._last_accepted_seq_indices,
+            accepted_tokens=self._accepted_tokens_per_request,
+            accepted_counts=self._accepted_token_counts_per_request,
+        )
 
     def _sample_logits(
         self,

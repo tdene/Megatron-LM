@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling.flashinfer_sampling import FlashInferSampling
