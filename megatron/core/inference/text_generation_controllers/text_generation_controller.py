@@ -24,11 +24,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import (
-    CUDAGraphCache,
-    get_attention_mask,
-    set_decode_expert_padding,
-)
+from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -56,6 +52,7 @@ except ImportError:
     HAVE_TE = False
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.logprobs import LogProbsDecode, LogProbsPrefill, LogProbsSpeculative
 
 
 # pylint: disable=line-too-long
@@ -151,8 +148,6 @@ class TextGenerationController:
             self._all_logits_cuda = torch.zeros(
                 (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
             )
-            self._log_prob_graphs = CUDAGraphCache()
-            self._log_prob_graph_outputs: Dict[tuple, Tuple[Tensor, ...]] = {}
         else:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -184,6 +179,11 @@ class TextGenerationController:
         # Filled on the bookkeeping stream; guaranteed ready after _pre_forward_bookkeeping_event.
         self._log_prob_count_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
         self._top_n_max_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
+
+        # Log-prob computation backends (graph caching is per-backend).
+        self._log_probs_decode = LogProbsDecode()
+        self._log_probs_prefill = LogProbsPrefill()
+        self._log_probs_speculative = LogProbsSpeculative()
 
         # Used for inefficient torch sampling.
         if self._sampling_backend == "torch":
@@ -1262,9 +1262,9 @@ class TextGenerationController:
             log_prob_count = (
                 context.active_request_metadata["return_log_probs"][:active_request_count] > 0
             ).sum()
-            top_n_max_gpu = (
-                context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0
-            ).max()
+            top_n_max_gpu = context.active_request_metadata["top_n_logprobs"][
+                :active_request_count
+            ].max()
         else:
             log_prob_count = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
             top_n_max_gpu = torch.zeros(1, dtype=torch.int32, device=torch.cuda.current_device())
@@ -1283,36 +1283,16 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
-        padded_request_count = context.padded_active_request_count
-        padded_token_count = context.padded_active_token_count
 
         if context.num_speculative_tokens > 0:
-            only_last = context.config.materialize_only_last_token_logits
-            if not only_last:
-                graph_key = ("log_probs_spec_fp_idx", padded_request_count, padded_token_count)
-                for _ in self._log_prob_graphs(
-                    graph_key, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-                ):
-                    self._log_prob_graph_outputs[graph_key] = (
-                        context.log_probs_spec_prefill_indexing_kernel()
-                    )
+            if not context.config.materialize_only_last_token_logits:
+                self._log_probs_speculative.prefill_indexing(context, eager=eager)
             return
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            graph_key = ("log_probs_decode_idx", padded_request_count)
-            for _ in self._log_prob_graphs(
-                graph_key, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-            ):
-                self._log_prob_graph_outputs[graph_key] = context.log_probs_decode_indexing_kernel()
+            self._log_probs_decode.indexing(context, eager=eager)
         else:
-            padded_token_count = context.padded_active_token_count
-            graph_key = ("log_probs_prefill_idx", padded_request_count, padded_token_count)
-            for _ in self._log_prob_graphs(
-                graph_key, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-            ):
-                self._log_prob_graph_outputs[graph_key] = (
-                    context.log_probs_prefill_indexing_kernel()
-                )
+            self._log_probs_prefill.indexing(context, eager=eager)
 
     def _dynamic_step_log_probs_softmax(self):
         """Conditionally launch the speculative softmax kernel on the bookkeeping stream."""
@@ -1330,16 +1310,7 @@ class TextGenerationController:
             else context.padded_active_token_count
         )
         logits = self._all_logits_cuda[:, :logits_seq_len, :]
-
-        padded_decode_count = context.padded_batch_dimensions.decode_req_count
-        padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
-        graph_key_sm = ("log_probs_spec_sm", padded_decode_count, padded_prefill_count)
-        for _ in self._log_prob_graphs(
-            graph_key_sm, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-        ):
-            self._log_prob_graph_outputs[graph_key_sm] = (
-                context.log_probs_speculative_softmax_kernel(logits)
-            )
+        self._log_probs_speculative.softmax(context, logits, eager=eager)
 
     def _router_record_bookkeeping(self) -> Optional[Dict[int, Tensor]]:
         """Collect and map routing indices per request for MoE router recording.
@@ -1421,168 +1392,35 @@ class TextGenerationController:
         eager = not (self._enable_cuda_graph and context._using_cuda_graph_this_step)
 
         if context.num_speculative_tokens > 0:
-            return self._calculate_log_probs_speculative(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-
-        if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            return self._calculate_log_probs_decode(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-        else:
-            return self._calculate_log_probs_prefill(
-                context, logits, new_tokens, log_prob_request_count, eager, top_n_max
-            )
-
-    def _calculate_log_probs_decode(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run decode softmax kernel (post-forward). Returns a deferred extract callable."""
-        padded_count = context.padded_active_request_count
-        ri, padded_arange = self._log_prob_graph_outputs[("log_probs_decode_idx", padded_count)]
-
-        graph_key_sm = ("log_probs_decode_sm", padded_count)
-        for _ in self._log_prob_graphs(
-            graph_key_sm, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-        ):
-            self._log_prob_graph_outputs[graph_key_sm] = context.log_probs_decode_softmax_kernel(
-                logits, new_tokens, ri, padded_arange
-            )
-
-        slp, sl = self._log_prob_graph_outputs[graph_key_sm]
-        active_request_count = context.total_request_count - context.paused_request_count
-        return functools.partial(
-            context.log_probs_decode_extract,
-            ri,
-            slp,
-            log_prob_request_count,
-            active_request_count,
-            selected_logits=sl,
-            top_n_max=top_n_max,
-        )
-
-    def _calculate_log_probs_prefill(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run prefill softmax kernel (post-forward). Returns a deferred extract callable."""
-        padded_request_count = context.padded_active_request_count
-        padded_token_count = context.padded_active_token_count
-
-        ri, cu_ml, li, li_range, mt = self._log_prob_graph_outputs[
-            ("log_probs_prefill_idx", padded_request_count, padded_token_count)
-        ]
-
-        graph_key_sm = ("log_probs_prefill_sm", padded_request_count, padded_token_count)
-        for _ in self._log_prob_graphs(
-            graph_key_sm, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-        ):
-            self._log_prob_graph_outputs[graph_key_sm] = (
-                context.log_probs_prefill_softmax_kernel(
-                    logits, new_tokens, ri, cu_ml, li, li_range, mt
-                ),
-            )
-
-        (slp,) = self._log_prob_graph_outputs[graph_key_sm]
-        active_request_count = context.total_request_count - context.paused_request_count
-        return functools.partial(
-            context.log_probs_prefill_extract,
-            ri,
-            cu_ml,
-            slp,
-            log_prob_request_count,
-            active_request_count,
-            top_n_max=top_n_max,
-            logits=logits,
-            logit_indices=li,
-        )
-
-    def _calculate_log_probs_speculative(
-        self, context, logits, new_tokens, log_prob_request_count, eager, top_n_max=0
-    ):
-        """Run speculative gather kernel (post-verification). Returns a deferred extract callable."""
-        active_request_count = context.total_request_count - context.paused_request_count
-        num_prefill = active_request_count - context.num_decode_requests
-        only_last = context.config.materialize_only_last_token_logits
-
-        # Speculative gather: runs post-verification.
-        padded_decode_count = context.padded_batch_dimensions.decode_req_count
-        padded_prefill_count = context.padded_batch_dimensions.prefill_req_count
-        decode_log_probs, prefill_log_probs = self._log_prob_graph_outputs[
-            ("log_probs_spec_sm", padded_decode_count, padded_prefill_count)
-        ]
-        graph_key_ga = ("log_probs_spec_ga", padded_decode_count, padded_prefill_count)
-        for _ in self._log_prob_graphs(
-            graph_key_ga, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-        ):
-            self._log_prob_graph_outputs[graph_key_ga] = (
-                context.log_probs_speculative_gather_kernel(
-                    decode_log_probs,
-                    prefill_log_probs,
-                    new_tokens,
-                    self._accepted_tokens_per_request,
-                    self._accepted_token_counts_per_request,
-                )
-            )
-
-        decode_gathered, prefill_gathered = self._log_prob_graph_outputs[graph_key_ga]
-
-        # Full prefill softmax (if needed) — runs post-verification, before extract.
-        fp_slp = None
-        fp_ri = fp_cu_ml = fp_li = fp_count_gpu = None
-        if not only_last and num_prefill > 0:
-            padded_request_count = context.padded_active_request_count
-            padded_token_count = context.padded_active_token_count
-
-            fp_ri, fp_cu_ml, fp_li, li_range, mt, fp_count_gpu = self._log_prob_graph_outputs[
-                ("log_probs_spec_fp_idx", padded_request_count, padded_token_count)
-            ]
-
-            graph_key_fp_sm = ("log_probs_spec_fp_sm", padded_request_count, padded_token_count)
-            for _ in self._log_prob_graphs(
-                graph_key_fp_sm, skip_warmup=True, eager=eager, pool=CudaGraphManager.global_mempool
-            ):
-                self._log_prob_graph_outputs[graph_key_fp_sm] = (
-                    context.log_probs_prefill_softmax_kernel(
-                        logits, new_tokens, fp_ri, fp_cu_ml, fp_li, li_range, mt
-                    ),
-                )
-
-            (fp_slp,) = self._log_prob_graph_outputs[graph_key_fp_sm]
-
-        def extract():
-            result: List[Optional[List[float]]] = [None] * active_request_count
-            top_n_dict = context.log_probs_speculative_extract(
-                decode_gathered,
-                prefill_gathered,
+            return self._log_probs_speculative.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                self._accepted_tokens_per_request,
                 self._accepted_token_counts_per_request,
-                result,
-                logits=logits,
+                eager=eager,
                 top_n_max=top_n_max,
             )
 
-            if fp_slp is not None:
-                prefill_result, prefill_top_n = context.log_probs_prefill_extract(
-                    fp_ri,
-                    fp_cu_ml,
-                    fp_slp,
-                    fp_count_gpu.item(),
-                    active_request_count,
-                    top_n_max=top_n_max,
-                    logits=logits,
-                    logit_indices=fp_li,
-                )
-                for i, lp in enumerate(prefill_result):
-                    if lp is not None:
-                        result[i] = lp
-                if prefill_top_n:
-                    if top_n_dict is None:
-                        top_n_dict = prefill_top_n
-                    else:
-                        top_n_dict.update(prefill_top_n)
-
-            return result, top_n_dict
-
-        return extract
+        if context.config.materialize_only_last_token_logits or context.is_decode_only():
+            return self._log_probs_decode.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                eager=eager,
+                top_n_max=top_n_max,
+            )
+        else:
+            return self._log_probs_prefill.calculate(
+                context,
+                logits,
+                new_tokens,
+                log_prob_request_count,
+                eager=eager,
+                top_n_max=top_n_max,
+            )
 
     def graph_capture_variants(self) -> Generator[Callable, None, None]:
         """Yield context-setup callables for each graph-capture variant.
