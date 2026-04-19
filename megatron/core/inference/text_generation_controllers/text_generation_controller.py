@@ -1271,7 +1271,7 @@ class TextGenerationController:
 
         # Get active request info from context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_ids = context.request_ids[:active_request_count].tolist()
+        active_request_ids = context.active_request_ids[:active_request_count].tolist()
         active_query_lengths = context.active_request_query_lengths[:active_request_count].tolist()
         active_token_count = context.active_token_count
 
@@ -1785,7 +1785,8 @@ class TextGenerationController:
             active_sequence_lengths, context.request_output_lengths[:active_request_count]
         ).byte()
 
-        active_request_ids = context.request_ids[:active_request_count]
+        # Use the snapshot taken during build_active_slices.
+        active_request_ids = context.active_request_ids[:active_request_count]
 
         # Mark requests as finished if they hit stop words
         # (detected in previous step's post_process_requests)
@@ -1798,7 +1799,7 @@ class TextGenerationController:
                         active_request_mask[idx] = 0
 
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-        finished_request_ids = context.request_ids[finished_idxs]
+        finished_request_ids = context.active_request_ids[finished_idxs]
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused _sampled_tokens_cuda buffer.
