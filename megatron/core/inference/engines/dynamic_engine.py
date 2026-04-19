@@ -725,6 +725,9 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            if self.controller._sampling_backend == "flashinfer":
+                self.controller._sampling._sampling_cuda_graphs.clear()
+                self.controller._sampling._verification_cuda_graphs.clear()
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included
