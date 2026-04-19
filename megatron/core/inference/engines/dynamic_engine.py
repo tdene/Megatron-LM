@@ -742,6 +742,9 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            self.controller._log_probs_decode._graphs.clear()
+            self.controller._log_probs_prefill._graphs.clear()
+            self.controller._log_probs_speculative._graphs.clear()
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included
