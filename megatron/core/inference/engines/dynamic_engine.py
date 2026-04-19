@@ -365,6 +365,8 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+        model_config = controller.inference_wrapped_model.model.config
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -393,11 +395,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
                 # Launch bookkeeping on a side stream so it overlaps with forward.
                 with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
+                    controller._dynamic_step_sample_bookkeeping()
                     controller._pre_forward_bookkeeping_event.record()
 
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
                 controller._pre_forward_bookkeeping_event.synchronize()
+                controller._dynamic_step_sample_logits()
 
             context.reset()
 
@@ -721,6 +725,9 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            if self.controller._sampling_backend == "flashinfer":
+                self.controller._sampling._sampling_cuda_graphs.clear()
+                self.controller._sampling._verification_cuda_graphs.clear()
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included

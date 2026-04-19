@@ -64,6 +64,7 @@ class TestTextGenerationController:
         sequence_parallel: bool = False,
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
+        sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
     ):
         Utils.initialize_model_parallel(
@@ -144,6 +145,7 @@ class TestTextGenerationController:
                     block_size_tokens=block_size_tokens,
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
+                    sampling_backend=sampling_backend,
                 ),
             )
 
@@ -251,47 +253,77 @@ class TestTextGenerationController:
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    @pytest.mark.parametrize("backend", ["torch"])
+    @pytest.mark.parametrize("padding_extra", [0, 4])
+    @pytest.mark.parametrize("use_cuda_graph", [False, True])
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
+    # "mixed": per-request mix of filters; exercises the filtered FI kernel.
+    # "all_default": every request uses default SamplingParams; exercises the
+    # plain FI kernel (which the mixed profile never hits, since it always has
+    # at least one actively-filtering request).
+    @pytest.mark.parametrize("sampling_profile", ["mixed", "all_default"])
     def test_sample_from_dynamic_logits(
-        self, backend: str, materialize_only_last_token_logits: bool
+        self,
+        sampling_profile: str,
+        backend: str,
+        materialize_only_last_token_logits: bool,
+        use_cuda_graph: bool,
+        padding_extra: int,
     ):
-        batch_size = 12
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        if use_cuda_graph and backend != "flashinfer":
+            pytest.skip("CUDA graph sampling only applies to the flashinfer backend")
+        if padding_extra > 0 and not use_cuda_graph:
+            pytest.skip("Padded request slots only matter for the graph path")
+        batch_size = 15
+        padded_n = batch_size + padding_extra
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
             static=False,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=backend,
+            cuda_graph_impl='local' if use_cuda_graph else 'none',
         )
         self.mock_tokenizer.eod = self.vocab_size
+        device = torch.cuda.current_device()
 
         context = self.text_generation_controller.inference_wrapped_model.inference_context
+        controller = self.text_generation_controller
 
-        # Prepare sampling params in human-readable format, to aid with test maintenance.
-        sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
-            (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
-            (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
-            (SamplingParams(top_p=0.8), [4, 1, 7]),
-            (SamplingParams(temperature=10.0, top_k=5), [11, 5, 8]),
-        ]
-        # For non-torch backends, test simultaneous top_k and top_p sampling.
-        if backend != "torch":
-            sampling_test_cases[3][0].top_p = 0.8
+        # Build per-request sampling params.  The torch backend doesn't support
+        # simultaneous top_k + top_p, so the 4th mixed case varies by backend.
+        if sampling_profile == "mixed":
+            sampling_test_cases: List[Tuple[SamplingParams, List[int]]] = [
+                (SamplingParams(temperature=0.1, top_p=0.01), [9, 6, 10]),
+                (SamplingParams(temperature=5.0, top_k=15), [0, 3, 2]),
+                (SamplingParams(top_p=0.8), [4, 1, 7]),
+                (
+                    SamplingParams(
+                        temperature=10.0, top_k=5, top_p=0.8 if backend != "torch" else 0.0
+                    ),
+                    [11, 5, 8],
+                ),
+                (SamplingParams(), [12, 13, 14]),  # plain (no filtering)
+            ]
+            rev_sampling_dict: List[SamplingParams] = [None] * batch_size
+            for sampling_params, indices in sampling_test_cases:
+                for idx in indices:
+                    rev_sampling_dict[idx] = sampling_params
+            temp_values = torch.tensor([s.temperature for s in rev_sampling_dict])
+            top_k_values = torch.tensor([s.top_k for s in rev_sampling_dict], dtype=torch.int32)
+            top_p_values = torch.tensor([s.top_p for s in rev_sampling_dict])
+        else:  # all_default
+            temp_values = torch.ones(batch_size, dtype=torch.float32)
+            top_k_values = torch.zeros(batch_size, dtype=torch.int32)
+            top_p_values = torch.zeros(batch_size, dtype=torch.float32)
 
-        # Convert sampling params to non-readable format.
-        rev_sampling_dict: List[SamplingParams] = [None] * batch_size
-        for sampling_params, indices in sampling_test_cases:
-            for idx in indices:
-                rev_sampling_dict[idx] = sampling_params
-
-        # Prepare metadata for sample bookkeeping.
-        temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
-        top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
-        top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
+        # Sampling params are written in user form (top_k=0 / top_p=0.0 mean
+        # "no filter"); the FlashInfer encoding happens inside the sampler.
         context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
         context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
         context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
-        self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
@@ -305,45 +337,83 @@ class TestTextGenerationController:
         )
         context.paused_request_count = 0
         context.total_request_count = batch_size
+        context.num_prefill_requests = 0
+        context.padded_active_request_count = padded_n
+        context._using_cuda_graph_this_step = use_cuda_graph
 
-        # Bookkeeping.
-        self.text_generation_controller._dynamic_step_sample_bookkeeping()
-
-        # Sampling.
+        # Set up logits: ascending [0, 1, ..., vocab_size-1] per request.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
-        self.text_generation_controller._all_logits_cuda = logits
-        self.text_generation_controller._dynamic_step_sample_logits()
-        sampled_logits = self.text_generation_controller._sampled_tokens_cuda[:batch_size]
-        vocab_indices = torch.arange(self.vocab_size).cuda()
+        if use_cuda_graph:
+            controller._all_logits_cuda[:, :batch_size, :].copy_(logits)
+        elif controller._sampling_backend == "flashinfer":
+            controller._all_logits_cuda = logits.contiguous()
+        else:
+            controller._all_logits_cuda = logits
 
-        # Move tensors to GPU for assertion checks.
-        temp_values = temp_values.cuda()
-        top_k_values = top_k_values.cuda()
-        top_p_values = top_p_values.cuda()
+        # Two passes so graph mode exercises both capture and replay. Eager mode
+        # runs twice harmlessly.
+        for _ in range(2):
+            controller._dynamic_step_sample_bookkeeping()
+            controller._dynamic_step_sample_logits()
+            sampled = controller._sampled_tokens_cuda[:batch_size]
 
-        # Assert correct sampled values.
-        top_k_values[top_k_values == 0] = self.vocab_size
-        assert torch.all(
-            sampled_logits >= self.vocab_size - top_k_values
-        ), f"The sampled logits should all be greater than {self.vocab_size - top_k_values} but its {sampled_logits}"
-        l = logits.squeeze(0)
-        sampled_l = l.div(temp_values.unsqueeze(1)).softmax(dim=-1)
-        top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_values.unsqueeze(1))
-        sampled_l.masked_fill_(top_k_mask, 0.0)
-        top_p_mask = sampled_l.cumsum(dim=-1) > top_p_values.unsqueeze(1)
+            # All sampled tokens must be valid vocab indices.
+            assert torch.all(sampled >= 0) and torch.all(
+                sampled < self.vocab_size
+            ), f"Sampled tokens out of range: {sampled}"
 
-        first_excluded = torch.where(
-            top_p_mask.any(dim=-1),
-            top_p_mask.float().argmax(dim=-1),
-            torch.full((batch_size,), self.vocab_size, device=top_p_mask.device),
+            # top_k constraint.
+            top_k_gpu = top_k_values.cuda()
+            top_k_gpu[top_k_gpu == 0] = self.vocab_size
+            assert torch.all(
+                sampled >= self.vocab_size - top_k_gpu
+            ), f"top_k violated: sampled {sampled}, min allowed {self.vocab_size - top_k_gpu}"
+
+            # Combined top_k + top_p constraint: compute the minimum token value
+            # that passes both filters given temperature-scaled probabilities.
+            l = logits.squeeze(0)
+            scaled_probs = l.div(temp_values.cuda().unsqueeze(1)).softmax(dim=-1)
+            vocab_indices = torch.arange(self.vocab_size, device=device)
+            top_k_mask = vocab_indices.unsqueeze(0) < (self.vocab_size - top_k_gpu.unsqueeze(1))
+            scaled_probs.masked_fill_(top_k_mask, 0.0)
+
+            top_p_gpu = top_p_values.cuda()
+            top_p_mask = scaled_probs.cumsum(dim=-1) > top_p_gpu.unsqueeze(1)
+            first_excluded = torch.where(
+                top_p_mask.any(dim=-1),
+                top_p_mask.float().argmax(dim=-1),
+                torch.full((batch_size,), self.vocab_size, device=device),
+            )
+            last_included = torch.clamp(first_excluded - 1, min=0)
+            start_idx = torch.clamp(self.vocab_size - top_k_gpu, min=0).long()
+            last_included = torch.max(last_included, start_idx)
+            expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
+            assert torch.all(
+                sampled >= expected_min_values
+            ), f"Sampled below expected min: sampled {sampled}, expected_min {expected_min_values}"
+
+        if use_cuda_graph:
+            # After two passes exactly one graph should be captured for this
+            # padded_n; the second pass hits the cache.
+            cache = controller._sampling._sampling_cuda_graphs
+            assert (
+                len(cache) == 1
+            ), f"Expected exactly one captured sampling graph, got {len(cache)}"
+            assert padded_n in cache, f"Expected key {padded_n} not found in graph cache"
+
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
+    def test_add_request_metadata_compatibility(self, backend: str):
+        """Verify that add_request's metadata assertion passes for all backends."""
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
+        self.setup_model(torch.float32, batch_size=4, static=False, sampling_backend=backend)
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        req = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.zeros(4, dtype=torch.long, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         )
-        last_included = torch.clamp(first_excluded - 1, min=0)
-        start_idx = torch.clamp(self.vocab_size - top_k_values, min=0).long()
-        last_included = torch.max(last_included, start_idx)
-        expected_min_values = l.gather(1, last_included.unsqueeze(1)).squeeze(1)
-        assert torch.all(
-            sampled_logits >= expected_min_values
-        ), f"The sampled logits should all be greater than {expected_min_values} but its {sampled_logits}"
+        context.add_request(req)
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
@@ -1129,8 +1199,8 @@ class TestTextGenerationController:
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1254,11 +1324,10 @@ class TestTextGenerationController:
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
+        # Bucket format: (indices, temp, top_k, top_p)
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 0, 0.9)]
 
-        # Since we are actually testing the internal math of `_torch_sampling_func` handling the shapes,
-        # we DO NOT mock `_torch_sampling_func` here. We want it to run natively to prove it doesn't crash.
+        # We want _sampling_func to run natively to prove it doesn't crash.
 
         self.text_generation_controller._all_logits_cuda = logits
         try:
@@ -1415,10 +1484,12 @@ class TestTextGenerationController:
             side_effect=mock_compute_mtp_single_step
         )
 
-        # Mock _sample_from_logits_2d to return arbitrary dummy tokens
-        self.text_generation_controller._sample_from_logits_2d = mock.MagicMock(
-            return_value=torch.tensor([101, 201], device='cuda')
-        )
+        # Set up real sampling: populate metadata with default params and run
+        # bookkeeping so _sample_logits uses the real torch sampling path.
+        ctx.active_request_metadata["temperature"][:2].fill_(1.0)
+        ctx.active_request_metadata["top_k"][:2].fill_(1)
+        ctx.active_request_metadata["top_p"][:2].fill_(0.0)
+        self.text_generation_controller._dynamic_step_sample_bookkeeping()
 
         self.text_generation_controller._compute_serial_mtp_and_sample()
 
@@ -1491,7 +1562,7 @@ class TestTextGenerationController:
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
