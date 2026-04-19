@@ -874,6 +874,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_sequence_lengths = torch.empty_like(self.request_query_lengths)
         self.active_request_last_token_idxs = torch.empty_like(self.request_query_lengths)
 
+        # Pre-allocated indices for speculative decode logit extraction.
+        if self.num_speculative_tokens > 0:
+            self.active_speculative_logit_indices = torch.empty(
+                (self.max_tokens,), dtype=torch.long, device=torch.cuda.current_device()
+            )
+
+        # Postprocess tail graph: set by TextGenerationController when CUDA graphing.
+        self.postprocess_graph_cache = None
+        self.logits_output_buffer = None
+
         # NOTE: Need to build this outside the UVM / TMS context to avoid IMA.
         if self.is_hybrid_model:
             self.active_mamba_indices = torch.empty_like(
@@ -1102,6 +1112,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             out=self.active_request_last_token_idxs[:batch_size],
         )
         self.active_request_last_token_idxs[:batch_size] -= 1
+
+        if self.num_speculative_tokens > 0:
+            padded_decode = self.padded_batch_dimensions.decode_req_count
+            padded_prefill = self.padded_batch_dimensions.prefill_req_count
+            padded_decode_tokens = padded_decode * (self.num_speculative_tokens + 1)
+            torch.arange(
+                padded_decode_tokens,
+                out=self.active_speculative_logit_indices[:padded_decode_tokens],
+            )
+            total = padded_decode_tokens + padded_prefill
+            self.active_speculative_logit_indices[padded_decode_tokens:total].copy_(
+                self.active_request_last_token_idxs[padded_decode:batch_size]
+            )
+            self.padded_speculative_logit_count = total
 
         if self.is_hybrid_model:
             self.active_mamba_indices[:batch_size].copy_(
@@ -1873,7 +1897,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_metadata(self) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
-        This must be called after ``initialize_all_tensors()`` and after any
+        This must be called after `initialize_all_tensors()` and after any
         suspend/resume cycle to bring the context back to a clean state.
         """
 
@@ -1964,7 +1988,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Return:
             (Tensor) 1-D indices into the packed token sequence, length
-            ``num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests``.
+            `num_decode_requests * (num_speculative_tokens + 1) + num_prefill_requests`.
         """
         paused = self.paused_request_count
         total = self.total_request_count
@@ -1981,6 +2005,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def last_token_logits(self, logits: Tensor) -> Tensor:
         """Select the logit positions needed for token generation.
+
+        Uses padded request counts so that output shapes are fixed per `padded_batch_dimensions`.
+        Padding entries index position 0, producing unused logits that downstream never consumes.
 
         When speculative decoding is active, decode requests need logits for all
         their tokens (base + speculative) for verification, while prefill requests
@@ -2003,11 +2030,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         logits_2d = logits.squeeze(0)
 
         if self.num_speculative_tokens > 0:
-            selected = self.speculative_required_logit_indices(logits.device)
-            return logits_2d[selected, :]
+            n = self.padded_speculative_logit_count
+            return logits_2d[self.active_speculative_logit_indices[:n], :]
 
-        active_request_count = self.total_request_count - self.paused_request_count
-        return logits_2d[self.active_request_last_token_idxs[:active_request_count], :]
+        return logits_2d[
+            self.active_request_last_token_idxs[:self.padded_active_request_count], :
+        ]
 
     def _compute_prefix_match(
         self, req: DynamicInferenceRequest, prefill_chunk_length: int

@@ -721,6 +721,8 @@ class DynamicInferenceEngine(AbstractEngine):
             and not self.context.static_kv_memory_pointers
         ):
             delete_cuda_graphs()
+            if self.context.postprocess_graph_cache is not None:
+                self.context.postprocess_graph_cache.clear()
 
         # Build the list of requests to re-add on resume.
         # All waiting requests are always included; active requests are included

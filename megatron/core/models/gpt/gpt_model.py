@@ -653,42 +653,63 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                 )
-        sequence_parallel_override = False
+        # When CUDA-graphing dynamic-batched inference, capture/replay the output-layer
+        # so that logits materialise directly into a static buffer with no per-step allocation.
+        if (
+            in_inference_mode
+            and inference_context.is_dynamic_batching()
+            and inference_context.using_cuda_graph_this_step()
+        ):
+            cache = inference_context.postprocess_graph_cache
+            key = inference_context.padded_batch_dimensions
+            pool = inference_context.postprocess_graph_pool
+            graph_iter = cache(key, pool=pool)
+        else:
+            graph_iter = (None,)
 
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                if self.output_layer.sequence_parallel:
-                    # Perform the sequence parallel gather here instead of after the output layer
-                    # because we need to slice the last token logits from the full view of the
-                    # packed logits across all requests.
-                    hidden_states = gather_from_sequence_parallel_region(
-                        hidden_states, group=self.pg_collection.tp
-                    )
-                    self.output_layer.sequence_parallel = False
-                    sequence_parallel_override = True
+        for _ in graph_iter:
+            sequence_parallel_override = False
 
-                # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
-                # then back to [S’, B, H] for the output layer.
-                reshaped = hidden_states.squeeze(1).unsqueeze(0)
-                hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+            if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+                if inference_context.is_static_batching():
+                    hidden_states = hidden_states[-1:, :, :]
+                else:
+                    if self.output_layer.sequence_parallel:
+                        # Perform the sequence parallel gather here instead of after the
+                        # output layer because we need to slice the last token logits from
+                        # the full view of the packed logits across all requests.
+                        hidden_states = gather_from_sequence_parallel_region(
+                            hidden_states, group=self.pg_collection.tp
+                        )
+                        self.output_layer.sequence_parallel = False
+                        sequence_parallel_override = True
 
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+                    # Reshape [S, B, H] (with B=1) to [1, S, H] for logit extraction,
+                    # then back to [S', B, H] for the output layer.
+                    reshaped = hidden_states.squeeze(1).unsqueeze(0)
+                    hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-
-        # Restore sequence parallel execution to the output layer if necessary.
-        if sequence_parallel_override:
-            assert (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.config.materialize_only_last_token_logits
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
-            self.output_layer.sequence_parallel = True
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
+
+            # Restore sequence parallel execution to the output layer if necessary.
+            if sequence_parallel_override:
+                assert (
+                    in_inference_mode
+                    and inference_context.is_dynamic_batching()
+                    and inference_context.config.materialize_only_last_token_logits
+                )
+                self.output_layer.sequence_parallel = True
+
+            # When a logits output buffer exists, write directly into it.
+            if in_inference_mode and (buf := inference_context.logits_output_buffer) is not None:
+                buf[:, : logits.shape[0], :].copy_(logits.permute(1, 0, 2))
+
+        if in_inference_mode and inference_context.logits_output_buffer is not None:
+            return None
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(

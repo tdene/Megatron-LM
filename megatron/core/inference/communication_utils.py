@@ -42,6 +42,7 @@ def broadcast_from_last_pipeline_stage(
     dtype: torch.dtype,
     tensor: Optional[torch.Tensor] = None,
     pp_group: Optional[ProcessGroup] = None,
+    recv_buffer: Optional[torch.Tensor] = None,
 ):
     """Broadcast a tensor from last pipeline stage to all ranks.
 
@@ -50,6 +51,7 @@ def broadcast_from_last_pipeline_stage(
         dtype: Expected tensor dtype
         tensor: Tensor to broadcast (only on last stage)
         pp_group: Custom process group (if None, uses global state)
+        recv_buffer: Pre-allocated receive buffer for non-last stages.
     """
     # Use custom process group or fall back to global state
     if pp_group is None:
@@ -72,6 +74,8 @@ def broadcast_from_last_pipeline_stage(
         ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
         assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
         _is_cuda_contiguous(tensor)
+    elif recv_buffer is not None:
+        tensor = recv_buffer
     else:
         tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
 

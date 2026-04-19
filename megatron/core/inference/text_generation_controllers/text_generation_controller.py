@@ -24,12 +24,13 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.utils import get_attention_mask, set_decode_expert_padding
+from megatron.core.inference.utils import CUDAGraphCache, get_attention_mask, set_decode_expert_padding
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -146,6 +147,10 @@ class TextGenerationController:
             self._all_logits_cuda = torch.zeros(
                 (1, max_logits, self.vocab_size), dtype=logits_dtype, device=device
             )
+            # Set up the postprocess tail graph on the inference context.
+            context.postprocess_graph_cache = CUDAGraphCache()
+            context.logits_output_buffer = self._all_logits_cuda
+            context.postprocess_graph_pool = CudaGraphManager.global_mempool
         else:
             self._all_logits_cuda = None
         self._sampled_tokens_cuda = torch.empty(max_requests, dtype=torch.int64, device=device)
@@ -678,20 +683,29 @@ class TextGenerationController:
                 logits_seq_len = input_ids.shape[1]
             logits_shape = [1, logits_seq_len, self.vocab_size]
 
+            # When _postprocess wrote directly into _all_logits_cuda, logits is
+            # None. Create a contiguous view into the buffer for the broadcast.
+            recv_buffer = None
+            if self._enable_cuda_graph:
+                n = logits_seq_len * self.vocab_size
+                buf_view = self._all_logits_cuda.view(-1)[:n].view(logits_shape)
+                if is_pipeline_last_stage(self.pp_group):
+                    logits = buf_view
+                else:
+                    recv_buffer = buf_view
+
             if is_pipeline_last_stage(self.pp_group):
                 assert logits is not None and torch.Size(logits_shape) == logits.shape
-
             logits = broadcast_from_last_pipeline_stage(
                 logits_shape,
                 dtype=self.model_config.params_dtype,
                 tensor=logits,
+                recv_buffer=recv_buffer,
                 pp_group=self.pp_group,
             )
 
-        # Copy logits to contiguous buffer.
-        if self._enable_cuda_graph:
-            self._all_logits_cuda[:, :logits_seq_len, :].copy_(logits)
-        else:
+        # With CUDA graphs, the model's `_postprocess` writes directly into `_all_logits_cuda`.
+        if not self._enable_cuda_graph:
             self._all_logits_cuda = logits
 
     def _dynamic_step_sample_bookkeeping(self):

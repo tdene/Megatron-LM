@@ -244,11 +244,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.inference_context.increment_sequence_len_offset(seq_len)
 
         logits = None
-        if is_pipeline_last_stage(self.pp_group):
-            logits = output_tensor
-
-            # Explicitly cast logits to expected dtype
-            logits = logits.to(self.config.params_dtype)
+        if is_pipeline_last_stage(self.pp_group) and output_tensor is not None:
+            # Explicitly cast logits to expected dtype.
+            # When the postprocess tail graph is active, output_tensor is None
+            # because the logits were written directly into a static buffer.
+            logits = output_tensor.to(self.config.params_dtype)
 
         return logits
 
