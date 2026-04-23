@@ -1,9 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import ctypes
 import logging
 import multiprocessing
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 
 import torch
@@ -310,3 +312,106 @@ if sys.version_info < (3, 13):
 else:
     asyncio_QueueShutDown = asyncio.QueueShutDown
     asyncio_Queue = asyncio.Queue
+
+
+from typing import Optional
+
+_libcudart: Optional[ctypes.CDLL] = None
+_CUDA_HOST_FN_T = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
+
+
+def _get_cudart() -> ctypes.CDLL:
+    """Lazily load and configure the CUDA runtime library."""
+    global _libcudart
+    if _libcudart is None:
+        cuda_major = torch.version.cuda.split('.')[0]
+        _libcudart = ctypes.CDLL(f"libcudart.so.{cuda_major}")
+        _libcudart.cudaLaunchHostFunc.restype = ctypes.c_int
+        _libcudart.cudaLaunchHostFunc.argtypes = [
+            ctypes.c_void_p,  # cudaStream_t
+            _CUDA_HOST_FN_T,  # cudaHostFn_t
+            ctypes.c_void_p,  # void* userData
+        ]
+    return _libcudart
+
+
+class GPUFuture:
+    """Awaitable that resolves when all preceding work on a CUDA stream completes.
+
+    Uses cudaLaunchHostFunc to fire a callback from CUDA's internal thread,
+    which resolves this future via call_soon_threadsafe (back of queue).
+    This is the BASELINE implementation — no front-of-queue scheduling.
+    """
+
+    _prevent_gc: dict = {}
+    _asyncio_future_blocking = False
+
+    def __init__(self, loop: asyncio.AbstractEventLoop):
+        self._loop = loop
+        self._done = False
+        self._callbacks: list = []
+
+    def get_loop(self):
+        return self._loop
+
+    def done(self):
+        return self._done
+
+    def cancelled(self):
+        return False
+
+    def cancel(self, msg=None):
+        return False
+
+    def result(self):
+        if not self._done:
+            raise asyncio.InvalidStateError('not ready')
+        return None
+
+    def add_done_callback(self, fn, *, context=None):
+        if self._done:
+            self._loop.call_soon(fn, self, context=context)
+        else:
+            self._callbacks.append((fn, context))
+
+    def __await__(self):
+        if not self._done:
+            self._asyncio_future_blocking = True
+            yield self
+        if not self._done:
+            raise RuntimeError("await wasn't used with future")
+        return self.result()
+
+    def record(self, stream: Optional[torch.cuda.Stream] = None) -> None:
+        """Enqueue a host callback that resolves this future when stream drains."""
+        if stream is None:
+            stream = torch.cuda.current_stream()
+
+        prevent_gc_ref: Optional[object] = None
+
+        def _host_fn(_user_data: ctypes.c_void_p) -> None:
+            # Runs on CUDA's internal callback thread; MUST NOT call CUDA API.
+            try:
+                self._loop.call_soon_threadsafe(self._resolve)
+            except RuntimeError:
+                pass  # event loop closed
+            GPUFuture._prevent_gc.pop(id(prevent_gc_ref), None)
+
+        c_fn = _CUDA_HOST_FN_T(_host_fn)
+        prevent_gc_ref = c_fn
+        GPUFuture._prevent_gc[id(c_fn)] = c_fn
+
+        err = _get_cudart().cudaLaunchHostFunc(
+            ctypes.c_void_p(stream.cuda_stream), c_fn, ctypes.c_void_p(0)
+        )
+        if err != 0:
+            GPUFuture._prevent_gc.pop(id(c_fn), None)
+            raise RuntimeError(f"cudaLaunchHostFunc failed with CUDA error {err}")
+
+    def _resolve(self):
+        """Mark done and fire callbacks (back of queue — baseline behavior)."""
+        self._resolve_time = time.perf_counter()
+        self._done = True
+        cbs, self._callbacks = self._callbacks, []
+        for fn, ctx in cbs:
+            self._loop.call_soon(fn, self, context=ctx)
