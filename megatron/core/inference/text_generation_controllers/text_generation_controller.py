@@ -4,6 +4,8 @@ import asyncio
 import concurrent
 import copy
 import functools
+import logging
+import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -1867,7 +1869,11 @@ class TextGenerationController:
         # lets other asyncio tasks run while the GPU is busy, and resumes
         # as soon as the forward pass completes.
         gpu_done.record()
+        torch.cuda.nvtx.range_push("await_gpu_done")
         await gpu_done
+        torch.cuda.nvtx.range_pop()
+        schedule_latency_ms = (time.perf_counter() - gpu_done._resolve_time) * 1000
+        logging.info("gpu_done scheduling latency: %.3f ms", schedule_latency_ms)
 
         with torch.inference_mode():
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()

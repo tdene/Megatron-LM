@@ -5,6 +5,7 @@ import ctypes
 import logging
 import multiprocessing
 import sys
+import time
 from importlib.metadata import PackageNotFoundError, version
 from typing import Optional
 
@@ -451,6 +452,7 @@ class GPUFuture:
 
     def _resolve(self):
         """Mark done and fire callbacks at the front of the ready queue."""
+        self._resolve_time = time.perf_counter()
         self._done = True
         cbs, self._callbacks = self._callbacks, []
         for fn, ctx in cbs:

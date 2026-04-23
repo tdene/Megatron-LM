@@ -2193,6 +2193,23 @@ class DynamicInferenceEngine(AbstractEngine):
         """Continually steps the engine asynchronously."""
         self._loop = get_asyncio_loop(loop)
         self.use_coordinator = False
+
+        # --- TEST: synthetic side tasks to simulate concurrent async work ---
+        _N_SYNTHETIC_TASKS = 50
+
+        async def _synthetic_side_task():
+            while True:
+                total = 0
+                for i in range(5000):
+                    total += i
+                await asyncio.sleep(0.001)
+
+        synthetic_tasks = [
+            asyncio.ensure_future(_synthetic_side_task()) for _ in range(_N_SYNTHETIC_TASKS)
+        ]
+        logging.info("Spawned %d synthetic side tasks for scheduling test", _N_SYNTHETIC_TASKS)
+        # --- END TEST ---
+
         try:
             while True:
                 # Wait until there are active requests before proceeding.
@@ -2208,7 +2225,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                 await self.async_step()
         except asyncio.CancelledError:
-            pass
+            for t in synthetic_tasks:
+                t.cancel()
+            await asyncio.gather(*synthetic_tasks, return_exceptions=True)
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
