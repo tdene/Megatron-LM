@@ -63,9 +63,7 @@ from megatron.core.utils import (
     internal_api,
     nvtx_range_pop,
     nvtx_range_push,
-    round_up_to_nearest_multiple,
     trace_async_exceptions,
-    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
@@ -367,21 +365,6 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        # MTP warmup preparation: capture MTP CUDA graphs alongside the
-        # decoder graphs within the same loop rather than in a separate pass.
-        unwrapped = unwrap_model(controller.inference_wrapped_model.model)
-        if hasattr(unwrapped, 'mtp') and (controller.num_speculative_tokens or 0) > 0:
-            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
-            sp_enabled = model_config.sequence_parallel and tp_size > 1
-            mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
-            mtp_seen_batch_sizes = set()
-        else:
-            tp_size = 1
-            sp_enabled = False
-            mtp_warmup_depths = None
-            mtp_seen_batch_sizes = None
-
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -403,61 +386,25 @@ class DynamicInferenceEngine(AbstractEngine):
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Capture all relevant graphs in the pipeline.
-            # Note that some steps of the pipeline may capture multiple different variant graphs.
+            # Run each warmup variant the controller decides to capture for this batch
+            # dimension (decoder + sampling, plus one variant per MTP depth on the
+            # speculative path, deduped by resolved batch size).
             with torch.inference_mode():
-                for setup_variant in controller.graph_capture_variants():
-                    setup_variant(context)
-                    controller._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
-                    # Launch bookkeeping on a side stream so it overlaps with forward.
-                    with torch.cuda.stream(controller._pre_forward_bookkeeping_stream):
-                        controller._pre_forward_bookkeeping_event.record()
-
-                    controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                    controller._pre_forward_bookkeeping_event.synchronize()
-
-                    # Sampling warm-up. The non-speculative path captures `sample_kernel`
-                    # keyed by `("sample", padded_active_request_count)`; the speculative
-                    # path additionally captures `("sample_speculative", padded_decode, 0)`
-                    # for decode-only graphs. Other backends and mixed graphs run eagerly.
-                    controller._dynamic_step_sample_bookkeeping()
-                    if controller.num_speculative_tokens > 0:
-                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
-                    else:
-                        controller._dynamic_step_sample_logits()
-
-                # MTP CUDA graph warmup for this batch dimension.
-                if mtp_warmup_depths is not None:
-                    n = cuda_graph_batch_dimension.req_count
-                    if sp_enabled:
-                        n = round_up_to_nearest_multiple(n, tp_size)
-                    if n > 0 and n not in mtp_seen_batch_sizes:
-                        mtp_seen_batch_sizes.add(n)
-                        device = torch.cuda.current_device()
-                        batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                        for depth in mtp_warmup_depths:
-                            unwrapped.compute_mtp_single_step(
-                                hidden_states=torch.zeros(
-                                    (batch_dim, 1, model_config.hidden_size),
-                                    device=device,
-                                    dtype=model_config.params_dtype,
-                                ),
-                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
-                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
-                                depth=depth,
-                                cache_key=("mtp", n, depth),
-                            )
-
+                for variant in controller.graph_capture_variants(
+                    cuda_graph_batch_dimension, input_ids, position_ids
+                ):
+                    variant()
                 context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
-        if mtp_warmup_depths is not None and mtp_seen_batch_sizes:
-            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
+        if controller._mtp_warmup_seen_batch_sizes:
+            logging.info(
+                "> MTP CUDA graph warmup: %d batch size(s)",
+                len(controller._mtp_warmup_seen_batch_sizes),
+            )
 
         # Memory usage.
         time_end = time.time()

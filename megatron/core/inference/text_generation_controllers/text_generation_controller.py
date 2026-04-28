@@ -190,6 +190,11 @@ class TextGenerationController:
 
         Addresses must be stable across steps for CUDA graph capture.
         """
+        # Warmup state: yielded by `graph_capture_variants`. Populated below for the
+        # speculative path; `None` means "no MTP variants to warm up".
+        self._mtp_warmup_depths = None
+        self._mtp_warmup_seen_batch_sizes: set = set()
+
         if not self.num_speculative_tokens:
             self._sampled_mtp_tokens_cuda = None
             self._accepted_tokens_per_request = None
@@ -220,6 +225,15 @@ class TextGenerationController:
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
         )
+
+        # MTP warmup: each (depth, padded-batch-size) pair captures one graph keyed
+        # by `("mtp", n, depth)`. Layer-shared models use a single `depth=None`
+        # placeholder; layer-distinct models capture per depth.
+        if hasattr(self._unwrapped_model, 'mtp'):
+            mtp_pass_depth = not self._unwrapped_model.mtp.mtp_use_repeated_layer
+            self._mtp_warmup_depths = (
+                list(range(self._num_mtp_depths)) if mtp_pass_depth else [None]
+            )
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -1454,17 +1468,72 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
-    def graph_capture_variants(self) -> Generator[Callable, None, None]:
-        """Yield context-setup callables for each graph-capture variant.
+    def graph_capture_variants(
+        self,
+        cuda_graph_batch_dimension: InferenceBatchDimensions,
+        input_ids: Tensor,
+        position_ids: Tensor,
+    ) -> Generator[Callable[[], None], None, None]:
+        """Yield warmup actions for the given batch dimension.
 
-        During graph warmup, the engine runs the full step pipeline once per yielded callable.
-        Each callable exercises a different kernel path.
+        Each yielded callable, when invoked, performs one warmup pass — typically
+        capturing one or more CUDA graphs. The decoder + sampling pass is always
+        yielded; for the speculative path, one MTP pass is yielded per depth, deduped
+        by resolved-padded batch size across the warmup loop.
         """
-        if not self._enable_cuda_graph:
-            yield lambda context: None
-            return
+        # Decoder forward + sampling pass.
+        yield lambda: self._warmup_decoder_pass(input_ids, position_ids)
 
-        yield lambda context: None
+        # MTP passes (one per depth); deduped by resolved batch size since the MTP
+        # cache key depends only on `n` (and depth), not on the surrounding context.
+        if self._mtp_warmup_depths is None:
+            return
+        n = cuda_graph_batch_dimension.req_count
+        if self._sp_enabled:
+            n = round_up_to_nearest_multiple(n, self._tp_size)
+        if n == 0 or n in self._mtp_warmup_seen_batch_sizes:
+            return
+        self._mtp_warmup_seen_batch_sizes.add(n)
+        for depth in self._mtp_warmup_depths:
+            yield self._make_mtp_warmup_variant(n, depth)
+
+    def _warmup_decoder_pass(self, input_ids: Tensor, position_ids: Tensor) -> None:
+        """Decoder warmup body: bookkeeping → forward → sampling."""
+        self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+        # Launch bookkeeping on a side stream so it overlaps with forward.
+        with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
+            self._pre_forward_bookkeeping_event.record()
+
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        self._pre_forward_bookkeeping_event.synchronize()
+        self._dynamic_step_sample_bookkeeping()
+        if self.num_speculative_tokens > 0:
+            self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+        else:
+            self._dynamic_step_sample_logits()
+
+    def _make_mtp_warmup_variant(self, n: int, depth) -> Callable[[], None]:
+        """Build a closure that captures the MTP graph for batch size `n` at `depth`."""
+
+        def variant() -> None:
+            device = torch.cuda.current_device()
+            batch_dim = n // self._tp_size if self._sp_enabled else n
+            # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups
+            # during graph capture/replay.
+            self._unwrapped_model.compute_mtp_single_step(
+                hidden_states=torch.zeros(
+                    (batch_dim, 1, self.model_config.hidden_size),
+                    device=device,
+                    dtype=self.model_config.params_dtype,
+                ),
+                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                depth=depth,
+                cache_key=("mtp", n, depth),
+            )
+
+        return variant
 
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
