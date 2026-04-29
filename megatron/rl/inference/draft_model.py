@@ -162,6 +162,57 @@ class EarlyExitGPTModel(nn.Module):
     # Forward pass
     # ------------------------------------------------------------------
 
+    def _mamba_style_preprocess(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        decoder_input: Optional[torch.Tensor],
+        inference_context: Optional[BaseInferenceContext],
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Manual preprocess matching MambaModel.forward (no `_preprocess`).
+
+        Returns ``(decoder_input_tensor, rotary_pos_emb)``.  The other
+        TransformerBlock-style preprocess outputs (rotary cos/sin, padding
+        mask, sequence_len_offset) aren't produced by MambaModel and the
+        per-layer kwarg filter just drops them, so returning None for those
+        in the caller is fine.
+        """
+        fm = self._full_model
+
+        # Embedding (or pass-through if caller provided decoder_input).
+        if decoder_input is not None:
+            decoder_input_tensor = decoder_input
+        elif fm.pre_process:
+            decoder_input_tensor = fm.embedding(
+                input_ids=input_ids, position_ids=position_ids
+            )
+        else:
+            decoder_input_tensor = None
+
+        # Rotary positional embeddings (only if the model uses them).
+        rotary_pos_emb = None
+        if (
+            getattr(fm, "position_embedding_type", None) == "rope"
+            and getattr(fm, "rotary_pos_emb", None) is not None
+        ):
+            rotary_seq_len = fm.rotary_pos_emb.get_rotary_seq_len(
+                inference_context,
+                fm.decoder,
+                decoder_input_tensor,
+                fm.config,
+                packed_seq_params,
+            )
+            rotary_pos_emb = fm.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=(
+                    packed_seq_params is not None
+                    and packed_seq_params.qkv_format == "thd"
+                ),
+            )
+
+        return decoder_input_tensor, rotary_pos_emb
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -182,23 +233,40 @@ class EarlyExitGPTModel(nn.Module):
         """
         fm = self._full_model
 
-        # Embeddings + rotary positional encodings.
-        preproc = fm._preprocess(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            decoder_input=decoder_input,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-        )
-        (
-            decoder_input_tensor,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
-            padding_mask,
-        ) = preproc[:6]
-        rotary_pos_cos_sin = preproc[6] if len(preproc) == 7 else None
+        # Embeddings + rotary positional encodings.  GPTModel exposes a
+        # `_preprocess()` helper that returns everything we need; MambaModel
+        # does the same work inline in its `forward()` and has no helper, so
+        # fall back to a manual preprocess when `_preprocess` isn't there.
+        if hasattr(fm, "_preprocess"):
+            preproc = fm._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+            (
+                decoder_input_tensor,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                padding_mask,
+            ) = preproc[:6]
+            rotary_pos_cos_sin = preproc[6] if len(preproc) == 7 else None
+        else:
+            decoder_input_tensor, rotary_pos_emb = self._mamba_style_preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+            rotary_pos_cos = None
+            rotary_pos_sin = None
+            rotary_pos_cos_sin = None
+            sequence_len_offset = None
+            padding_mask = None
 
         # _preprocess wraps decoder_input in a WrappedTensor during inference
         # so that TransformerBlock can drop its caller's reference for early
@@ -264,8 +332,12 @@ class EarlyExitGPTModel(nn.Module):
             hidden_states, weight=output_weight, runtime_gather_output=gather
         )
 
-        # MuP logit scaling, when configured on the full model.
-        logits = fm._scale_logits(logits)
+        # MuP logit scaling, when configured on the full model.  Only GPTModel
+        # exposes `_scale_logits`; MambaModel applies MuP scaling differently
+        # (or not at all) and lacks this helper.
+        scale = getattr(fm, "_scale_logits", None)
+        if scale is not None:
+            logits = scale(logits)
 
         # Logits arrive as [s, b, h]; downstream consumers expect [b, s, h].
         return logits.transpose(0, 1).contiguous()
