@@ -307,9 +307,20 @@ class EarlyExitGPTModel(nn.Module):
             )
             hidden_states, context = _call_layer(layer, kwargs)
 
-        # Final layer norm — shared with the full model.
-        if fm.decoder.final_layernorm is not None:
-            hidden_states = apply_module(fm.decoder.final_layernorm)(hidden_states)
+        # Final layer norm — shared with the full model.  Different decoders
+        # call this attribute different things and may not have it at all:
+        #   * TransformerBlock (GPTModel.decoder): `final_layernorm`,
+        #     possibly None.
+        #   * MambaStack (MambaModel.decoder): `final_norm`, only present
+        #     when `post_process and post_layer_norm` were both True.
+        # `getattr(..., None)` guards both the missing-attribute case (Mamba)
+        # and the None case (Transformer with no terminal layer norm).
+        final_ln = (
+            getattr(fm.decoder, "final_layernorm", None)
+            or getattr(fm.decoder, "final_norm", None)
+        )
+        if final_ln is not None:
+            hidden_states = apply_module(final_ln)(hidden_states)
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=False, keep_graph=False
             )
