@@ -67,6 +67,7 @@ class TextGenerationControllerTestBase:
         expert_model_parallel_size: int = 1,
         num_moe_experts: int = None,
         hybrid_layer_pattern: str = None,
+        sampling_backend: str = 'torch',
         cuda_graph_impl: str = 'none',
     ):
         if use_training_random_init:
@@ -164,6 +165,7 @@ class TextGenerationControllerTestBase:
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
                     mamba_inference_state_config=mamba_inference_state_config,
+                    sampling_backend=sampling_backend,
                 ),
             )
 
@@ -280,17 +282,20 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    @pytest.mark.parametrize("backend", ["torch"])
+    @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_sample_from_dynamic_logits(
         self, backend: str, materialize_only_last_token_logits: bool
     ):
+        if backend == "flashinfer":
+            pytest.importorskip("flashinfer")
         batch_size = 12
         self.setup_model(
             torch.float32,
             batch_size=batch_size,
             static=False,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
+            sampling_backend=backend,
         )
         self.mock_tokenizer.eod = self.vocab_size
 
@@ -320,7 +325,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
         context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
         context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
-        self.text_generation_controller._sampling_backend = backend
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32)
@@ -995,11 +999,11 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 return torch.zeros((12,), dtype=torch.long, device='cuda')
 
         # Override sampling to return our predictable mock outputs
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 1, 0.0)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 1, 0.0)]
+        self.text_generation_controller._sampling._bucket_index_tensors = [
             torch.tensor([0, 1], device='cuda', dtype=torch.long)
         ]
-        self.text_generation_controller._torch_sampling_func = mock.MagicMock(
+        self.text_generation_controller._sampling._sampling_func = mock.MagicMock(
             side_effect=mock_sampling_func
         )
 
@@ -1227,9 +1231,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         logits = torch.randn(1, 8, self.vocab_size, device='cuda')
 
         # Set up a bucket that forces multinomial sampling (top_p = 0.9, top_k = 0)
-        # _torch_sampling_buckets format: (indices, temp, top_k, top_p)
-        self.text_generation_controller._torch_sampling_buckets = [([0, 1], 1.0, 0, 0.9)]
-        self.text_generation_controller._torch_sampling_bucket_index_tensors = [
+        # _buckets format: (indices, temp, top_k, top_p)
+        self.text_generation_controller._sampling._buckets = [([0, 1], 1.0, 0, 0.9)]
+        self.text_generation_controller._sampling._bucket_index_tensors = [
             torch.tensor([0, 1], device='cuda', dtype=torch.long)
         ]
 
@@ -1387,7 +1391,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         captured_position_ids = []
 
-        def mock_compute_mtp_single_step(hidden_states, next_token_ids, position_ids, depth=None):
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth=None, eager=False, cache_key=None
+        ):
             captured_position_ids.append(position_ids.clone())
             return hidden_states, torch.randn(2, 1, self.vocab_size, device='cuda')
 
@@ -1471,8 +1477,8 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctrl._torch_sampling_buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
-        ctrl._torch_sampling_bucket_index_tensors = [
+        ctrl._sampling._buckets = [(list(range(active_request_count)), 1.0, 1, 0.0)]
+        ctrl._sampling._bucket_index_tensors = [
             torch.arange(active_request_count, device='cuda', dtype=torch.long)
         ]
 

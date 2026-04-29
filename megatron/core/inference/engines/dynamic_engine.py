@@ -50,7 +50,7 @@ from megatron.core.inference.utils import (
     unset_inference_cuda_graphed_iteration_for_ep_inference,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs, graph_capture
+from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -407,6 +407,16 @@ class DynamicInferenceEngine(AbstractEngine):
             with torch.inference_mode():
                 controller._dynamic_step_forward_logits(input_ids, position_ids)
 
+                # Sampling warm-up. The non-speculative path captures `sample_kernel`
+                # keyed by `("sample", padded_active_request_count)`; the speculative
+                # path additionally captures `("sample_speculative", padded_decode, 0)`
+                # for decode-only graphs. Other backends and mixed graphs run eagerly.
+                controller._dynamic_step_sample_bookkeeping()
+                if controller.num_speculative_tokens > 0:
+                    controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                else:
+                    controller._dynamic_step_sample_logits()
+
                 # MTP CUDA graph warmup for this batch dimension.
                 if mtp_warmup_enabled:
                     n = cuda_graph_batch_dimension.req_count
@@ -418,21 +428,17 @@ class DynamicInferenceEngine(AbstractEngine):
                         batch_dim = n // tp_size if sp_enabled else n
                         # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
                         for depth in mtp_warmup_depths:
-                            with graph_capture():
-                                unwrapped.compute_mtp_single_step(
-                                    hidden_states=torch.zeros(
-                                        (batch_dim, 1, model_config.hidden_size),
-                                        device=device,
-                                        dtype=model_config.params_dtype,
-                                    ),
-                                    next_token_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.long
-                                    ),
-                                    position_ids=torch.zeros(
-                                        (1, n), device=device, dtype=torch.int64
-                                    ),
-                                    depth=depth,
-                                )
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                                cache_key=("mtp", n, depth),
+                            )
 
                 context.reset()
 
@@ -441,7 +447,6 @@ class DynamicInferenceEngine(AbstractEngine):
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
-            controller.has_mtp_cuda_graphs = True
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
