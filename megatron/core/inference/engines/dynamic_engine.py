@@ -407,8 +407,22 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
+            print(
+                f"[DEBUG] WARMUP iter={tbar_idx} requested_dim={cuda_graph_batch_dimension}",
+                flush=True,
+            )
             input_ids, position_ids = self.controller._dynamic_step_context_init(
                 construct_graph_dimensions=cuda_graph_batch_dimension
+            )
+            print(
+                f"[DEBUG] WARMUP iter={tbar_idx} after_context_init "
+                f"padded_batch_dimensions={context.padded_batch_dimensions} "
+                f"is_decode_only={context.is_decode_only()} "
+                f"materialize_only_last={context.config.materialize_only_last_token_logits} "
+                f"total_request_count={context.total_request_count} "
+                f"paused_request_count={context.paused_request_count} "
+                f"num_speculative_tokens={context.num_speculative_tokens}",
+                flush=True,
             )
             # Progress.
             tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
@@ -427,6 +441,12 @@ class DynamicInferenceEngine(AbstractEngine):
             controller._pre_init_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(controller._pre_init_bookkeeping_stream):
                 controller._dynamic_step_log_probs_bookkeeping()
+            print(
+                f"[DEBUG] WARMUP iter={tbar_idx} pre log_probs_indexing "
+                f"padded_batch_dimensions={context.padded_batch_dimensions} "
+                f"is_decode_only={context.is_decode_only()}",
+                flush=True,
+            )
             controller._dynamic_step_log_probs_indexing()
 
             # Enable routing recording during warmup if routing replay is enabled.

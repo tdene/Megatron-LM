@@ -70,11 +70,24 @@ class LogProbsDecode:
         # nonzero_static keeps the output shape fixed (= padded_count) for graph capture;
         # trailing entries past log_prob_request_count are sliced off later, during extract.
         padded_count = context.padded_active_request_count
+        mask_slice = context.active_request_metadata["return_log_probs"][:padded_count]
+        print(
+            f"[DEBUG] DecodeIdxKernel padded_count={padded_count} "
+            f"mask_sum={int(mask_slice.sum().item())} "
+            f"padded_dim={context.padded_batch_dimensions} "
+            f"is_decode_only={context.is_decode_only()}",
+            flush=True,
+        )
         request_indices = torch.nonzero_static(
-            context.active_request_metadata["return_log_probs"][:padded_count], size=padded_count
+            mask_slice, size=padded_count
         ).squeeze(1)
         # Row range over the gather space; used by softmax_kernel to address per-row sampled tokens.
         padded_arange = torch.arange(padded_count, device=request_indices.device)
+        print(
+            f"[DEBUG] DecodeIdxKernel result request_indices={request_indices.tolist()} "
+            f"padded_arange.shape={tuple(padded_arange.shape)}",
+            flush=True,
+        )
         return request_indices, padded_arange
 
     @staticmethod
@@ -101,6 +114,28 @@ class LogProbsDecode:
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
+        print(
+            f"[DEBUG] DecodeSoftmaxKernel ENTER "
+            f"logits.shape={tuple(logits.shape)} "
+            f"new_tokens.shape={tuple(new_tokens.shape)} new_tokens.dtype={new_tokens.dtype} "
+            f"request_indices.shape={tuple(request_indices.shape)} "
+            f"request_indices.dtype={request_indices.dtype} "
+            f"padded_arange.shape={tuple(padded_arange.shape)}",
+            flush=True,
+        )
+        # Reduce request_indices and new_tokens to CPU stats so we can sanity-check
+        # bounds without trying to print huge tensors.
+        ri_min = int(request_indices.min().item()) if request_indices.numel() else -1
+        ri_max = int(request_indices.max().item()) if request_indices.numel() else -1
+        nt_min = int(new_tokens.min().item()) if new_tokens.numel() else -1
+        nt_max = int(new_tokens.max().item()) if new_tokens.numel() else -1
+        print(
+            f"[DEBUG] DecodeSoftmaxKernel BOUNDS "
+            f"request_indices=[{ri_min}, {ri_max}] (logits.dim1={logits.shape[1]}, "
+            f"new_tokens.size={new_tokens.shape[0]}) "
+            f"new_tokens=[{nt_min}, {nt_max}] (logits.dim2={logits.shape[2]})",
+            flush=True,
+        )
         # Gather only the rows we need; the same indices select the matching sampled token per row.
         selected_tokens = new_tokens[request_indices]
         selected_logits = logits.squeeze(0)[request_indices].float()
