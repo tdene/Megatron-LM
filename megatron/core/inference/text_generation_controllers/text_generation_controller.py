@@ -1110,46 +1110,19 @@ class TextGenerationController:
         # time (see DynamicInferenceEngine.add_request), so checking
         # log_prob_count alone covers the top-n case too.
         self._pre_init_bookkeeping_event.synchronize()
-        log_prob_count = self._log_prob_count_pinned.item()
-        if log_prob_count == 0:
-            print(
-                f"[DEBUG] indexing log_prob_count=0 SKIP "
-                f"padded_dim={self.inference_wrapped_model.inference_context.padded_batch_dimensions} "
-                f"is_decode_only={self.inference_wrapped_model.inference_context.is_decode_only()}",
-                flush=True,
-            )
+        if self._log_prob_count_pinned.item() == 0:
             return
 
         context = self.inference_wrapped_model.inference_context
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
 
         if context.num_speculative_tokens > 0:
-            print(
-                f"[DEBUG] indexing dispatch=SPECULATIVE "
-                f"padded_dim={context.padded_batch_dimensions} eager={eager} "
-                f"log_prob_count={log_prob_count}",
-                flush=True,
-            )
             self._log_probs_speculative.prefill_indexing(context, eager=eager)
             return
 
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            print(
-                f"[DEBUG] indexing dispatch=DECODE "
-                f"padded_dim={context.padded_batch_dimensions} eager={eager} "
-                f"materialize_only_last={context.config.materialize_only_last_token_logits} "
-                f"is_decode_only={context.is_decode_only()} "
-                f"log_prob_count={log_prob_count}",
-                flush=True,
-            )
             self._log_probs_decode.indexing(context, eager=eager)
         else:
-            print(
-                f"[DEBUG] indexing dispatch=PREFILL "
-                f"padded_dim={context.padded_batch_dimensions} eager={eager} "
-                f"log_prob_count={log_prob_count}",
-                flush=True,
-            )
             self._log_probs_prefill.indexing(context, eager=eager)
 
     def _dynamic_step_log_probs_softmax(self):
@@ -1231,19 +1204,10 @@ class TextGenerationController:
         """Calculate log probs from logits."""
         log_prob_request_count = self._log_prob_count_pinned.item()
         top_n_max = self._top_n_max_pinned.item()
-        context = self.inference_wrapped_model.inference_context
-        print(
-            f"[DEBUG] calculate_log_probs ENTRY "
-            f"padded_dim={context.padded_batch_dimensions} "
-            f"is_decode_only={context.is_decode_only()} "
-            f"materialize_only_last={context.config.materialize_only_last_token_logits} "
-            f"log_prob_request_count={log_prob_request_count} top_n_max={top_n_max} "
-            f"num_speculative_tokens={context.num_speculative_tokens}",
-            flush=True,
-        )
         if log_prob_request_count == 0:
-            print("[DEBUG] calculate_log_probs SKIP (count=0)", flush=True)
             return None
+
+        context = self.inference_wrapped_model.inference_context
 
         logits_seq_len = (
             context.padded_num_last_token_logits
@@ -1253,17 +1217,8 @@ class TextGenerationController:
         logits = self._all_logits_cuda[:, :logits_seq_len, :]
         new_tokens = self._sampled_tokens_cuda[: context.padded_active_request_count]
         eager = not (self._enable_cuda_graph and context.using_cuda_graph_this_step())
-        print(
-            f"[DEBUG] calculate_log_probs SHAPES "
-            f"logits.shape={tuple(logits.shape)} "
-            f"new_tokens.shape={tuple(new_tokens.shape)} "
-            f"new_tokens.dtype={new_tokens.dtype} "
-            f"eager={eager} using_cuda_graph={context.using_cuda_graph_this_step()}",
-            flush=True,
-        )
 
         if context.num_speculative_tokens > 0:
-            print("[DEBUG] calculate_log_probs DISPATCH=SPECULATIVE", flush=True)
             return self._log_probs_speculative.calculate(
                 context,
                 logits,
@@ -1275,7 +1230,6 @@ class TextGenerationController:
                 top_n_max=top_n_max,
             )
         if context.config.materialize_only_last_token_logits or context.is_decode_only():
-            print("[DEBUG] calculate_log_probs DISPATCH=DECODE", flush=True)
             return self._log_probs_decode.calculate(
                 context,
                 logits,
@@ -1284,7 +1238,6 @@ class TextGenerationController:
                 eager=eager,
                 top_n_max=top_n_max,
             )
-        print("[DEBUG] calculate_log_probs DISPATCH=PREFILL", flush=True)
         return self._log_probs_prefill.calculate(
             context, logits, new_tokens, log_prob_request_count, eager=eager, top_n_max=top_n_max
         )

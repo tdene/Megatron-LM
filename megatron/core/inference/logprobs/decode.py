@@ -174,25 +174,7 @@ class LogProbsDecode:
             eager (bool): If True, skip CUDA graph capture/replay for the kernels.
         """
         key = ("decode_idx", context.padded_batch_dimensions)
-        padded_count = context.padded_active_request_count
-        mask_sum = int(
-            context.active_request_metadata["return_log_probs"][:padded_count].sum().item()
-        )
-        print(
-            f"[DEBUG] DecodeIdx.indexing PRE padded_dim={context.padded_batch_dimensions} "
-            f"padded_count={padded_count} mask_sum={mask_sum} eager={eager} key={key}",
-            flush=True,
-        )
         self._ri, self._padded_arange = self.indexing_kernel(context, eager=eager, cache_key=key)
-        # Sync so the captured kernel's output buffer is filled before we read it.
-        torch.cuda.synchronize()
-        ri_list = self._ri.tolist()
-        print(
-            f"[DEBUG] DecodeIdx.indexing POST request_indices(self._ri)={ri_list} "
-            f"shape={tuple(self._ri.shape)} dtype={self._ri.dtype} "
-            f"padded_arange.shape={tuple(self._padded_arange.shape)}",
-            flush=True,
-        )
 
     def calculate(
         self,
@@ -221,22 +203,6 @@ class LogProbsDecode:
         # Run softmax on the main stream (graph-captured under a per-shape key).
         ri, padded_arange = self._ri, self._padded_arange
         key = ("decode_sm", context.padded_batch_dimensions)
-        # Sync so we can read the static buffers without breaking capture later.
-        torch.cuda.synchronize()
-        ri_min = int(ri.min().item()) if ri.numel() else -1
-        ri_max = int(ri.max().item()) if ri.numel() else -1
-        nt_min = int(new_tokens.min().item()) if new_tokens.numel() else -1
-        nt_max = int(new_tokens.max().item()) if new_tokens.numel() else -1
-        print(
-            f"[DEBUG] DecodeSm.calculate PRE padded_dim={context.padded_batch_dimensions} "
-            f"logits.shape={tuple(logits.shape)} new_tokens.shape={tuple(new_tokens.shape)} "
-            f"ri.shape={tuple(ri.shape)} ri.dtype={ri.dtype} "
-            f"ri=[{ri_min}, {ri_max}] (logits.dim1={logits.shape[1]}, "
-            f"new_tokens.size={new_tokens.shape[0]}) "
-            f"new_tokens=[{nt_min}, {nt_max}] (logits.dim2={logits.shape[2]}) "
-            f"eager={eager} key={key}",
-            flush=True,
-        )
         slp, lse = self.softmax_kernel(
             logits, new_tokens, ri, padded_arange, eager=eager, cache_key=key
         )
