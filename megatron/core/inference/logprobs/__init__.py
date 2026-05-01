@@ -64,7 +64,35 @@ from megatron.core.inference.logprobs.decode import LogProbsDecode
 from megatron.core.inference.logprobs.prefill import LogProbsPrefill
 from megatron.core.inference.logprobs.speculative import LogProbsSpeculative
 
-__all__ = ["LogProbsDecode", "LogProbsPrefill", "LogProbsSpeculative", "calculate_log_probs"]
+__all__ = [
+    "LogProbsDecode",
+    "LogProbsPrefill",
+    "LogProbsSpeculative",
+    "calculate_log_probs",
+    "get_log_probs_mempool",
+]
+
+
+# Shared CUDA-graph mempool for all log_probs captures. Kept separate from
+# `CudaGraphManager.global_mempool` so log_probs's static buffers can't be
+# aliased by intermediates of forward / sample / MTP captures (and vice versa).
+# This is required for correctness because parts of log_probs already overlap
+# with forward / sample on dedicated streams (`_pre_forward_bookkeeping_stream`,
+# `_post_forward_bookkeeping_stream`); concurrent replays from a shared
+# mempool race over allocator-reused addresses.
+_LOG_PROBS_MEMPOOL = None
+
+
+def get_log_probs_mempool():
+    """Return the shared CUDA-graph mempool handle used by all log_probs captures.
+
+    Lazily allocated on first call so we don't create a pool when not needed
+    (eager-only configurations, tests, etc.).
+    """
+    global _LOG_PROBS_MEMPOOL
+    if _LOG_PROBS_MEMPOOL is None:
+        _LOG_PROBS_MEMPOOL = torch.cuda.graph_pool_handle()
+    return _LOG_PROBS_MEMPOOL
 
 
 try:

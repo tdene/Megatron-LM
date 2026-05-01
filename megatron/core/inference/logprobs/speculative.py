@@ -40,12 +40,16 @@ class LogProbsSpeculative:
         # Pinned CPU scalar holding `num_decode * spec_plus_one`.
         self._prefill_offset_pinned = torch.zeros(1, dtype=torch.int64).pin_memory()
         if config is not None and config.cuda_graph_impl == "local":
+            from megatron.core.inference.logprobs import get_log_probs_mempool
+
+            log_probs_pool = get_log_probs_mempool()
             CudaGraphManager(
                 config,
                 self,
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
             CudaGraphManager(
                 config,
@@ -53,6 +57,7 @@ class LogProbsSpeculative:
                 function_name="gather_kernel",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
             CudaGraphManager(
                 config,
@@ -60,6 +65,7 @@ class LogProbsSpeculative:
                 function_name="prefill_indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
             # Thin wrapper: delegates to LogProbsPrefill's static method.
             CudaGraphManager(
@@ -68,6 +74,7 @@ class LogProbsSpeculative:
                 function_name="_prefill_softmax",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
 
     @staticmethod

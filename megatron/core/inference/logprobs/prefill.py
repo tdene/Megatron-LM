@@ -38,12 +38,16 @@ class LogProbsPrefill:
         self._topn_stream = topn_stream
         self._topn_event = topn_event
         if config is not None and config.cuda_graph_impl == "local":
+            from megatron.core.inference.logprobs import get_log_probs_mempool
+
+            log_probs_pool = get_log_probs_mempool()
             CudaGraphManager(
                 config,
                 self,
                 function_name="indexing_kernel",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
             CudaGraphManager(
                 config,
@@ -51,6 +55,7 @@ class LogProbsPrefill:
                 function_name="softmax_kernel",
                 need_backward=False,
                 inline_capture=True,
+                mempool=log_probs_pool,
             )
 
     @staticmethod
