@@ -1558,8 +1558,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         bookkeep_for_step = context_state.get("step_count", -1)
         if self.rank == 0:
+            _num_active = (
+                step_result["active_request_ids"].numel()
+                if step_result is not None
+                else 0
+            )
             print(
                 f"OVERLAP_TEST kind=bk_start bookkeep_for_step={bookkeep_for_step} "
+                f"step_result_none={step_result is None} num_active={_num_active} "
                 f"t={time.perf_counter():.6f}",
                 flush=True,
             )
@@ -1795,6 +1801,13 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_top_n_logprobs.append(logit_dict)
                         else:
                             request.generated_top_n_logprobs.append(logit_dict)
+
+            if self.rank == 0:
+                print(
+                    f"OVERLAP_TEST kind=bk_after_perreq bookkeep_for_step={bookkeep_for_step} "
+                    f"t={time.perf_counter():.6f}",
+                    flush=True,
+                )
 
             # Eviction bookkeeping (waiting_request_ids was already updated in prepare).
             for evicted_id in work.get("evict_list", []):
