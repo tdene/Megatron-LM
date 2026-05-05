@@ -1491,9 +1491,21 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
 
         self.step_start_event.record()
+        if self.rank == 0:
+            print(
+                f"OVERLAP_TEST kind=fwd_start step={self.context.step_count} "
+                f"t={time.perf_counter():.6f}",
+                flush=True,
+            )
         self._can_bookkeep.set()
         result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         self.step_end_event.record()
+        if self.rank == 0:
+            print(
+                f"OVERLAP_TEST kind=fwd_end step={self.context.step_count} "
+                f"t={time.perf_counter():.6f}",
+                flush=True,
+            )
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
@@ -1543,6 +1555,14 @@ class DynamicInferenceEngine(AbstractEngine):
         context_state = work["context_state"]
         sync_time = work["sync_time"]
         step_time = work["step_time"]
+
+        bookkeep_for_step = context_state.get("step_count", -1)
+        if self.rank == 0:
+            print(
+                f"OVERLAP_TEST kind=bk_start bookkeep_for_step={bookkeep_for_step} "
+                f"t={time.perf_counter():.6f}",
+                flush=True,
+            )
 
         active_request_ids: list[int] = []
         finished_request_records: list[DynamicInferenceRequestRecord] = []
@@ -1946,6 +1966,13 @@ class DynamicInferenceEngine(AbstractEngine):
                 self._prefix_cache_blocks_matched = 0
 
         nvtx_range_pop("bookkeeping")
+
+        if self.rank == 0:
+            print(
+                f"OVERLAP_TEST kind=bk_end bookkeep_for_step={bookkeep_for_step} "
+                f"t={time.perf_counter():.6f}",
+                flush=True,
+            )
 
         return {
             "active_request_ids": active_request_ids,
