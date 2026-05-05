@@ -1492,7 +1492,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.step_start_event.record()
         self._can_bookkeep.set()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(loop=self._loop)
         self.step_end_event.record()
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
