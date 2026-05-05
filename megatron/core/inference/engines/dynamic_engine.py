@@ -1720,23 +1720,20 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         is_decode_only = self.context.is_decode_only()
+        # These four are consumed every step:
+        # - active_token_count, step_count: by post_process_requests' pre_fwd_* args.
+        # - total_request_count, paused_request_count: by the flops_calculator block
+        #   in async_bookkeep (added by tde/mfu_tracking; reads are unconditional).
+        pre_step_context_state = {
+            "active_token_count": self.context.active_token_count,
+            "step_count": self.context.step_count,
+            "total_request_count": self.context.total_request_count,
+            "paused_request_count": self.context.paused_request_count,
+        }
         if will_log_this_step:
-            pre_step_context_state = {
-                "is_decode_only": is_decode_only,
-                "max_requests": self.context.max_requests,
-                "total_request_count": self.context.total_request_count,
-                "paused_request_count": self.context.paused_request_count,
-                "active_token_count": self.context.active_token_count,
-                "step_count": self.context.step_count,
-            }
-        else:
-            # active_token_count and step_count are still consumed by
-            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
-            # the other four fields are only read in the gated print block.
-            pre_step_context_state = {
-                "active_token_count": self.context.active_token_count,
-                "step_count": self.context.step_count,
-            }
+            # is_decode_only and max_requests are only read in the gated print block.
+            pre_step_context_state["is_decode_only"] = is_decode_only
+            pre_step_context_state["max_requests"] = self.context.max_requests
 
         # Generate tokens.
         nvtx_range_push("Prefill" if not is_decode_only else "Decode")
@@ -1757,6 +1754,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         nvtx_range_pop("Prefill" if not is_decode_only else "Decode")
 
+        # total_active_used_blocks is read every step by the flops_calculator block
+        # in async_bookkeep, so populate it regardless of will_log_this_step.
+        post_step_always = {
+            "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+        }
         if will_log_this_step:
             kvcache_util_stats = (
                 self.context.get_kvcache_utilization_stats()
@@ -1770,14 +1772,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 "kv_stats": kvcache_util_stats,
                 "total_active_block_count": self.context.kv_block_allocator.active_count,
                 "total_paused_block_count": self.context.kv_block_allocator.paused_count,
-                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
                 "total_paused_used_blocks": self.context.kv_block_allocator.get_paused_used(),
             }
-            context_state = {**pre_step_context_state, **post_step_context_state}
+            context_state = {
+                **pre_step_context_state,
+                **post_step_always,
+                **post_step_context_state,
+            }
         else:
             # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
-            context_state = {**pre_step_context_state, "kv_stats": None}
+            context_state = {**pre_step_context_state, **post_step_always, "kv_stats": None}
 
         return result, context_state, step_time
 
