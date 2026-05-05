@@ -1756,6 +1756,14 @@ class TextGenerationController:
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
             range_pop()
 
+        import time as _t
+        import torch.distributed as _td
+        if _td.get_rank() == 0:
+            print(
+                f"OVERLAP_TEST kind=ctl_pre_record gpu_done_done={gpu_done._done} "
+                f"t={_t.perf_counter():.6f}",
+                flush=True,
+            )
         # Trigger a faux-interrupt on the event loop after the forward pass GPU work completes.
         # The actual await happens after the CPU has also enqueued sampling work.
         # This allows the GPU to continue working (on sampling) while the faux-interrupt is handled.
@@ -1772,7 +1780,18 @@ class TextGenerationController:
                 self._dynamic_step_sample_logits()
                 nvtx_range_pop("sampling")
 
+            if _td.get_rank() == 0:
+                print(
+                    f"OVERLAP_TEST kind=ctl_pre_await gpu_done_done={gpu_done._done} "
+                    f"t={_t.perf_counter():.6f}",
+                    flush=True,
+                )
             await gpu_done
+            if _td.get_rank() == 0:
+                print(
+                    f"OVERLAP_TEST kind=ctl_post_await t={_t.perf_counter():.6f}",
+                    flush=True,
+                )
 
             if self.num_speculative_tokens > 0:
                 # Phase 2: Rewind KV cache for rejected tokens.
