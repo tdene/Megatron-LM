@@ -1470,8 +1470,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
         active_count = self.total_request_count - self.paused_request_count
-        lengths = self.request_kv_length_offsets + self.request_query_lengths
-        return lengths[:active_count]
+        # ``request_query_lengths`` is sized ``max_requests + 1`` (sentinel slot
+        # for per_request_logprobs's ``nonzero_static`` fill_value), but
+        # ``request_kv_length_offsets`` is ``max_requests``. Slice both to the
+        # active prefix so the broadcast shape matches.
+        return (
+            self.request_kv_length_offsets[:active_count]
+            + self.request_query_lengths[:active_count]
+        )
 
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
@@ -3127,7 +3133,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         p = perm
         s = target
         self.request_kv_length_offsets[s] = self.request_kv_length_offsets[p]
-        self.request_query_lengths[s] = self.request_query_lengths[p]
+        # ``request_query_lengths`` reserves a trailing sentinel slot at index
+        # ``max_requests`` (sized ``max_requests + 1``) for per_request_logprobs;
+        # only the ``[:max_requests]`` prefix participates in permutation. The
+        # slice is a writable view, so the indexed assignment lands in the
+        # underlying tensor and the sentinel slot stays at 0 forever.
+        rql = self.request_query_lengths[: self.max_requests]
+        rql[s] = rql[p]
         self.request_output_lengths[s] = self.request_output_lengths[p]
         self.request_ids[s] = self.request_ids[p]
         self.request_in_prefill_status_tensor[s] = self.request_in_prefill_status_tensor[p]
@@ -4163,11 +4175,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         # ``addcmul_`` fuses the query_length * is_active_f mul with the add,
         # avoiding the temp the unfused ``add_(query * is_active_f)`` allocates
         # at every replay.
+        # ``request_query_lengths`` reserves a trailing sentinel slot at index
+        # ``max_requests`` (sized ``max_requests + 1``) for per_request_logprobs;
+        # the writeback only operates on the ``[:max_requests]`` prefix so the
+        # sentinel stays at 0 forever. The slice returns a writable view, so
+        # in-place ops propagate to the underlying tensor.
+        rql = self.request_query_lengths[: self.max_requests]
         self.request_kv_length_offsets.addcmul_(
-            self.request_query_lengths.to(self.request_kv_length_offsets.dtype), is_active_f
+            rql.to(self.request_kv_length_offsets.dtype), is_active_f
         )
-        self.request_query_lengths.mul_(is_alive_f.to(self.request_query_lengths.dtype))
-        self.request_query_lengths.masked_fill_(is_active_post, num_gen)
+        rql.mul_(is_alive_f.to(rql.dtype))
+        rql.masked_fill_(is_active_post, num_gen)
         self.request_kv_length_offsets.mul_(is_alive_f)
         self.request_output_lengths.mul_(is_alive_f.to(self.request_output_lengths.dtype))
         self.request_last_kv_block_offset.copy_(
