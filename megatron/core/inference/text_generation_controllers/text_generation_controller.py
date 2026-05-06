@@ -36,6 +36,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -223,7 +224,53 @@ class TextGenerationController:
         self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
+        # Wrap the graphable attention-init body so each CUDA-graph bucket
+        # captures its own version. ``_apply_bucket_toggles`` runs inside the
+        # captured body so the per-bucket MoE / symmetric-AR toggles are
+        # baked into the graph.
+        if self._enable_cuda_graph:
+            CudaGraphManager(
+                self.model_config,
+                context,
+                function_name="run_attn_init_graph_body",
+                need_backward=False,
+                inline_capture=True,
+                num_warmup_steps=1,
+            )
+        context._init_body_hooks.append(self._apply_bucket_toggles)
+
+        if self.model_config.transformer_impl == "inference_optimized":
+            assert not self.model_config.moe_pad_experts_for_cuda_graph_inference, (
+                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
+                "transformer_impl is 'inference_optimized'"
+            )
+
         self._init_mtp_sampling_tensors()
+
+    def _apply_bucket_toggles(self, using_graph: bool) -> None:
+        """Apply MoE / symmetric-AR toggles for the current CUDA-graph bucket.
+
+        Registered as a hook on the inference context so it runs inside
+        ``run_attn_init_graph_body`` (and therefore inside the captured
+        graph). ``using_graph`` is ``True`` when the body runs as part of a
+        graph capture / replay; ``False`` for eager-mode steps.
+        """
+        cfg = self.model_config
+        context = self.inference_wrapped_model.inference_context
+
+        if cfg.moe_pad_experts_for_cuda_graph_inference:
+            if using_graph:
+                set_decode_expert_padding(
+                    self._unwrapped_model,
+                    True,
+                    capacity_factor=cfg.num_moe_experts / cfg.moe_router_topk,
+                )
+            else:
+                set_decode_expert_padding(self._unwrapped_model, False)
+
+        if cfg.nccl_all_reduce_for_prefill and cfg.symmetric_ar_type is not None:
+            target = cfg.symmetric_ar_type if context.is_decode_only() else None
+            self._unwrapped_model.set_symmetric_ar(target)
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -578,17 +625,16 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
-        # Initialize attention state (100% CPU computation).
+        # Initialize attention state. Three-phase orchestration:
+        # CPU-side prepare -> graphable body (per-bucket CudaGraphManager) ->
+        # CPU-side finalize. The unified-buffer H2D and the GPU compute that
+        # builds the per-step active tensors and runs Mamba update both
+        # happen inside the captured body.
         range_push("initialize_attention_state")
         context.initialize_attention_state(
             construct_graph_dimensions=construct_graph_dimensions,
             is_expert_parallel_dummy_cuda_graph_step=is_dummy_forward,
         )
-        range_pop()
-
-        # Single batch CPU-to-GPU transfer of bookkeeping state.
-        range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -605,34 +651,10 @@ class TextGenerationController:
         else:
             self._mtp_resolved_padded_count = None
 
-        # If using symmetric kernels and we are using using nccl
-        # for prefill turn off symmetric kernels
-        symmetric_ar_type = self.model_config.symmetric_ar_type
-        nccl_all_reduce_for_prefill = self.model_config.nccl_all_reduce_for_prefill
-        # Turning on/off MoE padding for cuda-graphs
-        moe_pad_experts_for_cuda_graph_inference = (
-            self.model_config.moe_pad_experts_for_cuda_graph_inference
-        )
-        is_inference_optimized = self.model_config.transformer_impl == "inference_optimized"
-        if is_inference_optimized:
-            assert not moe_pad_experts_for_cuda_graph_inference, (
-                "moe_pad_experts_for_cuda_graph_inference cannot be True when "
-                "transformer_impl is 'inference_optimized'"
-            )
-        if moe_pad_experts_for_cuda_graph_inference:
-            if context.using_cuda_graph_this_step():
-                capacity_factor = model_config.num_moe_experts / model_config.moe_router_topk
-                set_decode_expert_padding(unwrapped_model, True, capacity_factor=capacity_factor)
-            else:
-                set_decode_expert_padding(unwrapped_model, False)
-
-        if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
-            if context.is_decode_only():
-                # Turn on symmetric all reduce when in decode mode
-                unwrapped_model.set_symmetric_ar(symmetric_ar_type)
-            else:
-                # Turn off symmetric all reduces for prefill
-                unwrapped_model.set_symmetric_ar(None)
+        # MoE / symmetric-AR bucket toggles are now applied from inside
+        # ``run_attn_init_graph_body`` via the ``_apply_bucket_toggles`` hook
+        # registered on the inference context, so they are baked into each
+        # captured per-bucket graph.
 
         # Get flat tokens, position ids.
         # If we are running a dummy forward step we want to use the token count agreed upon
@@ -970,7 +992,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
+        # `_pad_gpu_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
@@ -1429,7 +1451,7 @@ class TextGenerationController:
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
-        # Use the snapshot taken during build_active_slices: active_request_ids holds the
+        # Use the snapshot taken during _build_cpu_active_slices: active_request_ids holds the
         # request IDs that were active when the step started (before update_requests
         # rearranges slots).
         active_request_ids = context.active_request_ids[:active_request_count]

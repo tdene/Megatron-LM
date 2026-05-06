@@ -579,9 +579,8 @@ class TestDynamicContext:
         mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
         assert mamba_idx >= 0
 
-        # Mamba state zeroing is deferred until transfer_bookkeeping_to_gpu().
+        # Mamba state zeroing runs as part of the attention-state init.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
         assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 
@@ -1157,7 +1156,6 @@ class TestDynamicContext:
 
         # Populate gpu_view again after update_requests modified bookkeeping state.
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
         decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
@@ -1221,7 +1219,6 @@ class TestDynamicContext:
         # This step will involve both prefill (for the new request) and decode (for existing requests).
 
         dynamic_context.initialize_attention_state()
-        dynamic_context.transfer_bookkeeping_to_gpu()
 
         mixed_step_logits = torch.randn(
             1,
@@ -1359,7 +1356,7 @@ class TestDynamicContext:
         top_n = 5
 
         def _set_active_metadata(n: int):
-            # build_active_slices (run from initialize_attention_state) overwrites
+            # _build_cpu_active_slices (run from initialize_attention_state) overwrites
             # active_request_metadata from request_metadata, so we patch it after.
             dynamic_context.active_request_metadata["top_n_logprobs"][:n].fill_(top_n)
             dynamic_context.active_request_metadata["skip_prompt_log_probs"][:n].fill_(
@@ -3034,7 +3031,7 @@ class TestDynamicContext:
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
             h = ctx.kv_block_allocator.block_hashes[bid].item()
-            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
+            assert h in ctx.prefix_cache_registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3576,7 +3573,7 @@ class TestDynamicContext:
         assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
-    #  Tests for active_logit_idxs / last_token_logits / pad_active_slices
+    #  Tests for active_logit_idxs / last_token_logits / _pad_gpu_active_slices
     # ------------------------------------------------------------------ #
 
     def _build_speculative_ctx(self, num_speculative_tokens=2, block_size=256):
@@ -3622,7 +3619,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_decode_only(self):
+    def test_pad_gpu_active_slices_speculative_decode_only(self):
         """Verify active_logit_idxs for a decode-only batch with speculative tokens."""
         num_decode = 3
         num_spec = 2
@@ -3647,7 +3644,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_mixed_batch(self):
+    def test_pad_gpu_active_slices_speculative_mixed_batch(self):
         """Verify active_logit_idxs for a mixed decode+prefill batch with speculative tokens."""
         num_decode = 2
         num_spec = 2
@@ -3688,7 +3685,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_speculative_all_prefill(self):
+    def test_pad_gpu_active_slices_speculative_all_prefill(self):
         """Verify active_logit_idxs with only prefill requests (no decode) and speculative tokens."""
         num_spec = 2
         ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
@@ -3721,7 +3718,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_pad_active_slices_no_speculative_tokens(self):
+    def test_pad_gpu_active_slices_no_speculative_tokens(self):
         """Verify active_logit_idxs without speculative tokens matches cumsum - 1."""
         ctx = self._build_speculative_ctx(num_speculative_tokens=0)
 

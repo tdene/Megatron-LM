@@ -118,9 +118,10 @@ def calculate_log_probs(
         return [], None
 
     # Refresh `gpu_return_log_probs_mask` from CPU pinned `active_request_metadata`.
-    # Production runs `transfer_bookkeeping_to_gpu` before this entry point; tests
-    # often mutate the CPU mask between the H2D and the call here, so re-stage the
-    # GPU mirror to make this helper safe to call standalone.
+    # Production stages the GPU mirror inside `run_attn_init_graph_body` (alongside
+    # the unified bookkeeping H2D); tests often mutate the CPU mask between that
+    # H2D and the call here, so re-stage the mirror to make this helper safe to
+    # call standalone.
     padded = context.padded_active_request_count
     context.gpu_return_log_probs_mask[:padded].copy_(
         context.active_request_metadata["return_log_probs"][:padded]

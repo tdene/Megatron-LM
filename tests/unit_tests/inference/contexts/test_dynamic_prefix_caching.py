@@ -214,8 +214,8 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx.add_request(req)
         b0, b1 = self._block_ids(ctx, 0, 2)
         h0, h1 = req.precomputed_block_hashes
-        assert alloc.kv_hash_to_block_id.get(h0) == b0
-        assert alloc.kv_hash_to_block_id.get(h1) == b1
+        assert ctx.prefix_cache_registry.kv_hash_to_block_id.get(h0) == b0
+        assert ctx.prefix_cache_registry.kv_hash_to_block_id.get(h1) == b1
         assert alloc.block_hashes[b0].item() == h0 and alloc.block_hashes[b1].item() == h1
 
         # partial block not registered
@@ -244,7 +244,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx4.add_request(self._req(ctx4, p4.clone()))
         req2 = self._req(ctx4, p4.clone(), request_id=2)
         for h in req2.precomputed_block_hashes:
-            assert h in alloc4.kv_hash_to_block_id
+            assert h in ctx4.prefix_cache_registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     def test_block_sharing_patterns(self):
@@ -392,9 +392,15 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         b0_hash = alloc.block_hashes[b0].item()
         assert alloc.block_ref_counts[b0].item() == 2
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.block_ref_counts[b0].item() == 1
+            and b0_hash in ctx.prefix_cache_registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.block_ref_counts[b0].item() == 0
+            and b0_hash in ctx.prefix_cache_registry.kv_hash_to_block_id
+        )
 
         # cached blocks reused by new request
         ctx2 = self._ctx()
@@ -443,9 +449,15 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         b0_hash = alloc.block_hashes[b0].item()
         avail_before = alloc.total_avail
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
-        assert alloc.block_ref_counts[b0].item() == 1 and b0_hash in alloc.kv_hash_to_block_id
+        assert (
+            alloc.block_ref_counts[b0].item() == 1
+            and b0_hash in ctx.prefix_cache_registry.kv_hash_to_block_id
+        )
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([1]))
-        assert alloc.block_ref_counts[b0].item() == 0 and b0_hash not in alloc.kv_hash_to_block_id
+        assert (
+            alloc.block_ref_counts[b0].item() == 0
+            and b0_hash not in ctx.prefix_cache_registry.kv_hash_to_block_id
+        )
         assert alloc.block_hashes[b0].item() == -1 and alloc.block_hashes[b1].item() == -1
         assert alloc.total_avail == avail_before + 2
 
@@ -495,8 +507,10 @@ class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
         # no caching attrs on disabled allocator
         alloc_d = ctx.kv_block_allocator
         assert not hasattr(alloc_d, 'block_hashes')
-        assert not hasattr(alloc_d, 'kv_hash_to_block_id')
         assert not hasattr(alloc_d, 'block_ref_counts')
+        # The hash dict lives on the registry; with prefix caching disabled
+        # nothing ever calls register_kv, so it stays empty.
+        assert len(ctx.prefix_cache_registry.kv_hash_to_block_id) == 0
 
         # REF_ZERO lacks timestamps
         ctx_rz = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
@@ -678,9 +692,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p5 = self._prompt(bs * 3)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         msa5 = ctx5.mamba_slot_allocator
-        assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 0
+        assert (
+            len(ctx5.prefix_cache_registry.kv_hash_to_block_id) == 3
+            and len(ctx5.prefix_cache_registry.mamba_hash_to_block_id) == 0
+        )
         self._mamba_allocate_and_register(ctx5, self._block_ids(ctx5, 0, 3)[:2])
-        assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 2
+        assert (
+            len(ctx5.prefix_cache_registry.kv_hash_to_block_id) == 3
+            and len(ctx5.prefix_cache_registry.mamba_hash_to_block_id) == 2
+        )
 
         # find_mamba_match_count
         ctx6 = self._mctx()
@@ -775,9 +795,15 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         bid5 = ctx5.request_to_kv_block_ids[0][0].item()
         bh5 = alloc5.block_hashes[bid5].item()
         self._mamba_allocate_and_register(ctx5, [bid5])
-        assert msa5.has_state(bid5) and bh5 in msa5.hash_to_block_id
+        assert (
+            msa5.has_state(bid5)
+            and bh5 in ctx5.prefix_cache_registry.mamba_hash_to_block_id
+        )
         ctx5.release_memory_blocks_from_request_indexes([0])
-        assert not msa5.has_state(bid5) and bh5 not in msa5.hash_to_block_id
+        assert (
+            not msa5.has_state(bid5)
+            and bh5 not in ctx5.prefix_cache_registry.mamba_hash_to_block_id
+        )
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):
@@ -804,12 +830,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
             overall,
         )
         # Penultimate block offset (block 2 boundary) is a valid intermediate
-        count = msa._intermediate_counts_cpu[1].item()
+        count = msa._intermediate_counts_gpu[1].item()
         if count > 0:
-            offsets = msa._intermediate_offsets_cpu[1, :count].tolist()
+            offsets = msa._intermediate_offsets_gpu[1, :count].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa._eos_cache_block_id_cpu[1].item() >= 0
+        assert msa._eos_cache_block_id_gpu[1].item() >= 0
 
         # non-aligned prompt produces last_aligned intermediate offset
         ctx2 = self._mctx(block_size_tokens=bs)
@@ -821,12 +847,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 2
         ctx2.add_request(req2b)
-        count2 = msa2._intermediate_counts_cpu[1].item()
+        count2 = msa2._intermediate_counts_gpu[1].item()
         if count2 > 0:
-            offsets = msa2._intermediate_offsets_cpu[1, :count2].tolist()
+            offsets = msa2._intermediate_offsets_gpu[1, :count2].tolist()
             for o in offsets:
                 assert o > 0 and o % 128 == 0
-        assert msa2._eos_cache_block_id_cpu[1].item() < 0
+        assert msa2._eos_cache_block_id_gpu[1].item() < 0
 
         # block-aligned prompts set EOS cache block ID
         ctx3 = self._mctx(block_size_tokens=bs)
@@ -835,10 +861,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 0
         ctx3.add_request(req3)
-        # Deferred Mamba ops execute during transfer.
+        # Deferred Mamba ops execute as part of the attention-state init.
         ctx3.initialize_attention_state()
-        ctx3.transfer_bookkeeping_to_gpu()
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
+        assert ctx3.mamba_slot_allocator._eos_cache_block_id_gpu[1].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()
@@ -946,7 +971,6 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
         # last_token_logits
         ctx.initialize_attention_state()
-        ctx.transfer_bookkeeping_to_gpu()
         logits = torch.randn(
             1, ctx.padded_active_token_count, vocab_size, device=torch.cuda.current_device()
         )
@@ -1074,18 +1098,20 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Set up intermediate offsets: 1 intermediate at src_offset=0
         bid0 = ctx.request_to_kv_block_ids[ctx_idx][0].item()
-        msa._intermediate_block_ids_cpu[ctx_idx, 0] = bid0
-        msa._intermediate_offsets_cpu[ctx_idx, 0] = 128
-        msa._intermediate_counts_cpu[ctx_idx] = 1
+        msa._intermediate_block_ids_gpu[ctx_idx, 0] = bid0
+        msa._intermediate_offsets_gpu[ctx_idx, 0] = 128
+        msa._intermediate_counts_gpu[ctx_idx] = 1
         msa._has_intermediates = True
 
-        # Set metadata fields that would normally be set by _update_intermediate_offsets
-        metadata.intermediate_count = 1
-        metadata.per_request_intermediate_counts = [1]
+        # Set metadata fields that would normally be set by ``_update_intermediate_metadata``.
+        # The post-forward consumer reads ``_pending_intermediate_counts_gpu.tolist()``.
+        metadata._pending_intermediate_counts_gpu = torch.tensor(
+            [1], dtype=torch.int32, device=ctx.device
+        )
 
         # Set up EOS block (block-aligned prompt)
         eos_bid = ctx.request_to_kv_block_ids[ctx_idx][2].item()
-        msa._eos_cache_block_id_cpu[ctx_idx] = eos_bid
+        msa._eos_cache_block_id_gpu[ctx_idx] = eos_bid
 
         # Write known patterns to live mamba state for EOS copy
         mamba_idx = metadata.request_to_mamba_state_idx[ctx_idx].item()
@@ -1122,13 +1148,13 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
                 torch.full_like(msa.ssm_states[layer, eos_slot], layer + 300.0),
             )
 
-        # Verify hash_to_block_id updated for valid hashes
+        # Verify mamba_hash_to_block_id updated for valid hashes
         bid0_hash = alloc.block_hashes[bid0].item()
         eos_hash = alloc.block_hashes[eos_bid].item()
         if bid0_hash > 0:
-            assert msa.hash_to_block_id.get(bid0_hash) == bid0
+            assert ctx.prefix_cache_registry.mamba_hash_to_block_id.get(bid0_hash) == bid0
         if eos_hash > 0:
-            assert msa.hash_to_block_id.get(eos_hash) == eos_bid
+            assert ctx.prefix_cache_registry.mamba_hash_to_block_id.get(eos_hash) == eos_bid
 
         # Verify _has_intermediates cleared
         assert not msa._has_intermediates
