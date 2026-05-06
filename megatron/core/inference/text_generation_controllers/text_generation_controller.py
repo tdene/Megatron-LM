@@ -994,7 +994,12 @@ class TextGenerationController:
             gather_indices=sample_gather_indices,
             eager=not use_graph_for_sampling,
             cache_key=(
-                ("sample_speculative", sample_num_decode, sample_num_prefill)
+                # PLACEHOLDER: include `padded_batch_dimensions` so sampling
+                # variants pair 1:1 with the model graph's variants. Without
+                # this, multiple model variants (different token_count)
+                # collapse to one sampling cache_key and `pin_input_from`
+                # fails the replay-time data_ptr assert. See chat trace.
+                ("sample_speculative", context.padded_batch_dimensions)
                 if use_graph_for_sampling
                 else None
             ),
@@ -1091,7 +1096,12 @@ class TextGenerationController:
             context,
             gather_indices=gather_indices,
             eager=not use_graph,
-            cache_key=("sample", n) if use_graph else None,
+            # PLACEHOLDER: include `padded_batch_dimensions` so sampling
+            # variants pair 1:1 with the model graph's variants. Without this,
+            # multiple model variants (different token_count) collapse to one
+            # sampling cache_key and `pin_input_from` fails the replay-time
+            # data_ptr assert. See chat trace.
+            cache_key=("sample", context.padded_batch_dimensions) if use_graph else None,
         )
 
     def _dynamic_step_log_probs_bookkeeping(self):
