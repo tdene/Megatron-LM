@@ -407,9 +407,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
 
             # Force all dummy requests to request log probs so graphs cover
-            # the full padded shape.
+            # the full padded shape. After tde/switch_active_and_paused, the
+            # active region of `request_metadata` is `[:active_count]` directly
+            # (no paused_count offset), and `_dynamic_step_log_probs_bookkeeping`
+            # now reads `request_metadata` so this is the correct write target.
             active_request_count = context.total_request_count - context.paused_request_count
-            context.active_request_metadata["return_log_probs"][:active_request_count] = True
+            context.request_metadata["return_log_probs"][:active_request_count] = True
 
             controller._dynamic_step_log_probs_bookkeeping()
             controller._side_stream.wait_stream(torch.cuda.current_stream())

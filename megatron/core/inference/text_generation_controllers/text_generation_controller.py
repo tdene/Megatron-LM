@@ -713,7 +713,7 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_slice = slice(0, active_request_count)
 
         # accepted_counts is the only GPU input; D2H a small slice so the
         # CPU rewind can read its values via .tolist() inside a Python loop.
@@ -796,7 +796,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_slice = slice(context.paused_request_count, context.total_request_count)
+        active_slice = slice(0, active_request_count)
 
         unwrapped_model = self._unwrapped_model
 
@@ -1110,10 +1110,10 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
 
         self._log_prob_count = int(
-            context.active_request_metadata["return_log_probs"][:active_request_count].sum().item()
+            context.request_metadata["return_log_probs"][:active_request_count].sum().item()
         )
         self._top_n_max = int(
-            context.active_request_metadata["top_n_logprobs"][:active_request_count].max().item()
+            context.request_metadata["top_n_logprobs"][:active_request_count].max().item()
         )
 
     def _dynamic_step_log_probs_indexing(self):
@@ -1419,7 +1419,6 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # Batch GPU-to-CPU transfer of all sampled tokens.
         range_push("transfer_samples_to_cpu")
@@ -1430,7 +1429,10 @@ class TextGenerationController:
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
-        active_request_ids = context.request_ids[active_request_slice].long()
+        # Use the snapshot taken during build_active_slices: active_request_ids holds the
+        # request IDs that were active when the step started (before update_requests
+        # rearranges slots).
+        active_request_ids = context.active_request_ids[:active_request_count]
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1442,10 +1444,10 @@ class TextGenerationController:
 
         # Request finished if termination_id or length >= max_sequence_length.
         # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
+        # request_metadata is CPU-pinned.
         active_request_mask = (
             sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
+            != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words
@@ -1458,10 +1460,8 @@ class TextGenerationController:
                     if request_id in stop_word_finished_ids:
                         active_request_mask[idx] = 0
 
-        finished_idxs = (
-            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
-        )
-        finished_request_ids = context.request_ids[finished_idxs]
+        finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
+        finished_request_ids = context.active_request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
