@@ -977,7 +977,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Assert offsets updated
         assert torch.equal(
@@ -1216,7 +1216,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Req 1 should have released block 20 (ref count decremented).
         assert ctx.kv_block_allocator.block_ref_counts[20].item() == 1
@@ -1260,7 +1260,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         blocks_to_release, remove_mask = self.text_generation_controller._rewind_kv_cache()
-        ctx.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
+        ctx.kv_block_allocator.release_memory_blocks_dynamic_gpu(blocks_to_release, remove_mask)
 
         # Only block 40 should be released, not blocks 10, 20, or 30.
         assert ctx.request_kv_block_counts[0].item() == 3

@@ -151,8 +151,11 @@ class TextGenerationController:
         else:
             max_logits = context.max_tokens
 
-        # Callback to get request IDs that should be marked as finished due to stop words
+        # Callback to get request IDs that should be marked as finished due to stop words.
+        # The mask is pre-computed on _pre_forward_bookkeeping_stream so the D2H
+        # sync overlaps with the forward pass.
         self._get_stop_word_finished_ids_callback = None
+        self._stop_word_mask = torch.zeros(max_requests, dtype=torch.bool, device='cuda')
 
         device = torch.cuda.current_device()
 
@@ -206,7 +209,18 @@ class TextGenerationController:
             pin_input_from=pin_input_from,
         )
 
-        # Sampling backend: provides the sampling kernel.
+        # Side stream for pre-forward bookkeeping. Work issued here runs concurrently
+        # with the forward pass; post-forward consumers synchronize on the event.
+        self._pre_forward_bookkeeping_stream = torch.cuda.Stream(device=device)
+        self._pre_forward_bookkeeping_event = torch.cuda.Event()
+
+        # Side stream for post-sampling bookkeeping. Copies the mask and sampled
+        # tokens into static buffers while the main stream builds return values.
+        self._post_sampling_bookkeeping_stream = torch.cuda.Stream(device=device)
+        self._post_sampling_bookkeeping_event = torch.cuda.Event()
+
+        # Sampling backend: provides the sampling kernel consumed by
+        # ``_dynamic_step_sample_logits`` and friends.
         if self._sampling_backend == "flashinfer":
             self._sampling: Sampling = FlashInferSampling(
                 self.vocab_size,
@@ -237,6 +251,21 @@ class TextGenerationController:
                 inline_capture=True,
                 num_warmup_steps=1,
             )
+            # Wrap the two update_requests graph bodies. First non-eager call
+            # captures, subsequent calls replay. Engine warmup invokes
+            # `_run_update_requests` once after forward graph capture.
+            for body_name in (
+                "_classify_and_resume_body",
+                "_evict_resume_chunked_tokens_body",
+            ):
+                CudaGraphManager(
+                    self.model_config,
+                    context,
+                    function_name=body_name,
+                    need_backward=False,
+                    inline_capture=True,
+                    num_warmup_steps=1,
+                )
         context._init_body_hooks.append(self._apply_bucket_toggles)
 
         if self.model_config.transformer_impl == "inference_optimized":
@@ -625,6 +654,16 @@ class TextGenerationController:
         unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
         model_config = get_model_config(unwrapped_model)
 
+        # Side-stream barrier: any ``add_request`` queued on the side stream
+        # must complete before ``initialize_attention_state`` runs. The
+        # ``prepare_attn_init`` phase reads the bridge mirrors (via
+        # ``sync_counters_to_cpu`` D2H) and ``_build_active_slices`` /
+        # ``build_active_slices`` read ``request_*`` / ``token_to_*`` /
+        # ``mamba_metadata.request_to_mamba_state_idx`` — all of which
+        # ``add_request`` writes for the new slot. Without this wait those
+        # reads see torn state.
+        context.wait_for_add_request_done()
+
         # Initialize attention state. Three-phase orchestration:
         # CPU-side prepare -> graphable body (per-bucket CudaGraphManager) ->
         # CPU-side finalize. The unified-buffer H2D and the GPU compute that
@@ -759,15 +798,9 @@ class TextGenerationController:
         # Mamba speculative rewind stays on GPU because it mutates GPU-resident
         # SSM/conv state that the next forward pass reads directly.
         if context.is_hybrid_model:
-            cuda_device = torch.cuda.current_device()
-            # gpu_view.request_in_prefill_status was uploaded by this step's
-            # coalesced H2D and mirrors the active-slice CPU values, so we
-            # don't need to re-upload prefill_status for the Mamba kernels.
-            prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
+            prefill_status_gpu = context.request_in_prefill_status_tensor[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
-            ].to(cuda_device, non_blocking=True)
+            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[active_request_slice]
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
@@ -844,16 +877,10 @@ class TextGenerationController:
             last_accepted_hidden = None
 
         # Compute position IDs for the next tokens.
-        # After rewind, request_kv_length_offsets has been adjusted. Read from
-        # CPU context (post-rewind values), NOT gpu_view (stale pre-rewind snapshot).
-        # The next position to predict is: adjusted_offset + processed_tokens.
-        cuda_device = torch.cuda.current_device()
-        adjusted_offsets = context.request_kv_length_offsets[active_slice].to(
-            cuda_device, non_blocking=True
-        )
-        processed_tokens = context.request_query_lengths[active_slice].to(
-            cuda_device, non_blocking=True
-        )
+        # After rewind, request_kv_length_offsets has been adjusted. The next
+        # position to predict is: adjusted_offset + processed_tokens.
+        adjusted_offsets = context.request_kv_length_offsets[active_slice]
+        processed_tokens = context.request_query_lengths[active_slice]
         # Cast to int64 to match CUDA graph capture dtype expectations.
         base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
@@ -992,7 +1019,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `_pad_gpu_active_slices` zero-pads the trailing slots), so the call site does not
+        # `pad_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
@@ -1110,7 +1137,7 @@ class TextGenerationController:
         gather_indices = (
             None
             if context.config.materialize_only_last_token_logits
-            else context.gpu_view.active_request_last_token_idxs
+            else context.active_request_last_token_idxs
         )
         self._sampled_tokens_cuda = self._sampling.sample_kernel(
             logits,
@@ -1406,55 +1433,35 @@ class TextGenerationController:
                 )
             nvtx_range_pop(f"mtp-spec-decoding/dummy-depth-{depth}")
 
-    def _transfer_samples_to_cpu(self, active_request_count: int) -> tuple:
-        """Batch GPU-to-CPU transfer of sampled tokens.
+    def _precompute_stop_word_mask(self) -> None:
+        """Build the stop-word mask."""
+        if self._get_stop_word_finished_ids_callback is None:
+            return
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_ids = context.active_request_ids[:active_request_count]
+        request_ids_list = active_request_ids.tolist()
+        stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+        self._stop_word_mask[:active_request_count] = torch.tensor(
+            [rid in stop_word_finished_ids for rid in request_ids_list],
+            dtype=torch.bool,
+        ) if stop_word_finished_ids else False
 
-        Called at the boundary between GPU sampling and CPU bookkeeping.
-        After this returns, all sampled data is on CPU and the remainder
-        of the step is 100% CPU.
+    def _dynamic_step_post_sample_bookkeeping(self) -> Dict:
+        """Build the active-request mask and prepare update_requests inputs.
 
-        Returns:
-            tuple: (sampled_tokens_cpu, sampled_mtp_tokens_cpu) where
-                sampled_mtp_tokens_cpu is None when speculative decoding is off.
-        """
-        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
-        if self.num_speculative_tokens > 0:
-            sampled_mtp_tokens_cpu = self._sampled_mtp_tokens_cuda[:, :active_request_count].cpu()
-        else:
-            sampled_mtp_tokens_cpu = None
-        return sampled_tokens_cpu, sampled_mtp_tokens_cpu
-
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling.
-
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
-
-        Return:
-            Dict [str, Tensor]: A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
+        Returns active/finished IDs and whether the batch has a chunked prefill request.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Batch GPU-to-CPU transfer of the sampled tokens; returned as
+        # ``"sample"`` so the engine's eventual ``.tolist()`` is sync-free.
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
+        sampled_tokens_cpu = self._sampled_tokens_cuda[:active_request_count].cpu()
         range_pop()
 
         range_push("active_request_mask")
-        # Everything below is 100% CPU.
-        # Use the snapshot taken during _build_cpu_active_slices: active_request_ids holds the
-        # request IDs that were active when the step started (before update_requests
-        # rearranges slots).
-        active_request_ids = context.active_request_ids[:active_request_count]
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1465,25 +1472,30 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # request_metadata is CPU-pinned.
+        # Both operands are now GPU after tde/graphed_context_update made
+        # ``request_metadata`` GPU-resident; no D2H required for the comparison.
+        # The ``.cpu()`` above is independent — it stages a return value.
         active_request_mask = (
-            sampled_tokens_cpu
+            self._sampled_tokens_cuda[:active_request_count]
             != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
+        # Apply pre-computed stop-word mask.
         if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+            active_request_mask.masked_fill_(self._stop_word_mask[:active_request_count], 0)
 
+        # Clone before returning: ``context.active_request_ids`` is a static
+        # buffer overwritten by the next step's ``_prepare_update_requests_metadata``
+        # and ``build_active_slices``. Returning a view leaves the engine's
+        # eventual ``.tolist()`` reading whatever's in that buffer at the
+        # moment it syncs — which can include stale dummy IDs from warmup
+        # or partially-overwritten state if the next step has already started.
+        # ``finished_request_ids`` uses fancy indexing which already copies,
+        # but cloning is explicit and matches the pattern used for
+        # ``sample``/``accepted_tokens`` in the main return dict.
+        active_request_ids = context.active_request_ids[:active_request_count].clone()
         finished_idxs = torch.nonzero(active_request_mask == 0, as_tuple=True)[0]
-        finished_request_ids = context.active_request_ids[finished_idxs]
+        finished_request_ids = context.active_request_ids[finished_idxs].clone()
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
@@ -1496,26 +1508,50 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
-        # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused buffer.
-        new_sample_copy = sampled_tokens_cpu.clone()
-        range_pop()
+        # Prepare sampled tokens for the side stream.
+        if self.num_speculative_tokens > 0:
+            sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda[:, :active_request_count]
+        else:
+            sampled_mtp_tokens_cuda = None
 
-        range_push("update_requests")
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+        has_chunked = context._prepare_update_requests_new_tokens(
+            active_request_mask,
+            self._sampled_tokens_cuda[:active_request_count],
+            sampled_mtp_tokens_cuda,
         )
         range_pop()
 
         return {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
-            # Already a CPU tensor (independent of _sampled_tokens_cuda via the
-            # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
-            # the separate new_sample_copy). Returning the CPU copy avoids a
-            # D2H sync when the engine later calls sample.tolist().
+            # CPU tensor (D2H done above); returning it avoids a sync
+            # when the engine later calls ``sample.tolist()``.
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "has_chunked": has_chunked,
+        }
+
+    def _run_update_requests(self, prep_result: Dict) -> Dict[str, Tensor]:
+        """Run update_requests."""
+        context = self.inference_wrapped_model.inference_context
+
+        # Each body is wrapped by its own CudaGraphManager (installed in __init__).
+        # First call captures, subsequent calls replay; cache_key keeps both bodies
+        # routed to a single runner each.
+        context._classify_and_resume_body(cache_key="update_requests")
+        context._evict_resume_chunked_tokens_body(cache_key="update_requests")
+        update_result = context._finalize_update_requests(prep_result["has_chunked"])
+
+        # Mark the end of update_requests on the main stream so the next
+        # scheduling pass's ``add_request_on_side_stream`` can order itself
+        # after the just-finished allocator mutations (block_ref_counts /
+        # block_bag / total_avail_gpu / dereg queue / etc.).
+        context.record_update_done()
+
+        return {
+            "active_request_ids": prep_result["active_request_ids"],
+            "finished_request_ids": prep_result["finished_request_ids"],
+            "finished_routing_block_ids": prep_result["finished_routing_block_ids"],
             **(update_result or {}),
         }
 
@@ -1559,11 +1595,23 @@ class TextGenerationController:
             if config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
+            # Log-prob indexing on the per_request_logprobs side stream — runs
+            # concurrently with the forward pass. The forward kernels join via
+            # the ``_side_step_done_event`` wait below.
             self._side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._side_stream):
                 indexing_outputs = self._dynamic_step_log_probs_indexing()
 
             torch.cuda.current_stream().wait_event(self._side_step_done_event)
+
+            # Stop-word + update_requests metadata on the graphed_context_update
+            # pre-forward bookkeeping stream — also overlaps with forward.
+            # Post-forward consumers synchronize via ``_pre_forward_bookkeeping_event``.
+            self._pre_forward_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._pre_forward_bookkeeping_stream):
+                self._precompute_stop_word_mask()
+                context._prepare_update_requests_metadata()
+                self._pre_forward_bookkeeping_event.record()
 
             # Forward pass produces only base logits. When speculative decoding is
             # active, MTP logits are computed serially after verification.
@@ -1627,6 +1675,8 @@ class TextGenerationController:
         await asyncio.sleep(0)
 
         with torch.inference_mode():
+            # Modular log-probs: gather + top-n on the side stream, deferred CPU
+            # extract returned as a callable. (per_request_logprobs / multi_stream_logprobs)
             torch.cuda.current_stream().wait_event(self._side_pre_calc_event)
             log_probs_extract = self._dynamic_step_calculate_log_probs(
                 logits, indexing_outputs, lse_outputs
@@ -1634,19 +1684,39 @@ class TextGenerationController:
             self._side_stream.wait_stream(torch.cuda.current_stream())
             self._side_step_done_event.record(self._side_stream)
 
+            # Build termination mask and copy tokens into static buffers on a
+            # side stream so it overlaps with the log-probs gather above.
+            # (graphed_context_update's GPU update_requests pipeline.) The
+            # post-sampling bookkeeping reads ``_stop_word_mask`` populated on
+            # the pre-forward bookkeeping stream, so wait on that event in
+            # addition to the main-stream join to pick up sampling's output.
+            if not skip_bookkeeping:
+                self._post_sampling_bookkeeping_stream.wait_stream(torch.cuda.current_stream())
+                self._post_sampling_bookkeeping_stream.wait_event(
+                    self._pre_forward_bookkeeping_event
+                )
+                with torch.cuda.stream(self._post_sampling_bookkeeping_stream):
+                    prep_result = self._dynamic_step_post_sample_bookkeeping()
+                    self._post_sampling_bookkeeping_event.record()
+
             if skip_bookkeeping:
-                # _transfer_samples_to_cpu wasn't invoked on this path, so do
-                # a one-shot D2H here to keep "sample" as a CPU tensor for
-                # downstream consumers.
+                # _dynamic_step_post_sample_bookkeeping wasn't invoked on this
+                # path, so do a one-shot D2H here to keep "sample" as a CPU
+                # tensor for downstream consumers.
                 request_bookkeeping = {
                     "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
                 }
             else:
-                # request_bookkeeping supplies "sample" as the already-CPU
-                # tensor produced by _transfer_samples_to_cpu.
-                request_bookkeeping = self._dynamic_step_context_bookkeeping()
+                torch.cuda.current_stream().wait_event(self._post_sampling_bookkeeping_event)
+                request_bookkeeping = self._run_update_requests(prep_result)
 
             ret = {
+                # Clone needed: context.active_request_ids is overwritten by
+                # the next step's _prepare_update_requests_metadata and the
+                # forward graph's build_active_slices.
+                "active_request_ids": context.active_request_ids[:active_request_count].clone(),
+                # Clone needed: _sampled_tokens_cuda is a reused buffer overwritten each step.
+                "sample": self._sampled_tokens_cuda[:active_request_count].clone(),
                 "accepted_tokens": (
                     # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()

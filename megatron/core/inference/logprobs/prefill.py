@@ -97,13 +97,15 @@ class LogProbsPrefill:
         padded_count = context.padded_active_request_count
         padded_token_count = context.padded_active_token_count
 
-        return_log_probs_mask = context.gpu_return_log_probs_mask[:padded_count]
-        # `gpu_view.request_query_lengths` and `gpu_view.active_request_last_token_idxs`
-        # both reserve a permanent slot at index `max_requests` so the
+        # After tde/graphed_context_update made request_metadata GPU-resident,
+        # the bool mask lives directly on the context with no separate H2D mirror.
+        return_log_probs_mask = context.request_metadata["return_log_probs"][:padded_count]
+        # `request_query_lengths` and `active_request_last_token_idxs` both reserve
+        # a permanent slot at index `max_requests` so the
         # `nonzero_static(..., fill_value=max_requests)` sentinel below indexes
-        # in-bounds; see `dynamic_context._cpu_bookkeeping_buf` layout.
-        active_query_lengths = context.gpu_view.request_query_lengths
-        last_token_idxs = context.gpu_view.active_request_last_token_idxs
+        # in-bounds; see `dynamic_context.initialize_all_tensors`.
+        active_query_lengths = context.request_query_lengths
+        last_token_idxs = context.active_request_last_token_idxs
 
         # Pick requests asking for log probs.
         # Size is padded_count + 1 so there's always at least one trailing sentinel slot

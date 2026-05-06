@@ -23,6 +23,39 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+def _alloc_n(allocator, n: int):
+    """Allocate ``n`` blocks via the GPU path; return a length-``n`` view.
+
+    Test helper that replaces the removed eager ``allocate_memory_blocks(n)``.
+    Mirrors what production ``add_request`` does after the GPU-only migration:
+    drives the prefix-aware (or vanilla) GPU allocate and write-throughs the
+    host ``total_avail`` mirror.
+    """
+    if n <= 0:
+        return torch.empty(0, dtype=torch.int32, device='cuda')
+    count_gpu = torch.tensor(n, dtype=torch.int32, device='cuda')
+    if allocator.enable_prefix_caching:
+        full = allocator.allocate_memory_blocks_prefix_aware_gpu(count_gpu)
+    else:
+        full = allocator.allocate_memory_blocks_gpu(count_gpu)
+    allocator.total_avail = max(allocator.total_avail - n, 0)
+    result = full[:n]
+    allocator.clear_routing_for_reallocated(result)
+    return result
+
+
+def _release_blocks(allocator, blocks):
+    """Release a 1-D tensor of block IDs via the GPU dynamic release.
+
+    Replaces the removed eager ``release_memory_blocks(blocks)``.
+    """
+    n = blocks.numel()
+    if n == 0:
+        return
+    remove_mask = torch.ones(n, dtype=torch.bool, device=blocks.device)
+    allocator.release_memory_blocks_dynamic_gpu(blocks, remove_mask)
+
+
 class PrefixCachingTestBase:
 
     @classmethod
@@ -374,7 +407,7 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         p3 = self._prompt(ctx3.block_size_tokens * 2)
         ctx3.add_request(self._req(ctx3, p3.clone()))
         while alloc3.total_avail > 0:
-            alloc3.allocate_memory_blocks(1)
+            _alloc_n(alloc3, 1)
         _, _, kv_available = ctx3.check_availability(self._req(ctx3, p3.clone(), request_id=2))
         assert kv_available
 
@@ -471,6 +504,276 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone(), request_id=2))
         new_blocks = self._block_ids(ctx2, 0, 2)
         assert alloc2.block_ref_counts[new_blocks[0]].item() == 1
+
+    @pytest.mark.internal
+    def test_graphed_release_refzero_deregisters_shared_blocks(self):
+        """REF_ZERO graphed release path (via update_requests) correctly
+        decrements refs, dedups shared block IDs, deregisters fully-unused
+        blocks, and drains the host-side dict."""
+        bs = 32
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        alloc = ctx.kv_block_allocator
+
+        # Two requests with identical prompts share all prefix-cached blocks.
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=1))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        assert self._block_ids(ctx, 1, 2) == [b0, b1]  # sharing confirmed
+        b0_hash = alloc.block_hashes[b0].item()
+        b1_hash = alloc.block_hashes[b1].item()
+        assert alloc.block_ref_counts[b0].item() == 2
+        assert alloc.block_ref_counts[b1].item() == 2
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+        assert b1_hash in alloc.registry.kv_hash_to_block_id
+        avail_before = alloc.total_avail
+
+        # Finish only request 1. The classify graph's folded release packs
+        # b0, b1 once (only request 0's row); per-request ref counts drop
+        # from 2 to 1, and the blocks stay cached for request 2.
+        active_mask = torch.tensor([0, 1], dtype=torch.uint8, device='cuda')
+        new_tokens = torch.tensor([100, 200], dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+
+        assert alloc.block_ref_counts[b0].item() == 1
+        assert alloc.block_ref_counts[b1].item() == 1
+        assert alloc.block_hashes[b0].item() == b0_hash
+        assert alloc.block_hashes[b1].item() == b1_hash
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+        assert alloc.total_avail == avail_before  # still held by req 2
+
+        # Now finish request 2 (moved to slot 0 by the permutation).
+        active_mask = torch.tensor([0], dtype=torch.uint8, device='cuda')
+        new_tokens = torch.tensor([300], dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+
+        # Fully released → dereg: ref counts zero, hashes cleared, dict dropped.
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_ref_counts[b1].item() == 0
+        assert alloc.block_hashes[b0].item() == -1
+        assert alloc.block_hashes[b1].item() == -1
+        assert b0_hash not in alloc.registry.kv_hash_to_block_id
+        assert b1_hash not in alloc.registry.kv_hash_to_block_id
+        assert alloc.total_avail == avail_before + 2
+
+    @pytest.mark.internal
+    def test_graphed_release_lru_caches_shared_blocks(self):
+        """LRU graphed release (via update_requests) keeps zero-ref blocks
+        cached and discoverable via the hash dict, instead of dereg'ing
+        them."""
+        bs = 32
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU)
+        alloc = ctx.kv_block_allocator
+
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=1))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        assert self._block_ids(ctx, 1, 2) == [b0, b1]
+        b0_hash = alloc.block_hashes[b0].item()
+        b1_hash = alloc.block_hashes[b1].item()
+        assert alloc.block_ref_counts[b0].item() == 2
+
+        # Both finish in one step (exercises dedup in the graphed release).
+        active_mask = torch.tensor([0, 0], dtype=torch.uint8, device='cuda')
+        new_tokens = torch.tensor([100, 200], dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+
+        # LRU: zero-ref blocks stay cached — hashes preserved, still in dict.
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_ref_counts[b1].item() == 0
+        assert alloc.block_hashes[b0].item() == b0_hash
+        assert alloc.block_hashes[b1].item() == b1_hash
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+        assert b1_hash in alloc.registry.kv_hash_to_block_id
+        # The LRU cached list should record both newly-cached blocks.
+        assert int(alloc._lru_cached_list_len.item()) == 2
+
+    @pytest.mark.internal
+    def test_graphed_release_lru_cached_reused_by_hash(self):
+        """After graphed release caches blocks, a new request with the
+        same prefix re-binds them via hash match (ref count back to 1)."""
+        bs = 32
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU)
+        alloc = ctx.kv_block_allocator
+
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=1))
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        b0_hash = alloc.block_hashes[b0].item()
+
+        # Finish the request via the graphed path; blocks become cached.
+        active_mask = torch.tensor([0], dtype=torch.uint8, device='cuda')
+        new_tokens = torch.tensor([100], dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert b0_hash in alloc.registry.kv_hash_to_block_id
+
+        # Add a new request with the same prefix; should bind the cached
+        # blocks via the dict instead of allocating fresh ones.
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+        assert self._block_ids(ctx, 0, 2) == [b0, b1]
+        assert alloc.block_ref_counts[b0].item() == 1
+
+    @pytest.mark.internal
+    def test_lru_evict_if_deficit_drops_oldest_first(self):
+        """_lru_evict_if_deficit scans the cached list head-to-tail and
+        dereg+pushes the first ``deficit`` non-stale entries. This is the
+        graphed-allocate eviction helper, exercised in isolation by
+        seeding the LRU state manually."""
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU)
+        alloc = ctx.kv_block_allocator
+
+        # pad_for_release is what allocates the graphed-path scratch
+        # buffers including _lru_cached_list and the dereg queue.
+        ctx.init_update_requests_state()
+
+        # Seed three "cached" blocks directly. Block 10 is oldest
+        # (earliest in the list), block 30 is newest.
+        seed = [(10, 1001, 5), (20, 1002, 6), (30, 1003, 7)]
+        for bid, h, ts in seed:
+            alloc.block_ref_counts[bid] = 0
+            alloc.block_hashes[bid] = h
+            alloc.block_timestamps[bid] = ts
+            alloc.registry.kv_hash_to_block_id[h] = bid
+        alloc._lru_cached_list[:3] = torch.tensor([10, 20, 30], dtype=torch.int32, device='cuda')
+        alloc._lru_cached_list_ts[:3] = torch.tensor([5, 6, 7], dtype=torch.int64, device='cuda')
+        alloc._lru_cached_list_len.fill_(3)
+
+        initial_avail = int(alloc.total_avail_gpu.item())
+
+        # Request ``initial_avail + 2`` → deficit = 2 → evict oldest two.
+        count = torch.tensor(initial_avail + 2, dtype=torch.int64, device='cuda')
+        alloc._lru_evict_if_deficit(count)
+        alloc.drain_pending_dereg()
+
+        # Blocks 10 and 20 evicted (dereg'd); 30 stays cached.
+        assert alloc.block_hashes[10].item() == -1
+        assert alloc.block_hashes[20].item() == -1
+        assert alloc.block_hashes[30].item() == 1003
+        assert 1001 not in alloc.registry.kv_hash_to_block_id
+        assert 1002 not in alloc.registry.kv_hash_to_block_id
+        assert 1003 in alloc.registry.kv_hash_to_block_id
+        # Free pool grew by the two evicted blocks.
+        assert int(alloc.total_avail_gpu.item()) == initial_avail + 2
+
+    @pytest.mark.internal
+    def test_graphed_token_bookkeeping_handles_paused_gt_zero(self):
+        """Regression test for a bug in the token-bookkeeping body.
+
+        The original body masked ``token_to_block_idx`` writes with
+        ``is_active_post`` (a per-*slot* mask) even though the writes
+        use packed token-position indexing via
+        ``src_idx = slot_idx + paused_post_gpu``. When
+        ``paused_request_count > 0`` after update_requests, the mask
+        was shifted by ``paused_post`` and wrongly zeroed the first
+        ``paused_post`` packed positions — so
+        ``token_to_block_idx[0]`` ended up as ``dummy_block_idx``
+        instead of the first active request's actual last-KV block,
+        silently diverting that token's KV writes to the dummy block.
+
+        This test constructs a tight buffer, adds several single-block
+        requests until the pool is nearly drained, then calls
+        ``update_requests``; every request needs a new block but the
+        resume can only refill a subset, leaving at least one slot
+        paused. We then verify that ``token_to_block_idx[0]`` holds
+        the correct block for the first active (resumed) request.
+        """
+        bs = 32
+        ctx = self._ctx(
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+            buffer_size_gb=0.0001,
+            rounder=1,
+        )
+
+        # Each request is a single block with a unique prefix (so
+        # REF_ZERO doesn't share blocks across them). Fill the pool
+        # until there is at most one free block left.
+        rid = 1
+        while ctx.kv_block_allocator.total_avail > 1 and rid <= 16:
+            try:
+                ctx.add_request(self._req(ctx, self._prompt(bs, offset=rid * 997), request_id=rid))
+                rid += 1
+            except Exception:
+                break
+
+        n = ctx.total_request_count
+        if n < 2 or ctx.kv_block_allocator.total_avail >= n:
+            pytest.skip(
+                f"buffer sizing did not produce a tight pool: n={n}, "
+                f"total_avail={ctx.kv_block_allocator.total_avail}"
+            )
+
+        # Every request's last-kv-block offset is bs - 1, so the
+        # classify graph marks each as "needs new block" → sort key
+        # 1 (newly paused). The resume path then tries to refill from
+        # the free pool; since it's short, at least one slot stays
+        # paused.
+        active_mask = torch.ones(n, dtype=torch.uint8, device='cuda')
+        new_tokens = torch.arange(100, 100 + n, dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+
+        assert ctx.paused_request_count > 0, (
+            f"expected paused > 0 to exercise the bug; got " f"paused={ctx.paused_request_count}"
+        )
+
+        # The first active slot sits at index paused_request_count
+        # after the permutation + partial resume. Its
+        # request_last_kv_block_id was updated by the graphed resume
+        # body to the newly-allocated block. token_to_block_idx[0]
+        # (the first packed token) must point to that same block —
+        # not ``dummy_block_idx``.
+        expected_block = ctx.request_last_kv_block_id[ctx.paused_request_count].item()
+        actual_block = ctx.token_to_block_idx[0].item()
+        assert actual_block == expected_block, (
+            f"token_to_block_idx[0]={actual_block} "
+            f"expected={expected_block} (paused={ctx.paused_request_count})"
+        )
+        assert actual_block != ctx.kv_block_allocator.dummy_block_idx
+
+    @pytest.mark.internal
+    def test_graphed_release_refzero_dedups_simultaneous_finish(self):
+        """Two prefix-sharing requests finishing in the SAME update_requests
+        step must dedup the shared blocks (each block appears in both
+        request rows of the released scatter-pack) and decrement ref counts
+        by the correct per-occurrence count."""
+        bs = 32
+        ctx = self._ctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        alloc = ctx.kv_block_allocator
+
+        prompt = self._prompt(bs * 2)
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=1))
+        ctx.add_request(self._req(ctx, prompt.clone(), request_id=2))
+
+        b0, b1 = self._block_ids(ctx, 0, 2)
+        assert self._block_ids(ctx, 1, 2) == [b0, b1]
+        b0_hash = alloc.block_hashes[b0].item()
+        b1_hash = alloc.block_hashes[b1].item()
+        assert alloc.block_ref_counts[b0].item() == 2
+        assert alloc.block_ref_counts[b1].item() == 2
+        avail_before = alloc.total_avail
+
+        # Both requests finish in the same update_requests call. The scatter-
+        # pack produces packed_blocks = [b0, b1, b0, b1, ...sentinels], with
+        # b0 and b1 each appearing twice. scatter_add_ on ref_counts must
+        # accumulate both decrements (2 -> 0), and the released-bitmap dedup
+        # must prevent double-push to the free pool.
+        active_mask = torch.tensor([0, 0], dtype=torch.uint8, device='cuda')
+        new_tokens = torch.tensor([100, 200], dtype=torch.int64, device='cuda')
+        ctx.update_requests(active_mask, new_tokens)
+
+        # Correctness signals: ref counts hit zero exactly (not -2, not 1),
+        # blocks are dereg'd, dict is drained, and total_avail increased by
+        # exactly 2 (not 4, which would happen without dedup on push).
+        assert alloc.block_ref_counts[b0].item() == 0
+        assert alloc.block_ref_counts[b1].item() == 0
+        assert alloc.block_hashes[b0].item() == -1
+        assert alloc.block_hashes[b1].item() == -1
+        assert b0_hash not in alloc.registry.kv_hash_to_block_id
+        assert b1_hash not in alloc.registry.kv_hash_to_block_id
+        assert alloc.total_avail == avail_before + 2
 
 
 class TestDisabledAndEngineScheduling(PrefixCachingTestBase):
@@ -1088,7 +1391,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx.initialize_attention_state()
 
         # Determine prefill_start for this batch
-        prefill_start = ctx.batch_dimensions.decode_req_count
+        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
         ctx_idx = prefill_start  # first prefill request
 
         # Write known patterns to intermediate output buffers
@@ -1172,7 +1475,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         num_layers, topk = 4, 2
 
         # Allocate a block
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
 
         # Store routing for some positions
@@ -1196,19 +1499,19 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
 
         # Allocate, store routing, release, re-allocate
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
         positions = np.array([0])
         routing = np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
         alloc.store_block_routing(bid, positions, routing)
         assert alloc.get_block_routing(bid) is not None
 
-        alloc.release_memory_blocks(block_ids)
+        _release_blocks(alloc, block_ids)
         # After release, routing still present (persists until re-alloc)
         assert alloc.get_block_routing(bid) is not None
 
         # Re-allocate the same block
-        new_ids = alloc.allocate_memory_blocks(1)
+        new_ids = _alloc_n(alloc, 1)
         new_bid = new_ids[0].item()
         # The re-allocated block should have routing cleared
         assert alloc.get_block_routing(new_bid) is None
@@ -1219,7 +1522,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         ctx = self._ctx()
         alloc = ctx.kv_block_allocator
 
-        block_ids = alloc.allocate_memory_blocks(1)
+        block_ids = _alloc_n(alloc, 1)
         bid = block_ids[0].item()
         alloc.store_block_routing(
             bid, np.array([0]), np.random.randint(-100, 100, size=(1, 4, 2), dtype=np.int16)
@@ -1252,7 +1555,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         # Release blocks (REF_ZERO deregisters immediately)
         blocks = ctx.request_to_kv_block_ids[0]
         valid_blocks = blocks[blocks >= 0]
-        alloc.release_memory_blocks(valid_blocks)
+        _release_blocks(alloc, valid_blocks)
 
         # Routing data should still be present
         assert alloc.get_block_routing(b0) is not None
@@ -1267,7 +1570,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         num_layers, topk = 4, 2
 
         # Allocate 3 blocks
-        block_ids = alloc.allocate_memory_blocks(3)
+        block_ids = _alloc_n(alloc, 3)
         bids = block_ids.tolist()
 
         # Store routing for all positions in first two blocks (full)
@@ -1322,7 +1625,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         alloc = ctx.kv_block_allocator
         bs = ctx.block_size_tokens
 
-        block_ids = alloc.allocate_memory_blocks(2)
+        block_ids = _alloc_n(alloc, 2)
         bids = block_ids.tolist()
 
         # Only store routing for the first block

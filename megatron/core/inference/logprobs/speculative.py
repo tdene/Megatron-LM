@@ -236,23 +236,26 @@ class LogProbsSpeculative:
 
         padded_decode_count = context.padded_batch_dimensions.decode_req_count
 
-        # LogProbsPrefill.indexing_kernel reads `gpu_return_log_probs_mask` to pick
-        # which requests to index. In speculative mode the prefill kernel must only
-        # process *prefill* requests (decode is handled by gather_kernel above), so
-        # temporarily mask out the decode entries on the GPU mirror.
-        # Saved mask is restored before returning so the rest of the system never sees it.
-        saved_mask = context.gpu_return_log_probs_mask[:padded_decode_count].clone()
-        context.gpu_return_log_probs_mask[:padded_decode_count] = False
+        # LogProbsPrefill.indexing_kernel reads ``request_metadata["return_log_probs"]``
+        # to pick which requests to index. In speculative mode the prefill kernel
+        # must only process *prefill* requests (decode is handled by gather_kernel
+        # above), so temporarily mask out the decode entries on the GPU bool tensor.
+        # After tde/graphed_context_update this is the source-of-truth, but the
+        # save/clear/restore stays self-contained on this side stream so no other
+        # reader observes the cleared value.
+        return_log_probs = context.request_metadata["return_log_probs"]
+        saved_mask = return_log_probs[:padded_decode_count].clone()
+        return_log_probs[:padded_decode_count] = False
 
         # Count of prefill requests asking for log probs.
         # Stays on GPU; the engine .item()s it later when it actually needs the value.
-        prefill_log_prob_count_gpu = context.gpu_return_log_probs_mask[
+        prefill_log_prob_count_gpu = return_log_probs[
             : context.padded_active_request_count
         ].sum()
 
         ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
 
-        context.gpu_return_log_probs_mask[:padded_decode_count] = saved_mask
+        return_log_probs[:padded_decode_count] = saved_mask
 
         return prefill_offset_gpu, ri, cu_ml, li, mt, prefill_log_prob_count_gpu
 

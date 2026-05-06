@@ -24,7 +24,6 @@ class MambaMetadata:
         max_tokens: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
-        request_to_mamba_state_idx_buf: Optional[torch.Tensor] = None,
     ):
         """
         Initialize the Mamba metadata buffers.
@@ -35,13 +34,6 @@ class MambaMetadata:
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
-            request_to_mamba_state_idx_buf (Optional[Tensor]): Pre-allocated CPU
-                ``(max_requests,)`` int32 buffer for the request-to-slot mapping,
-                aliased into the context's coalesced pinned bookkeeping buffer
-                so writes here ride the per-step H2D into
-                ``gpu_view.request_to_mamba_state_idx``. When ``None`` (e.g. unit
-                tests constructing :class:`MambaMetadata` standalone) a fresh
-                CPU tensor is allocated.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
@@ -53,16 +45,9 @@ class MambaMetadata:
         self.max_chunks = max_tokens // mamba_chunk_size + max_requests
 
         # Map from requests to slots in the static Mamba state buffer.
-        # Aliased into the context's coalesced pinned CPU bookkeeping buffer
-        # when constructed with one (production); otherwise standalone.
-        if request_to_mamba_state_idx_buf is not None:
-            assert request_to_mamba_state_idx_buf.shape == (max_requests,)
-            assert request_to_mamba_state_idx_buf.dtype == torch.int32
-            self.request_to_mamba_state_idx = request_to_mamba_state_idx_buf
-        else:
-            self.request_to_mamba_state_idx = torch.full(
-                (max_requests,), -1, dtype=torch.int32, device='cpu'
-            )
+        self.request_to_mamba_state_idx = torch.full(
+            (max_requests,), -1, dtype=torch.int32, device=self.device
+        )
 
         # Map from requests to slots in the static Mamba state buffer for active decode requests.
         # int64 so selective_state_update can index directly without a per-layer upcast kernel.
@@ -109,11 +94,24 @@ class MambaMetadata:
         self._conv_seq_idx_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
-        # Allocator for Mamba state slots (CPU for bookkeeping).
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
+        # Allocator for Mamba state slots.
+        # Pre-sized to `2 * max_requests` for shape-stability; this acts as a stack.
+        self.mamba_state_free_slots = torch.empty(
+            2 * self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
         )
+        self.mamba_state_free_slots[: self.max_requests] = torch.arange(
+            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self.mamba_state_free_slots[self.max_requests :] = 0
         self.mamba_state_free_slot_count = self.max_requests
+
+        # GPU mirror of the stack pointer and static arange for the graphed release path.
+        self._free_slot_count_gpu = torch.tensor(
+            [self.mamba_state_free_slot_count], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._free_arange = torch.arange(
+            self.max_requests, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # Scratch buffer for cumulative chunk counts.
         self._cum_chunks_buffer = torch.zeros(
@@ -138,10 +136,13 @@ class MambaMetadata:
         """Reset all Mamba state and free all allocated slots."""
         self.request_to_mamba_state_idx.fill_(-1)
         self.reset_varlen_metadata()
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
+
+        # Re-initialize the free slot pool
+        self.mamba_state_free_slots[: self.max_requests].copy_(
+            torch.arange(self.max_requests, dtype=torch.int32, device=torch.cuda.current_device())
         )
         self.mamba_state_free_slot_count = self.max_requests
+        self._free_slot_count_gpu.fill_(self.max_requests)
 
     def reset_varlen_metadata(self) -> None:
         """Reset varlen metadata."""
@@ -365,7 +366,10 @@ class MambaMetadata:
         if self.mamba_state_free_slot_count == 0:
             return None
         self.mamba_state_free_slot_count -= 1
-        return self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+        mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+        self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
+
+        return mamba_idx
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """Allocate ``num_slots`` slots, or ``None`` if not enough are free."""
@@ -375,6 +379,7 @@ class MambaMetadata:
         return self.mamba_state_free_slots[
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
+        self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """Free the Mamba state slots associated with the given request indices."""
@@ -387,8 +392,25 @@ class MambaMetadata:
             end_idx = start_idx + num_to_free
             self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
             self.mamba_state_free_slot_count = end_idx
+            self._free_slot_count_gpu.fill_(self.mamba_state_free_slot_count)
 
         self.request_to_mamba_state_idx[request_indices] = -1
+
+    def free_slots_gpu(self, packed_slots: torch.Tensor, num_valid: torch.Tensor) -> None:
+        """Shape-stable mamba free that writes a pre-packed buffer onto the stack.
+
+        Args:
+            packed_slots: (`max_requests`,) tensor with mamba slot IDs packed at `[0, num_valid)`.
+            num_valid: 0-d or 1-element int tensor holding the valid count.
+        """
+        assert packed_slots.numel() == self.max_requests
+        free_indices = self._free_slot_count_gpu + self._free_arange
+        self.mamba_state_free_slots[free_indices.long()] = packed_slots
+        self._free_slot_count_gpu.add_(num_valid.to(torch.int32).view(1))
+
+    def sync_to_cpu(self) -> None:
+        """Mirror `_free_slot_count_gpu` back into the Python int."""
+        self.mamba_state_free_slot_count = int(self._free_slot_count_gpu.item())
 
 
 class PrefixCachedMambaMetadata(MambaMetadata):
@@ -410,15 +432,8 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         max_tokens: int,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
-        request_to_mamba_state_idx_buf: Optional[torch.Tensor] = None,
     ):
-        super().__init__(
-            max_requests,
-            max_tokens,
-            mamba_chunk_size,
-            d_conv,
-            request_to_mamba_state_idx_buf=request_to_mamba_state_idx_buf,
-        )
+        super().__init__(max_requests, max_tokens, mamba_chunk_size, d_conv)
 
         # Each prefill request can produce up to MAX_INTERMEDIATE_OFFSETS_PER_REQUEST offsets.
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests

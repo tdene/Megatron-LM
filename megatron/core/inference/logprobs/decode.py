@@ -95,9 +95,11 @@ class LogProbsDecode:
         # Pick rows whose request asked for log probs.
         # nonzero_static keeps the output shape fixed (= padded_count) for graph capture;
         # trailing entries past log_prob_request_count are sliced off later, during extract.
+        # After tde/graphed_context_update made request_metadata GPU-resident, no
+        # separate H2D mirror is needed — read the bool flags directly.
         padded_count = context.padded_active_request_count
         return torch.nonzero_static(
-            context.gpu_return_log_probs_mask[:padded_count], size=padded_count
+            context.request_metadata["return_log_probs"][:padded_count], size=padded_count
         ).squeeze(1)
 
     @staticmethod
