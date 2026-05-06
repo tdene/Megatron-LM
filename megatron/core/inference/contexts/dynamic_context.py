@@ -350,11 +350,11 @@ class UpdateRequestsScratch:
 
         # Resume counts captured by graph 1 and graph 2 respectively.
         # ``resume_count_gpu`` is overwritten by each graph's resume body, so
-        # graph 1 copies its post-resume value here before graph 2 runs;
-        # ``_gpu_finalize_outputs`` reads both as inputs to the GPU survivor
-        # formula. They used to be slots inside a larger ``combined_sync``
-        # buffer that fed an 11-int .cpu().tolist() in finalize — that sync
-        # is gone, so the buffer is reduced to just these two scalars.
+        # graph 1 copies its post-resume value here before graph 2 runs; the
+        # survivor formula at the tail of graph 2 reads both as inputs.
+        # They used to be slots inside a larger ``combined_sync`` buffer that
+        # fed an 11-int .cpu().tolist() in finalize — that sync is gone, so
+        # the buffer is reduced to just these two scalars.
         self.resume1_gpu = torch.zeros(1, dtype=torch.int64, device=device)
         self.resume2_gpu = torch.zeros(1, dtype=torch.int64, device=device)
 
@@ -3079,16 +3079,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
-        # Mirror the CPU increments to the GPU bridge scalars. Without this,
-        # the next step's ``prepare_attn_init.sync_counters_to_cpu`` would
-        # read the pre-add-request bridge values (last written by graph 2 of
-        # the previous step's ``update_requests``) and clobber the mirror
-        # increments above. Pause count is unchanged by ``add_request`` —
-        # the rotation that runs when ``paused_request_count > 0`` keeps the
-        # paused region intact and merely shifts it right by one slot.
-        self._real_request_count_gpu.fill_(self.total_request_count - self.paused_request_count)
-        self._total_request_count_gpu.fill_(self.total_request_count)
-        self._real_token_count_gpu.fill_(self.active_token_count)
+        # No GPU bridge fill needed: the next ``prepare_attn_init`` stages the
+        # post-admit Python-int counters into ``_context_op_metadata_cpu`` and
+        # ``run_attn_init_graph_body`` does the single coalesced H2D into
+        # ``_context_op_metadata_gpu``. Between admit and that step, nothing
+        # reads the GPU bridge — ``check_availability``'s
+        # ``sync_counters_to_cpu`` short-circuits because ``_counters_stale``
+        # is False after ``_finalize_update_requests``'s tail sync.
 
         # If this admission is the chunked-prefill request, snapshot its
         # slot. Catches the case where ``chunked_prefill_request_id`` was
@@ -4078,7 +4075,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         to register as the captured graph's output. Callers ignore the
         return value; the actual outputs are the in-place writes to
         bookkeeping tensors plus the resume-count snapshot in
-        ``_ur.resume1_gpu`` (read by ``_gpu_finalize_outputs``).
+        ``_ur.resume1_gpu`` (read by graph 2's tail survivor formula).
         """
         slot_idx = self._ur.arange_long
         max_req = self.max_requests
@@ -4106,8 +4103,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._graphed_resume_body()
 
         # Snapshot graph 1's resume count before graph 2 overwrites
-        # ``resume_count_gpu`` with its own resume's value. Read by
-        # ``_gpu_finalize_outputs`` as input to the survivor formula.
+        # ``resume_count_gpu`` with its own resume's value. Read by graph 2's
+        # tail survivor formula.
         self._ur.resume1_gpu.copy_(self._ur.resume_count_gpu)
 
         return self._ur.resume1_gpu
@@ -4264,7 +4261,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def _evict_resume_chunked_tokens_body(self) -> Tensor:
-        """Graph body 2: evict, resume, chunked positioning, token bookkeeping.
+        """Graph body 2: evict, resume, chunked positioning, token bookkeeping,
+        and finalize-time survivor formula + repack + paused-tokens copy.
 
         Returns ``_ur.resume2_gpu`` so ``CudaGraphManager`` has a tensor
         to register as the captured graph's output (same reason as
@@ -4272,9 +4270,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # INVARIANT: graph 1 (`_classify_and_resume_body`) must run before
         # this graph 2; graph 1 writes ``_ur.resume1_gpu`` and this body
-        # writes ``_ur.resume2_gpu``. ``_gpu_finalize_outputs`` reads both
-        # as inputs to the survivor formula, so re-ordering or sharing a
-        # single resume buffer would lose graph 1's value.
+        # writes ``_ur.resume2_gpu``. The survivor formula folded in below
+        # reads both, so re-ordering or sharing a single resume buffer
+        # would lose graph 1's value.
         """
         self._graphed_eviction_body()
         self._graphed_resume_body()
@@ -4298,6 +4296,62 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self._write_phase2_sync_outputs()
         self._writeback_gpu_count_mirrors()
+
+        # ── Survivor formula (folded in from what used to be eager finalize
+        # work). All inputs are already in this graph's frame; capturing
+        # avoids ~15 eager kernel launches per step.
+        #
+        # The formula tracks how each of the resume / eviction passes consumes
+        # the ``[stayed-paused | newly-paused]`` region: resume eats from the
+        # LEFT (stayed-paused first, spilling into newly-paused), eviction
+        # eats from the RIGHT (newly-paused tail). Tracking each pass's
+        # contribution recovers the surviving slice — a naive
+        # ``bucket3 - (resume1 + resume2)`` undercounts whenever bucket2
+        # absorbed some resume.
+        bucket = self._ur.bucket_counts  # (5,) int64
+        bucket2 = bucket[2:3]
+        bucket3 = bucket[3:4]
+        resume1 = self._ur.resume1_gpu
+        resume2 = self._ur.resume2_gpu
+        evict_count = self._ur.evict_count_gpu
+
+        left_eaten_by_r1 = (resume1 - bucket2).clamp(min=0)
+        newly_after_r1 = bucket3 - left_eaten_by_r1
+        stayed_after_r1 = (bucket2 - resume1).clamp(min=0)
+        right_eaten_by_evict = torch.minimum(evict_count, newly_after_r1)
+        newly_after_evict = newly_after_r1 - right_eaten_by_evict
+        stayed_after_evict = stayed_after_r1 - (evict_count - right_eaten_by_evict)
+        left_eaten_by_r2 = (resume2 - stayed_after_evict).clamp(min=0)
+        final_newly_paused = newly_after_evict - left_eaten_by_r2  # (1,)
+        survivor_start = left_eaten_by_r1 + left_eaten_by_r2  # (1,)
+
+        # Stash the count for the post-finalize 2-int sync.
+        self._ur.final_newly_paused_gpu.copy_(final_newly_paused)
+
+        # Repack newly-paused survivors into a separate post-buffer:
+        #   post_buf[i] = newly_paused_ids_buf[survivor_start + i]  if i < final_newly_paused
+        #   post_buf[i] = -1                                         otherwise
+        # ``newly_paused_ids_buf`` has shape ``(max_requests + 1,)`` with the
+        # sink slot at index ``max_requests``; clamping OOB indices to the
+        # sink keeps the gather safe, and the ``where`` mask scrubs whatever
+        # the sink happened to hold.
+        np_src_idx = (survivor_start + slot_idx).clamp(max=self.max_requests)
+        in_range = slot_idx < final_newly_paused
+        gathered = self._ur.newly_paused_ids_buf[np_src_idx]
+        self._ur.newly_paused_ids_post_buf.copy_(
+            torch.where(in_range, gathered, torch.full_like(gathered, -1))
+        )
+
+        # Paused-tokens copy. ``paused_tokens_buf[i] = next_tokens[active + i]``
+        # for ``i in [0, paused_count)``. Tail positions read garbage indices
+        # (clamped to the last valid slot) and are never read by the next
+        # step's ``_prepare_update_requests_metadata`` gather.
+        pt_src_idx = (self._ur.new_active_gpu + slot_idx).clamp(
+            max=self.max_requests - 1
+        )
+        self._ur.paused_tokens_buf.copy_(self._ur.next_tokens[pt_src_idx])
+        if self._ur.spec_tokens is not None and self._ur.paused_spec_tokens_buf is not None:
+            self._ur.paused_spec_tokens_buf.copy_(self._ur.spec_tokens[:, pt_src_idx])
 
         return self._ur.resume2_gpu
 
@@ -4444,8 +4498,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.reset_attention_state()
 
-        # GPU-side: survivor formula, repack newly-paused, paused-tokens copy.
-        self._gpu_finalize_outputs()
+        # The survivor formula, newly-paused repack, and paused-tokens copy
+        # all run inside graph 2 (``_evict_resume_chunked_tokens_body``) now,
+        # so there's no eager GPU work here.
 
         # Drain the dereg queue. Conditional on PC + pre-step requests; the
         # drain's internal short-circuit handles the no-events case.
@@ -4476,71 +4531,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
-
-    def _gpu_finalize_outputs(self) -> None:
-        """GPU-side finalize work: survivor formula, repacks, paused copy.
-
-        Computes the survivor formula on GPU, repacks survivor newly-paused
-        IDs into ``newly_paused_ids_post_buf`` with ``-1`` sentinels, and
-        copies the paused-region tokens (and speculative paused tokens)
-        from ``next_tokens`` / ``spec_tokens`` into the corresponding
-        ``paused_*_buf`` static buffers. Does no host sync.
-
-        The survivor formula tracks how each of the resume / eviction
-        passes consumes the ``[stayed-paused | newly-paused]`` paused
-        region: resume eats from the LEFT (stayed-paused first, then
-        newly-paused), eviction eats from the RIGHT (newly-paused).
-        Tracking each pass's contribution exactly is the only way to
-        recover the surviving slice — a naive ``bucket3 - (resume1 +
-        resume2)`` undercounts whenever bucket2 absorbed some resume.
-        """
-        # Survivor formula. Mirror of the old host-side max/min/clamp
-        # expressions, lifted to GPU int64 arithmetic.
-        bucket = self._ur.bucket_counts  # (5,) int64
-        bucket2 = bucket[2:3]
-        bucket3 = bucket[3:4]
-        resume1 = self._ur.resume1_gpu
-        resume2 = self._ur.resume2_gpu
-        evict_count = self._ur.evict_count_gpu
-
-        left_eaten_by_r1 = (resume1 - bucket2).clamp(min=0)
-        newly_after_r1 = bucket3 - left_eaten_by_r1
-        stayed_after_r1 = (bucket2 - resume1).clamp(min=0)
-        right_eaten_by_evict = torch.minimum(evict_count, newly_after_r1)
-        newly_after_evict = newly_after_r1 - right_eaten_by_evict
-        stayed_after_evict = stayed_after_r1 - (evict_count - right_eaten_by_evict)
-        left_eaten_by_r2 = (resume2 - stayed_after_evict).clamp(min=0)
-        final_newly_paused = newly_after_evict - left_eaten_by_r2  # (1,)
-        survivor_start = left_eaten_by_r1 + left_eaten_by_r2  # (1,)
-
-        # Stash the count for the post-finalize 2-int sync.
-        self._ur.final_newly_paused_gpu.copy_(final_newly_paused)
-
-        # Repack newly-paused survivors into a separate post-buffer:
-        #   post_buf[i] = newly_paused_ids_buf[survivor_start + i]  if i < final_newly_paused
-        #   post_buf[i] = -1                                         otherwise
-        # ``newly_paused_ids_buf`` has shape ``(max_requests + 1,)`` with the
-        # sink slot at index ``max_requests``; clamping OOB indices to the
-        # sink keeps the gather safe, and the ``where`` mask scrubs whatever
-        # the sink happened to hold.
-        slot_idx = self._ur.arange_long
-        np_src_idx = (survivor_start + slot_idx).clamp(max=self.max_requests)
-        in_range = slot_idx < final_newly_paused
-        gathered = self._ur.newly_paused_ids_buf[np_src_idx]
-        self._ur.newly_paused_ids_post_buf.copy_(
-            torch.where(in_range, gathered, torch.full_like(gathered, -1))
-        )
-
-        # Paused-tokens copy.  ``paused_tokens_buf[i] = next_tokens[active + i]``
-        # for ``i in [0, paused_count)``.  Tail positions read garbage indices
-        # (clamped to the last valid slot) and are never read by the next
-        # step's ``_prepare_update_requests_metadata`` gather.
-        pt_src_idx = (self._ur.new_active_gpu + slot_idx).clamp(
-            max=self.max_requests - 1
-        )
-        self._ur.paused_tokens_buf.copy_(self._ur.next_tokens[pt_src_idx])
-        if self._ur.spec_tokens is not None and self._ur.paused_spec_tokens_buf is not None:
-            self._ur.paused_spec_tokens_buf.copy_(self._ur.spec_tokens[:, pt_src_idx])
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
