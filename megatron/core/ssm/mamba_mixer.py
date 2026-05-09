@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -437,18 +438,29 @@ class MambaMixer(MegatronModule):
 
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
+        # During dummy_forward (torch.inference_mode() + no inference_context), not all CP
+        # ranks participate in the model forward pass, so the CP all_to_all collectives in
+        # pre_conv_ssm and post_conv_ssm would hang.  Override cp to act as cp_size=1 so
+        # those collectives become no-ops.  Real dynamic inference takes the early-return
+        # path above and never reaches here, so this does not affect inference correctness.
+        _cp_ctx = (
+            self.cp.inference_mode()
+            if torch.is_inference_mode_enabled() and self.cp.cp_size > 1
+            else contextlib.nullcontext()
+        )
+        with _cp_ctx:
+            zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
 
-        if in_inference_mode or not self.use_mem_eff_path:
-            # TODO(ksanthanam): Consider deprecating this path for training
-            assert packed_seq_params is None, (
-                "Training with packed sequences is not supported "
-                "in the non-memory-efficient code path."
-            )
-            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
-        else:
-            assert ssm_state is None
-            y = self._ssm_training(zxBCdt, packed_seq_params)
+            if in_inference_mode or not self.use_mem_eff_path:
+                # TODO(ksanthanam): Consider deprecating this path for training
+                assert packed_seq_params is None, (
+                    "Training with packed sequences is not supported "
+                    "in the non-memory-efficient code path."
+                )
+                y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            else:
+                assert ssm_state is None
+                y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
 
@@ -459,6 +471,15 @@ class MambaMixer(MegatronModule):
         Executes dynamic inference by separating decode and prefill requests and
         running them independently.
         """
+        # Dynamic inference never does the CP all_to_all layout conversion (pre_conv_ssm),
+        # so in_proj output and state buffers are TP-only sharded. Override the CP module
+        # to behave as cp_size=1 so that _ssm_prefill/_ssm_decode use matching dimensions.
+        with self.cp.inference_mode():
+            return self._dynamic_inference_impl(hidden_states, context)
+
+    def _dynamic_inference_impl(
+        self, hidden_states: torch.Tensor, context: DynamicInferenceContext
+    ):
         sequence_packing_available, reason_for_no_sequence_packing = (
             _check_mamba_sequence_packing_support(for_inference_not_training=True)
         )

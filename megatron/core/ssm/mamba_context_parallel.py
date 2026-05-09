@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -298,6 +299,39 @@ class MambaContextParallel:
         start = self.cp_rank * size
         end = start + size
         return param[start:end]
+
+    @contextmanager
+    def inference_mode(self):
+        """Temporarily override this object to behave as cp_size=1 for dynamic inference.
+
+        Dynamic inference never performs the all_to_all layout conversion (pre_conv_ssm),
+        so in_proj outputs and SSM state buffers are TP-only sharded (not TP+CP sharded).
+        Setting cp_size=1 makes all dimension lookups and parameter slices return the full
+        TP-local tensors, consistent with how the dynamic-inference state buffers are allocated.
+        """
+        if self.cp_size == 1:
+            yield
+            return
+
+        saved = (
+            self.cp_size,
+            self.d_inner_local_tpcp,
+            self.nheads_local_tpcp,
+            self.ngroups_local_tpcp,
+        )
+        self.cp_size = 1
+        self.d_inner_local_tpcp = self.d_inner_local_tp
+        self.nheads_local_tpcp = self.nheads_local_tp
+        self.ngroups_local_tpcp = self.ngroups_local_tp
+        try:
+            yield
+        finally:
+            (
+                self.cp_size,
+                self.d_inner_local_tpcp,
+                self.nheads_local_tpcp,
+                self.ngroups_local_tpcp,
+            ) = saved
 
 
 # TODO(duncan): Consider combining with all_to_all_sp2hp in mappings.py and using einops.rearrange
