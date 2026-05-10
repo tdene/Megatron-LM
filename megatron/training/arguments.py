@@ -1997,6 +1997,8 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         "log_max_attention_logit",
         "barrier_with_L1_time",
+        # registered manually in _add_inference_args (string-with-choices interface)
+        "mamba_ssm_state_dtype",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
