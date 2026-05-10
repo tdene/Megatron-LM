@@ -956,7 +956,8 @@ class TransformerConfig(ModelParallelConfig):
 
     mamba_ssm_state_dtype: Optional[torch.dtype] = None
     """Dtype for Mamba SSM states during training.
-    When None, defaults to params_dtype (current behavior).
+    When None, state_dtype is not passed to the kernel and the mamba_ssm
+    default applies (current behavior — typically inferred from input dtype).
     Training-side equivalent of mamba_inference_ssm_states_dtype."""
 
     use_mamba_mem_eff_path: bool = field(
