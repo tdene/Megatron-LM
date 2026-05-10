@@ -954,6 +954,11 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    mamba_ssm_state_dtype: Optional[torch.dtype] = None
+    """Dtype for Mamba SSM states during training.
+    When None, defaults to params_dtype (current behavior).
+    Training-side equivalent of mamba_inference_ssm_states_dtype."""
+
     use_mamba_mem_eff_path: bool = field(
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )

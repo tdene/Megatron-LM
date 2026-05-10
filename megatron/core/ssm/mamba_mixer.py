@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
@@ -66,6 +67,13 @@ except ImportError:
     mamba_chunk_scan_combined = None
     mamba_split_conv1d_scan_combined = None
     HAVE_MAMBA_SSM = False
+
+# mamba_split_conv1d_scan_combined gained state_dtype support in newer mamba_ssm versions.
+# Detect at import time so _ssm_training can pass it when available.
+_MAMBA_SPLIT_HAS_STATE_DTYPE = (
+    mamba_split_conv1d_scan_combined is not None
+    and "state_dtype" in inspect.signature(mamba_split_conv1d_scan_combined).parameters
+)
 
 try:
     from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
@@ -202,6 +210,7 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.ssm_state_dtype = config.mamba_ssm_state_dtype or config.params_dtype
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -718,6 +727,9 @@ class MambaMixer(MegatronModule):
             assert sequence_packing_available, reason_for_no_sequence_packing
             seq_idx = packed_seq_params.seq_idx
 
+        _split_kwargs = {}
+        if _MAMBA_SPLIT_HAS_STATE_DTYPE:
+            _split_kwargs["state_dtype"] = self.ssm_state_dtype
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -735,6 +747,7 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            **_split_kwargs,
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
@@ -1122,6 +1135,7 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
+                state_dtype=self.ssm_state_dtype,
             )
 
             if ssm_state is not None:
