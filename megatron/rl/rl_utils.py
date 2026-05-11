@@ -993,7 +993,10 @@ def compute_group_stats(
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
-        turn_lens.append(group_turn_lengths)
+        # Guard against an all-placeholder group (every sub-request failed, e.g.
+        # workplace_assistant prompts already exceeding seq_length at turn 1).
+        # turn_lens drives min/max/mean stats downstream; max([]) crashes.
+        turn_lens.append(group_turn_lengths or [0])
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
