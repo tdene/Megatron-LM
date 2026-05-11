@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import abc
+import contextlib
 from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
@@ -106,6 +107,59 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """
         raise NotImplementedError()
 
+    @contextlib.contextmanager
+    def _attention_cp_disabled(self):
+        """Temporarily disable context-parallel ring-attention for the duration of
+        an inference forward.
+
+        Why: the dynamic-inference engine's mp_group excludes CP (see
+        `megatron.rl.parallel_utils:100` and `dynamic_engine.py:609-610`), so a
+        single request is dispatched to one CP rank while its peer waits idly
+        in the asyncio loop. TE attention under CP issues ring-attention P2P
+        sends/recvs that require all CP ranks to participate, which deadlocks
+        NCCL. This mirrors the per-layer `MambaContextParallel.inference_mode()`
+        shielding (`mamba_mixer.py:486`) but applies to attention layers.
+
+        Mamba state buffers are already TP-only sharded for inference and
+        attention KV caches likewise hold TP-local heads, so running each
+        request locally on its assigned CP rank is consistent with how state
+        is allocated.
+        """
+        if getattr(self.config, "context_parallel_size", 1) <= 1:
+            yield
+            return
+
+        # Lazily discover TE attention modules so we don't walk the model
+        # on every forward. The set is stable for the wrapper's lifetime.
+        if not hasattr(self, "_te_attention_modules"):
+            try:
+                from megatron.core.extensions.transformer_engine import (
+                    TEDotProductAttention,
+                )
+            except ImportError:
+                self._te_attention_modules = []
+            else:
+                self._te_attention_modules = [
+                    m for m in self.model.modules()
+                    if isinstance(m, TEDotProductAttention)
+                ]
+
+        saved = []
+        try:
+            for m in self._te_attention_modules:
+                saved.append((
+                    m,
+                    getattr(m, "cp_group", None),
+                    getattr(m, "cp_global_ranks", None),
+                    getattr(m, "cp_stream", None),
+                    getattr(m, "cp_comm_type", None),
+                ))
+                m.set_context_parallel_group(None, None, None, getattr(m, "cp_comm_type", None))
+            yield
+        finally:
+            for m, cp_group, cp_global_ranks, cp_stream, cp_comm_type in saved:
+                m.set_context_parallel_group(cp_group, cp_global_ranks, cp_stream, cp_comm_type)
+
     def _forward(self, inference_input):
         """Runs a forward pass of the model.
 
@@ -118,13 +172,14 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        return self.model(
-            tokens,
-            position_ids,
-            attention_mask,
-            inference_context=self.inference_context,
-            runtime_gather_output=True,  # Inference should always gather the logits
-        )
+        with self._attention_cp_disabled():
+            return self.model(
+                tokens,
+                position_ids,
+                attention_mask,
+                inference_context=self.inference_context,
+                runtime_gather_output=True,  # Inference should always gather the logits
+            )
 
     @torch.inference_mode()
     def dummy_forward(self):
@@ -152,7 +207,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
         is_spec_decode = (
             self.inference_context.is_dynamic_batching() and self.config.mtp_num_layers is not None
         )
-        return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
+        with self._attention_cp_disabled():
+            return self.model(tokens, position_ids, attention_mask, is_spec_decode=is_spec_decode)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
