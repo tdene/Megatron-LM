@@ -606,7 +606,13 @@ class DynamicInferenceEngine(AbstractEngine):
         tp_rank = get_pg_rank(self.pg_collection.tp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
 
-        self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
+        # Use the actual mp_group rank rather than (tp_rank, pp_rank) so the
+        # coordinator predicate is consistent with whatever dimensions mp_group
+        # spans. With CP>1 and mp_group=[tp, cp, pp], this restricts the
+        # coordinator to cp_rank=0 — otherwise every CP-peer of the (0,0) TP/PP
+        # coordinate becomes its own coordinator and the engines split across
+        # multiple DP coordinator subprocesses, deadlocking _world_barrier.
+        self.is_mp_coordinator = get_pg_rank(mp_group) == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = socket.gethostname()
