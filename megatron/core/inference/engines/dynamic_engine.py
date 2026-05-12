@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import logging
 import multiprocessing
+import os
 import socket
 import struct
 import time
@@ -2566,6 +2567,46 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    async def _check_mp_divergence(self, local_pending: int) -> None:
+        """Diagnostic: detect active_request_count divergence across mp_group.
+
+        With mp_group = [tp, cp, pp] and the MP coordinator on cp_rank=0, requests
+        are fanned out to CP-peers via a ZMQ PUB/SUB socket. A dropped PUBLISH (e.g.
+        slow-joiner handshake race) leaves cp_rank=1 unaware of an in-flight request
+        — cp_rank=0 keeps decoding alone, all other DP groups eventually block at
+        the world barrier, run hangs silently.
+
+        Gated by MEGATRON_RL_CP_DIVERGENCE_CHECK so this is off in production. When
+        on: every call, max+min all-reduce of local_pending across mp_group, log an
+        error on mismatch. Set MEGATRON_RL_CP_DIVERGENCE_FAIL=1 to raise instead of
+        logging (useful in smoke tests).
+        """
+        if not os.environ.get("MEGATRON_RL_CP_DIVERGENCE_CHECK"):
+            return
+        mp_group = self.pg_collection.mp
+        if get_pg_size(mp_group) <= 1:
+            return
+        # max(local), max(-local) -> global_max, -global_min in one collective.
+        t = torch.tensor(
+            [local_pending, -local_pending], dtype=torch.int64, device="cuda"
+        )
+        work = torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MAX, group=mp_group, async_op=True
+        )
+        while not work.is_completed():
+            await asyncio.sleep(0)
+        global_max = int(t[0].item())
+        global_min = -int(t[1].item())
+        if global_max != global_min:
+            msg = (
+                f"MP divergence: rank={torch.distributed.get_rank()} "
+                f"mp_rank={get_pg_rank(mp_group)} local_pending={local_pending} "
+                f"mp_max={global_max} mp_min={global_min} step={self.context.step_count}"
+            )
+            logging.error(msg)
+            if os.environ.get("MEGATRON_RL_CP_DIVERGENCE_FAIL"):
+                raise RuntimeError(msg)
+
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
     ) -> tuple[int, bool]:
@@ -2655,6 +2696,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     local_pending = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
+                    await self._check_mp_divergence(local_pending)
                     global_work, all_pausing = await self._ep_establish_consensus(
                         local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                     )
