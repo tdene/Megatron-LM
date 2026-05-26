@@ -85,7 +85,7 @@ MODEL_OPTIONS="\
   --inference-max-seq-length $MAX_SEQ_LENGTH \
   --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
-  --distributed-timeout-minutes 60 \
+  --distributed-timeout-minutes 240 \
   --use-mcore-models \
   --no-mmap-bin-files \
   --disable-bias-linear \
