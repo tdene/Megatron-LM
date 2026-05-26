@@ -209,6 +209,78 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+        # Fix CP=2 silent hang: when pg_collection comes from
+        # ProcessGroupCollection.use_mpu_process_groups() (i.e. training-model reuse,
+        # the case where rl_inference_* parallelism args are unset), pg_collection.mp
+        # is parallel_state.get_model_parallel_group(), which spans only 'tp-pp' and
+        # excludes CP. That causes mp_size = TP*PP instead of TP*CP*PP, so the
+        # MP coordinator is elected per CP-peer independently -> request fan-out
+        # breaks and the engine deadlocks. Widen pg_collection.mp to include CP.
+        try:
+            tp_size_for_mp = (
+                get_pg_size(self.pg_collection.tp) if self.pg_collection.tp is not None else 1
+            )
+            pp_size_for_mp = (
+                get_pg_size(self.pg_collection.pp) if self.pg_collection.pp is not None else 1
+            )
+            cp_size_for_mp = (
+                get_pg_size(self.pg_collection.cp) if self.pg_collection.cp is not None else 1
+            )
+            mp_size_for_mp = (
+                get_pg_size(self.pg_collection.mp) if self.pg_collection.mp is not None else 1
+            )
+            expected_mp_with_cp = tp_size_for_mp * cp_size_for_mp * pp_size_for_mp
+            if (
+                cp_size_for_mp > 1
+                and mp_size_for_mp == tp_size_for_mp * pp_size_for_mp
+                and mp_size_for_mp != expected_mp_with_cp
+            ):
+                if pp_size_for_mp == 1:
+                    # PP=1: a group spanning TP+CP is exactly the desired mp_group.
+                    # tp_cp is populated by use_mpu_process_groups() (see
+                    # megatron/core/process_groups_config.py:190-192).
+                    tp_cp_group = getattr(self.pg_collection, 'tp_cp', None)
+                    if tp_cp_group is None:
+                        # Fall back to mpu accessor directly.
+                        from megatron.core import parallel_state as _ps
+
+                        tp_cp_group = _ps.get_tensor_and_context_parallel_group(
+                            check_initialized=False
+                        )
+                    new_mp_size = (
+                        get_pg_size(tp_cp_group) if tp_cp_group is not None else mp_size_for_mp
+                    )
+                    if tp_cp_group is not None and new_mp_size == expected_mp_with_cp:
+                        logging.info(
+                            f"Inference engine widened pg_collection.mp from size "
+                            f"{mp_size_for_mp} to {new_mp_size} to include CP={cp_size_for_mp} "
+                            f"(TP={tp_size_for_mp}, PP={pp_size_for_mp})"
+                        )
+                        self.pg_collection.mp = tp_cp_group
+                    else:
+                        logging.warning(
+                            f"Inference engine: pg_collection.mp size={mp_size_for_mp} "
+                            f"excludes CP={cp_size_for_mp} but no suitable TP+CP group "
+                            f"was found (tp_cp={tp_cp_group}). Leaving mp unchanged; "
+                            f"CP-aware coordinator election may misbehave."
+                        )
+                else:
+                    # PP>1: not in the tested target use case. Leave behaviour as-is
+                    # to avoid regressing PP runs we haven't validated.
+                    logging.warning(
+                        f"Inference engine: pg_collection.mp excludes CP "
+                        f"(mp_size={mp_size_for_mp}, expected {expected_mp_with_cp} for "
+                        f"TP*CP*PP={tp_size_for_mp}*{cp_size_for_mp}*{pp_size_for_mp}) "
+                        f"and PP>1. Not widening mp automatically; if the engine hangs, "
+                        f"set rl_inference_* parallelism args to build a proper inference "
+                        f"pg_collection."
+                    )
+        except Exception as _widen_exc:  # noqa: BLE001
+            logging.warning(
+                f"Inference engine: failed to evaluate/widen pg_collection.mp for CP: "
+                f"{_widen_exc}. Proceeding with the original mp group."
+            )
+
         # Initialization options.
         self.controller = controller
         self.context = context
@@ -2576,16 +2648,44 @@ class DynamicInferenceEngine(AbstractEngine):
         — cp_rank=0 keeps decoding alone, all other DP groups eventually block at
         the world barrier, run hangs silently.
 
-        Gated by MEGATRON_RL_CP_DIVERGENCE_CHECK so this is off in production. When
-        on: every call, max+min all-reduce of local_pending across mp_group, log an
-        error on mismatch. Set MEGATRON_RL_CP_DIVERGENCE_FAIL=1 to raise instead of
-        logging (useful in smoke tests).
+        Two failure modes are surfaced:
+        - **Value mismatch**: all mp_group members reach the check but
+          local_pending differs. Raises iff MEGATRON_RL_CP_DIVERGENCE_FAIL=1
+          (otherwise just logs — useful when monitoring without crashing).
+        - **all_reduce timeout**: at least one mp_group member never reached
+          the check (it's stuck at an earlier collective like world_barrier).
+          Always raises, because the engine cannot make progress and the run
+          would hang indefinitely otherwise. THIS is the production CP=2 hang
+          fingerprint — cp_rank=1 blocked at suspend()'s world_barrier while
+          cp_rank=0 keeps decoding alone.
+
+        Auto-enabled whenever mp_group spans >1 rank (i.e. CP>1 or PP>1).
+        Set MEGATRON_RL_CP_DIVERGENCE_OFF=1 to disable. Tuning:
+        MEGATRON_RL_CP_DIVERGENCE_INTERVAL (default 10 = check every 10th
+        engine step to keep overhead minimal); MEGATRON_RL_CP_DIVERGENCE_TIMEOUT
+        (default 30 s before declaring the peer stuck).
+
+        Earlier versions required MEGATRON_RL_CP_DIVERGENCE_CHECK=1 to opt in,
+        but that env var was being stripped between the submitting shell and
+        the training container in our pyxis setup — the detector silently
+        no-op'd and the run still hung. Auto-on avoids that.
         """
-        if not os.environ.get("MEGATRON_RL_CP_DIVERGENCE_CHECK"):
+        if os.environ.get("MEGATRON_RL_CP_DIVERGENCE_OFF"):
             return
         mp_group = self.pg_collection.mp
         if get_pg_size(mp_group) <= 1:
             return
+        if not getattr(self, "_mp_divergence_announced", False):
+            logging.info(
+                f"MP divergence detector active: mp_size={get_pg_size(mp_group)} "
+                f"interval={os.environ.get('MEGATRON_RL_CP_DIVERGENCE_INTERVAL', '10')} "
+                f"timeout_s={os.environ.get('MEGATRON_RL_CP_DIVERGENCE_TIMEOUT', '30')}"
+            )
+            self._mp_divergence_announced = True
+        interval = int(os.environ.get("MEGATRON_RL_CP_DIVERGENCE_INTERVAL", "10"))
+        if self.context.step_count % max(interval, 1) != 0:
+            return
+        timeout_s = float(os.environ.get("MEGATRON_RL_CP_DIVERGENCE_TIMEOUT", "30"))
         # max(local), max(-local) -> global_max, -global_min in one collective.
         t = torch.tensor(
             [local_pending, -local_pending], dtype=torch.int64, device="cuda"
@@ -2593,15 +2693,34 @@ class DynamicInferenceEngine(AbstractEngine):
         work = torch.distributed.all_reduce(
             t, op=torch.distributed.ReduceOp.MAX, group=mp_group, async_op=True
         )
+        deadline = time.monotonic() + timeout_s
         while not work.is_completed():
-            await asyncio.sleep(0)
+            if time.monotonic() > deadline:
+                # The all_reduce hasn't completed within timeout_s, so an
+                # mp_group peer never entered this check. That stuckness IS the
+                # bug. Raise instead of looping forever — NCCL state is shot
+                # at this point anyway (the pending op blocks the comm stream),
+                # so there's no safe way to continue.
+                raise RuntimeError(
+                    f"MP divergence-check all_reduce timed out after "
+                    f"{timeout_s:.0f}s. rank={torch.distributed.get_rank()} "
+                    f"mp_rank={get_pg_rank(mp_group)} "
+                    f"local_pending={local_pending} "
+                    f"step={self.context.step_count}. At least one CP peer in "
+                    f"mp_group never entered _check_mp_divergence — it is "
+                    f"stuck at an earlier collective (likely suspend()'s "
+                    f"world barrier in rl_utils.py). This matches the "
+                    f"production CP=2 long-tail-decode hang signature."
+                )
+            await asyncio.sleep(0.005)
         global_max = int(t[0].item())
         global_min = -int(t[1].item())
         if global_max != global_min:
             msg = (
                 f"MP divergence: rank={torch.distributed.get_rank()} "
                 f"mp_rank={get_pg_rank(mp_group)} local_pending={local_pending} "
-                f"mp_max={global_max} mp_min={global_min} step={self.context.step_count}"
+                f"mp_max={global_max} mp_min={global_min} "
+                f"step={self.context.step_count}"
             )
             logging.error(msg)
             if os.environ.get("MEGATRON_RL_CP_DIVERGENCE_FAIL"):

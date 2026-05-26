@@ -1194,6 +1194,33 @@ class TextGenerationController:
 
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
 
+            # CP-divergence fix. Under CP>1, the post-PP-broadcast logits are
+            # not guaranteed bit-identical across cp_ranks (CP shards the
+            # sequence dim and can introduce accumulation-order asymmetries).
+            # Independent per-rank sampling on slightly-different logits then
+            # produces different next-tokens, and the downstream finish check
+            # (sampled_token != termination_id at _dynamic_step_postprocess_logits)
+            # disagrees across the mp_group — observed as cumulative divergence
+            # of finished_request_count between cp_ranks (one finishes a
+            # request, its CP-peer doesn't), which trips _check_mp_divergence.
+            # Broadcasting mp_rank=0's sample to all mp_group members
+            # eliminates the asymmetry at one all_reduce-equivalent op per
+            # step. No-op when mp_size == 1.
+            mp_group = getattr(
+                getattr(context.config, "pg_collection", None), "mp", None
+            )
+            if mp_group is not None and torch.distributed.get_world_size(mp_group) > 1:
+                active_request_count = (
+                    context.total_request_count - context.paused_request_count
+                )
+                if active_request_count > 0:
+                    src = torch.distributed.get_global_rank(mp_group, 0)
+                    torch.distributed.broadcast(
+                        self._sampled_tokens_cuda[:active_request_count],
+                        src=src,
+                        group=mp_group,
+                    )
+
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
 

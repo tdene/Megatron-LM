@@ -384,7 +384,10 @@ def align_unpacked_inference_logprobs(
 
     # We need to align old_logprobs and inference logprobs as the latter are only for generations
     for i, inf_logprobs in enumerate(inference_logprobs):
-        first_gen_idx = first_gen_tok[i]
+        first_gen_idx = int(first_gen_tok[i])
+        if first_gen_idx < 0:
+            # No generation tokens (dropped/placeholder rollout) — nothing to align.
+            continue
         # We subtract -1 here because we append eod token on the train side, and we do not
         # get it from the inference. For the eod token, we reuse old_logprobs value.
         end_idx = min(first_gen_idx + len(inf_logprobs), padded_inference_logprobs.shape[1])
@@ -702,17 +705,45 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
+def _zigzag_slice(x: torch.Tensor, cp_size: int, cp_rank: int) -> torch.Tensor:
+    """Pick chunks ``cp_rank`` and ``2*cp_size - cp_rank - 1`` after viewing
+    the sequence dim as ``2*cp_size`` equal chunks, then concatenate.
+
+    Mirrors ``get_batch_on_this_cp_rank`` in ``megatron/core/utils.py`` — the
+    canonical Megatron-LM load-balanced (zigzag) CP layout that TE ring
+    attention, RoPE-CP, and Mamba-CP all assume.
+    """
+    seq_len = x.shape[1]
+    chunk_size = seq_len // (2 * cp_size)
+    # [B, S, ...] -> [B, 2*CP, S/(2*CP), ...]
+    x = x.view(x.shape[0], 2 * cp_size, chunk_size, *x.shape[2:])
+    index = torch.tensor(
+        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.int64, device=x.device
+    )
+    x = x.index_select(1, index)
+    # [B, 2, S/(2*CP), ...] -> [B, S/CP, ...]
+    return x.reshape(x.shape[0], -1, *x.shape[3:]).contiguous()
+
+
 def _scatter_for_context_parallel(
     tokens: torch.Tensor,
     position_ids: torch.Tensor,
     packed_seq_params: 'PackedSeqParams',
     cp_size: int,
 ) -> tuple:
-    """Prepare local inputs for one context-parallel rank.
+    """Prepare local inputs for one context-parallel rank using the
+    canonical Megatron-LM zigzag (load-balanced) CP layout.
 
-    Slices the sequence dimension so that each CP rank handles
-    ``seq_len // cp_size`` tokens, and computes the matching token labels
-    needed for the log-softmax without any cross-rank communication.
+    Each CP rank receives a NON-CONTIGUOUS pair of chunks
+    ``(chunk_r, chunk_{2*cp_size-r-1})`` after a 2*cp_size partition of the
+    sequence dim — matching what TE ring attention (``cp_comm_type=p2p``),
+    Megatron's RoPE-CP slicer, and the Mamba CP layer all expect. A plain
+    contiguous slice produces silently-wrong attention / SSM outputs (see
+    cp_zigzag_scatter_bug memory).
+
+    Labels are pre-shifted globally then zigzag-sliced the same way, so each
+    rank's local labels stay aligned with its local tokens with no cross-rank
+    communication. The final boundary label is a dummy (always loss-masked).
 
     Args:
         tokens:          Full token tensor  [batch, seq_len].
@@ -729,29 +760,31 @@ def _scatter_for_context_parallel(
     cp_rank  = mpu.get_context_parallel_rank()
     cp_group = mpu.get_context_parallel_group()
 
-    seq_len    = tokens.shape[1]
-    assert seq_len % cp_size == 0, (
-        f"Sequence length {seq_len} must be divisible by "
-        f"context_parallel_size {cp_size}."
+    seq_len = tokens.shape[1]
+    assert seq_len % (2 * cp_size) == 0, (
+        f"Sequence length {seq_len} must be divisible by 2*context_parallel_size "
+        f"({2 * cp_size}) for the zigzag CP layout."
     )
-    local_size = seq_len // cp_size
-    start      = cp_rank * local_size
-    end        = start + local_size
 
-    local_tokens      = tokens[:, start:end].contiguous()
-    local_position_ids = position_ids[:, start:end].contiguous()
+    # Pre-shifted labels: tokens_shifted[i] = tokens[i+1] for i < S-1, and
+    # tokens_shifted[S-1] = tokens[S-1] (dummy boundary, always loss-masked).
+    # Zigzag-slicing this together with tokens keeps labels aligned per-rank.
+    tokens_shifted = torch.cat([tokens[:, 1:], tokens[:, -1:]], dim=1)
 
-    # Build labels without cross-rank communication.
-    # Label for position i is tokens[i+1].  For rank r that means tokens at
-    # indices [r*L+1, (r+1)*L+1).  The last element of the last rank wraps to
-    # tokens[-1] (a padding token that is always loss-masked, so it is harmless).
-    tokens_extended = torch.cat([tokens, tokens[:, -1:]], dim=1)  # [batch, seq_len+1]
-    local_labels = tokens_extended[:, start + 1 : end + 1].contiguous()
+    local_tokens       = _zigzag_slice(tokens,          cp_size, cp_rank)
+    local_position_ids = _zigzag_slice(position_ids,    cp_size, cp_rank)
+    local_labels       = _zigzag_slice(tokens_shifted,  cp_size, cp_rank)
 
     # Shallow-copy so we do not mutate the caller's object.
     cp_packed_seq_params = copy.copy(packed_seq_params)
     cp_packed_seq_params.cp_group      = cp_group
     cp_packed_seq_params.local_cp_size = cp_size
+    # THD CP path needs cu_seqlens_*_padded; fall back to the unpadded variant
+    # when the caller didn't supply one (matches get_thd_batch_on_this_cp_rank).
+    if cp_packed_seq_params.cu_seqlens_q_padded is None:
+        cp_packed_seq_params.cu_seqlens_q_padded  = cp_packed_seq_params.cu_seqlens_q
+    if cp_packed_seq_params.cu_seqlens_kv_padded is None:
+        cp_packed_seq_params.cu_seqlens_kv_padded = cp_packed_seq_params.cu_seqlens_kv
 
     return local_tokens, local_position_ids, cp_packed_seq_params, local_labels
 
@@ -760,28 +793,30 @@ def _gather_logprobs_context_parallel(
     local_logprobs: torch.Tensor,
     no_grad: bool,
 ) -> torch.Tensor:
-    """All-gather per-rank logprobs into the full-sequence logprob tensor.
+    """All-gather per-rank logprobs and invert the zigzag scatter.
 
-    Each CP rank holds ``[batch, local_size]`` logprobs.  After gathering all
-    ranks we get ``[batch, seq_len]`` and drop the final element (the dummy
-    boundary logprob appended by ``_scatter_for_context_parallel``) to obtain
-    ``[batch, seq_len - 1]``.
+    Each rank holds ``[batch, 2*chunk]`` logprobs corresponding to chunks
+    ``(r, 2*cp_size-r-1)`` of the global sequence. After all-gather we split
+    each rank's slice into halves and place them in their global chunk slots
+    to reconstruct ``[batch, seq_len]``, then drop the final dummy position
+    appended by ``_scatter_for_context_parallel`` → ``[batch, seq_len - 1]``.
 
     Uses ``torch.distributed.nn.functional.all_gather`` on the training path so
-    that gradients flow back through the gather to each rank's local forward
-    pass.  The no-grad path uses the non-differentiable variant.
+    that gradients flow back through the gather (reduce-scatter) to each rank's
+    local forward pass; ``cat`` in zigzag order routes each chunk's gradient
+    back to its source rank.
 
     Args:
-        local_logprobs: Local logprob tensor  [batch, local_size].
+        local_logprobs: Local logprob tensor  [batch, 2*chunk].
         no_grad:        True when called in inference/reference-logprob mode.
 
     Returns:
         Full logprob tensor  [batch, seq_len - 1].
     """
     cp_group = mpu.get_context_parallel_group()
+    cp_size  = mpu.get_context_parallel_world_size()
 
     if no_grad:
-        cp_size = mpu.get_context_parallel_world_size()
         gathered = [torch.empty_like(local_logprobs) for _ in range(cp_size)]
         torch.distributed.all_gather(gathered, local_logprobs, group=cp_group)
     else:
@@ -789,8 +824,16 @@ def _gather_logprobs_context_parallel(
         # each rank's gradient slice back to the correct local forward pass.
         gathered = torch.distributed.nn.functional.all_gather(local_logprobs, group=cp_group)
 
+    # Each rank's gather result contains [chunk_r | chunk_{2*CP-r-1}]; split
+    # and place in global chunk order.
+    chunk_size = local_logprobs.shape[1] // 2
+    chunks = [None] * (2 * cp_size)
+    for r in range(cp_size):
+        chunks[r]                    = gathered[r][:, :chunk_size]
+        chunks[2 * cp_size - r - 1]  = gathered[r][:, chunk_size:]
+
     # cat → [batch, seq_len]; drop the dummy boundary position → [batch, seq_len-1].
-    return torch.cat(gathered, dim=1)[:, :-1]
+    return torch.cat(chunks, dim=1)[:, :-1]
 
 
 def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
@@ -969,10 +1012,16 @@ def compute_group_stats(
                     lang_rl_log(
                         f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} tokens] {detokenized_traj}"
                     )
-                    # TODO(vitalyk): how does multiturn change EOD/EOT?
-                    assert (len(turn_traj) == seq_len) or (
-                        turn_traj[-1] == tokenizer.eod
-                    ), f"Rollout is not the correct length: {len(turn_traj)} {turn_traj[-1]}\n{detokenized_traj}"
+                    # Multi-turn agents can terminate a turn on a tool-call boundary,
+                    # which is neither tokenizer.eod (11) nor a hit-seq_len truncation.
+                    # The downstream packing/loss code only requires len <= seq_len;
+                    # the strict EOD/full-length check was a single-turn assumption.
+                    # TODO(vitalyk): tighten this with a per-agent terminator set if
+                    # we want to keep some sanity check on multi-turn boundaries.
+                    assert len(turn_traj) <= seq_len, (
+                        f"Rollout too long: {len(turn_traj)} > {seq_len} "
+                        f"(last token {turn_traj[-1]})\n{detokenized_traj}"
+                    )
             else:
                 lang_rl_log(
                     f"Rollout: [{rollout.env_id}] [{rollout.reward} : {len(rollout.trajectory)} chars] {rollout.trajectory}"
@@ -1289,10 +1338,13 @@ def prepare_trajectories(
             generation_mask = rollout.generation_mask[turn_idx] if isinstance(rollout, TokenRollout) else None
             length = len(trajectory)
             assert length <= seq_length, "Rollout too long, how did this happen?"
-            if len(trajectory) < seq_length:
-                assert (
-                    trajectory[-1] == tokenizer.eod
-                ), "Trajectories under a seq_length limit should have eod token at the end."
+            # Multi-turn agents can terminate a turn on a tool-call boundary which is
+            # neither tokenizer.eod nor seq_length truncation. Padding logic below
+            # handles any short trajectory regardless of terminator. See companion
+            # relaxation in compute_group_stats (~line 1013).
+            # Old strict check:
+            #     if len(trajectory) < seq_length:
+            #         assert trajectory[-1] == tokenizer.eod, ...
 
             if length < seq_length:
                 trajectory.extend([tokenizer.pad] * (seq_length - length))
@@ -1317,6 +1369,19 @@ def prepare_trajectories(
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
+
+    if trajs.ndim == 1:
+        # trajs is 1D (shape (0,)) when every rollout had trajectory=[] — i.e. all inference
+        # requests returned empty-trajectory placeholders (e.g. 500/TokenOverflowError from KV-cache
+        # exhaustion or a chunked-prefill wedge).  The downstream trajs[:, 0] assert would give a
+        # confusing IndexError; raise an actionable message here instead.
+        rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
+        raise RuntimeError(
+            f"[rank {rank_str}] prepare_trajectories: 0 usable trajectories from {len(rollouts)} rollout(s). "
+            f"All rollouts have trajectory=[] (empty-trajectory placeholders). "
+            f"Likely cause: inference server returned only 500/TokenOverflowError — check for "
+            f"KV-cache exhaustion (too many parallel generations at this SL) or --enable-chunked-prefill wedge."
+        )
 
     # Only process if we have inference_logprobs
     if inference_logprobs and any(lp is not None for lp in inference_logprobs):
@@ -1511,6 +1576,91 @@ def prepare_data_for_update(
                 rollouts, tokenizer, args.seq_length, sequence_packing, args.rl_skip_bos_token
             )
 
+        # DP-split divergence fix for multi-turn rollouts.
+        #
+        # The DP split above slices `rollouts` evenly across DP ranks, but multi-turn
+        # rollouts produce 1..max_steps trajectories EACH (one per turn). Per-rank
+        # trajectory counts therefore vary: one rank may get all 1-turn rollouts
+        # (32 trajs), another may get all 6-turn (192 trajs).
+        #
+        # Downstream `compute_logprobs_batch` iterates `len(data_loader)` times —
+        # variable per rank — and each iter calls `forward_backward_no_pipelining`
+        # which fires `Timers.start(barrier=True)` on default_pg. Ranks with fewer
+        # trajectories race ahead to the next barrier while slower ranks are still
+        # in their loop → deadlock at the world-level barrier.
+        #
+        # Pad each rank's trajectories up to the global max across DP ranks so
+        # all ranks loop the same number of times. Padded entries have
+        # generation_mask=False everywhere → zero loss / zero grad contribution.
+        if (data_parallel_world_size := mpu.get_data_parallel_world_size()) > 1:
+            local_count = trajs.shape[0]
+            max_count_t = torch.tensor([local_count], device='cuda', dtype=torch.long)
+            torch.distributed.all_reduce(
+                max_count_t,
+                op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group(),
+            )
+            target_count = int(max_count_t.item())
+
+            if target_count > local_count:
+                pad_n = target_count - local_count
+                seq_len = trajs.shape[1]
+                pad_trajs = torch.full(
+                    (pad_n, seq_len), tokenizer.pad,
+                    dtype=trajs.dtype, device=trajs.device,
+                )
+                pad_gen_masks = torch.zeros(
+                    (pad_n, seq_len),
+                    dtype=generation_masks.dtype, device=generation_masks.device,
+                )
+                trajs = torch.cat([trajs, pad_trajs], dim=0)
+                generation_masks = torch.cat([generation_masks, pad_gen_masks], dim=0)
+                # advantages was sliced to local_num_turns above; pad with zeros.
+                pad_adv = torch.zeros(
+                    pad_n, dtype=advantages.dtype, device=advantages.device,
+                )
+                advantages = torch.cat([advantages, pad_adv])
+                # inference_logprobs is None, OR a list of per-traj tensors (no-packing path),
+                # OR a [N, S] padded tensor (sequence-packing path — `_pad_nonnull_with_zeros`
+                # at ~prepare_trajectories line 1376 returns a 2D tensor).
+                if inference_logprobs is not None:
+                    if isinstance(inference_logprobs, torch.Tensor):
+                        # Tensor path: concatenate zero rows of matching shape/dtype/device.
+                        pad_lp = torch.zeros(
+                            (pad_n, *inference_logprobs.shape[1:]),
+                            dtype=inference_logprobs.dtype,
+                            device=inference_logprobs.device,
+                        )
+                        inference_logprobs = torch.cat([inference_logprobs, pad_lp], dim=0)
+                    else:
+                        # List path: append zero tensors matching existing non-None entry shape.
+                        non_none = next(
+                            (lp for lp in inference_logprobs if lp is not None), None
+                        )
+                        if non_none is not None:
+                            dummy_lp = torch.zeros_like(non_none)
+                        else:
+                            dummy_lp = torch.zeros(seq_len - 1, dtype=torch.float)
+                        inference_logprobs.extend(
+                            [dummy_lp.clone() for _ in range(pad_n)]
+                        )
+
+            # Rebuild global_advantages from padded local advantages so that
+            # `pack_all_trajectories` (sequence-packing path) — which all-gathers
+            # local trajs into a global concat — has a global_advantages tensor
+            # that matches the post-gather length. Without this, the dummy
+            # trajectories shift indices and `global_advantages[seq_indices]`
+            # would go out of range.
+            gathered_adv = [
+                torch.empty_like(advantages)
+                for _ in range(data_parallel_world_size)
+            ]
+            torch.distributed.all_gather(
+                gathered_adv, advantages,
+                group=mpu.get_data_parallel_group(),
+            )
+            global_advantages = torch.cat(gathered_adv, dim=0)
+
         packing_context = None
         # Build trajectories based on sequence packing or standard processing
         if sequence_packing:
@@ -1547,17 +1697,35 @@ def prepare_data_for_update(
             except Exception:
                 pass
         else:
-            # Always compute standard masks for the original data (we'll need them later)
+            # Always compute standard masks for the original data (we'll need them later).
+            # We discard the attention_mask, but get_ltor_masks_and_position_ids allocates a
+            # [1, seq_length, seq_length] tril tensor unconditionally — that's 68 GB at
+            # seq_length=131072 in fp32 and OOMs on iter 2's data prep. Skip the helper in
+            # the common case (no EOD-based reset) and compute loss_mask + position_ids
+            # inline without the seq^2 allocation. Fall through to the helper if either
+            # reset flag is set, since that path needs the attention_mask buffer to mark
+            # the inter-document boundaries.
             with nvtx_range("get_ltor_masks_and_position_ids", time=True):
-                _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
-                    trajs,
-                    tokenizer.eod,
-                    tokenizer.pad,
-                    args.reset_position_ids,
-                    args.reset_attention_mask,
-                    eod_mask_loss=False,
-                    pad_mask_loss=True,
-                )
+                if args.reset_position_ids or args.reset_attention_mask:
+                    _, original_loss_mask, original_position_ids = get_ltor_masks_and_position_ids(
+                        trajs,
+                        tokenizer.eod,
+                        tokenizer.pad,
+                        args.reset_position_ids,
+                        args.reset_attention_mask,
+                        eod_mask_loss=False,
+                        pad_mask_loss=True,
+                    )
+                else:
+                    # Mirror the helper's behaviour for eod_mask_loss=False, pad_mask_loss=True.
+                    original_loss_mask = torch.ones_like(trajs, dtype=torch.float)
+                    original_loss_mask[trajs == tokenizer.pad] = 0.0
+                    _, seq_len = trajs.size()
+                    original_position_ids = (
+                        torch.arange(seq_len, dtype=torch.long, device=trajs.device)
+                        .unsqueeze(0)
+                        .expand_as(trajs)
+                    )
                 original_loss_mask[~generation_masks] = 0.0
                 compute_trajs = trajs
                 compute_position_ids = original_position_ids
