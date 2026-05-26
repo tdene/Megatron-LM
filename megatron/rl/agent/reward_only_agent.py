@@ -129,7 +129,9 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         Default: delegates to get_reward() using only the final response, which
         keeps single-turn behaviour unchanged.
         """
-        return await self.get_reward(responses[-1].response.content, golden)
+        return await self.get_reward(
+            responses[-1].response.content, golden, responses[-1].finish_reason
+        )
 
     async def _run_episode(
         self,
