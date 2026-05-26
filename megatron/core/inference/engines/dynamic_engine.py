@@ -1904,9 +1904,15 @@ class DynamicInferenceEngine(AbstractEngine):
             }
         else:
             # active_token_count and step_count are still consumed by
-            # post_process_requests' pre_fwd_* args (for add_event_generated_token);
-            # the other four fields are only read in the gated print block.
+            # post_process_requests' pre_fwd_* args (for add_event_generated_token).
+            # is_decode_only / total_request_count / paused_request_count are
+            # consumed unconditionally by the flops-calculator + prefill/decode
+            # time-split blocks below, so they must be populated every step
+            # (not just on log steps). max_requests is logging-only.
             pre_step_context_state = {
+                "is_decode_only": is_decode_only,
+                "total_request_count": self.context.total_request_count,
+                "paused_request_count": self.context.paused_request_count,
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
             }
@@ -1950,7 +1956,13 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
-            context_state = {**pre_step_context_state, "kv_stats": None}
+            # total_active_used_blocks is consumed unconditionally by the
+            # flops-calculator block, so populate it every step too.
+            context_state = {
+                **pre_step_context_state,
+                "kv_stats": None,
+                "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
+            }
 
         return result, context_state, step_time
 
