@@ -5,6 +5,7 @@ import concurrent.futures
 import logging
 import math
 import multiprocessing
+import os
 import socket
 import time
 import warnings
@@ -31,6 +32,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.inference_flops import InferenceFLOPsCalculator
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
@@ -42,10 +44,20 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
+from megatron.core.inference.utils import (
+    Counter,
+    InferenceMode,
+    await_process_call,
+    get_model_weight_bytes,
+    measure_allreduce_bandwidth,
+    measure_alltoall_bandwidth,
+    measure_hbm_bandwidth,
+    measure_reduce_scatter_bandwidth,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
     deprecate_args,
@@ -55,6 +67,8 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    is_column_parallel_linear,
+    is_row_parallel_linear,
     nvtx_range_pop,
     nvtx_range_push,
     round_up_to_nearest_multiple,
@@ -133,8 +147,8 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
-    for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
-        suffix_bytes = 1024**power
+    for power, suffix in [(4, "TB"), (3, "GB"), (2, "MB"), (1, "KB"), (0, "bytes")]:
+        suffix_bytes = 1000**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
@@ -198,6 +212,78 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
+        # Fix CP=2 silent hang: when pg_collection comes from
+        # ProcessGroupCollection.use_mpu_process_groups() (i.e. training-model reuse,
+        # the case where rl_inference_* parallelism args are unset), pg_collection.mp
+        # is parallel_state.get_model_parallel_group(), which spans only 'tp-pp' and
+        # excludes CP. That causes mp_size = TP*PP instead of TP*CP*PP, so the
+        # MP coordinator is elected per CP-peer independently -> request fan-out
+        # breaks and the engine deadlocks. Widen pg_collection.mp to include CP.
+        try:
+            tp_size_for_mp = (
+                get_pg_size(self.pg_collection.tp) if self.pg_collection.tp is not None else 1
+            )
+            pp_size_for_mp = (
+                get_pg_size(self.pg_collection.pp) if self.pg_collection.pp is not None else 1
+            )
+            cp_size_for_mp = (
+                get_pg_size(self.pg_collection.cp) if self.pg_collection.cp is not None else 1
+            )
+            mp_size_for_mp = (
+                get_pg_size(self.pg_collection.mp) if self.pg_collection.mp is not None else 1
+            )
+            expected_mp_with_cp = tp_size_for_mp * cp_size_for_mp * pp_size_for_mp
+            if (
+                cp_size_for_mp > 1
+                and mp_size_for_mp == tp_size_for_mp * pp_size_for_mp
+                and mp_size_for_mp != expected_mp_with_cp
+            ):
+                if pp_size_for_mp == 1:
+                    # PP=1: a group spanning TP+CP is exactly the desired mp_group.
+                    # tp_cp is populated by use_mpu_process_groups() (see
+                    # megatron/core/process_groups_config.py:190-192).
+                    tp_cp_group = getattr(self.pg_collection, 'tp_cp', None)
+                    if tp_cp_group is None:
+                        # Fall back to mpu accessor directly.
+                        from megatron.core import parallel_state as _ps
+
+                        tp_cp_group = _ps.get_tensor_and_context_parallel_group(
+                            check_initialized=False
+                        )
+                    new_mp_size = (
+                        get_pg_size(tp_cp_group) if tp_cp_group is not None else mp_size_for_mp
+                    )
+                    if tp_cp_group is not None and new_mp_size == expected_mp_with_cp:
+                        logging.info(
+                            f"Inference engine widened pg_collection.mp from size "
+                            f"{mp_size_for_mp} to {new_mp_size} to include CP={cp_size_for_mp} "
+                            f"(TP={tp_size_for_mp}, PP={pp_size_for_mp})"
+                        )
+                        self.pg_collection.mp = tp_cp_group
+                    else:
+                        logging.warning(
+                            f"Inference engine: pg_collection.mp size={mp_size_for_mp} "
+                            f"excludes CP={cp_size_for_mp} but no suitable TP+CP group "
+                            f"was found (tp_cp={tp_cp_group}). Leaving mp unchanged; "
+                            f"CP-aware coordinator election may misbehave."
+                        )
+                else:
+                    # PP>1: not in the tested target use case. Leave behaviour as-is
+                    # to avoid regressing PP runs we haven't validated.
+                    logging.warning(
+                        f"Inference engine: pg_collection.mp excludes CP "
+                        f"(mp_size={mp_size_for_mp}, expected {expected_mp_with_cp} for "
+                        f"TP*CP*PP={tp_size_for_mp}*{cp_size_for_mp}*{pp_size_for_mp}) "
+                        f"and PP>1. Not widening mp automatically; if the engine hangs, "
+                        f"set rl_inference_* parallelism args to build a proper inference "
+                        f"pg_collection."
+                    )
+        except Exception as _widen_exc:  # noqa: BLE001
+            logging.warning(
+                f"Inference engine: failed to evaluate/widen pg_collection.mp for CP: "
+                f"{_widen_exc}. Proceeding with the original mp group."
+            )
+
         # Initialization options.
         self.controller = controller
         self.context = context
@@ -226,6 +312,22 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+
+        # Initialize inference FLOPs calculator and GPU peak for MFU reporting.
+        self.flops_calculator = None
+        self.gpu_peak_tflops = 0.0
+        self.cumulative_inference_flops = 0.0
+        self.cumulative_inference_time = 0.0
+        try:
+            from megatron.training.global_vars import get_args
+            from megatron.training.gpu_peak_flops import get_gpu_peak_tflops
+
+            args = get_args()
+            self.flops_calculator = InferenceFLOPsCalculator.from_args(args)
+            self.gpu_peak_tflops = get_gpu_peak_tflops()
+        except Exception as e:
+            logging.warning(f"Could not initialize inference FLOPs calculator: {e}")
+
         # Initialize engine.
         self.reset()
 
@@ -264,6 +366,95 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+        # Measure HBM bandwidth and model weight memory for SOL latency reporting.
+        self._model_weight_bytes = get_model_weight_bytes(
+            self.controller.inference_wrapped_model.model
+        )
+        self._measured_hbm_bandwidth = measure_hbm_bandwidth()
+
+        # Cache model topology fields needed for per-step SOL communication volume.
+        self._model_config = controller.inference_wrapped_model.model.config
+        unwrapped_model = controller.inference_wrapped_model.model
+        tp_size = get_pg_size(self.pg_collection.tp) if self.pg_collection.tp else 1
+        pp_size = get_pg_size(self.pg_collection.pp) if self.pg_collection.pp else 1
+        ep_size = self._model_config.expert_model_parallel_size
+        self._tp_sequence_parallel = self._model_config.sequence_parallel
+
+        # Number of GPUs that cooperate on a single inference engine instance.
+        # Used to convert the unsharded model FLOPs returned by the FLOPs
+        # calculator into per-GPU FLOPs for MFU reporting.  EP only shards the
+        # routed-expert portion of the model, so this is an over-estimate of
+        # the true sharding factor for non-MoE-dominated models, but it is the
+        # correct denominator for typical MoE inference where routed experts
+        # dominate the FLOPs count.
+        self._inference_world_size = max(1, tp_size * pp_size * ep_size)
+
+        # Count TP communication ops and MoE layers by inspecting the model.
+        # With sequence_parallel: RowParallel does reduce-scatter, ColumnParallel does all-gather.
+        # Without sequence_parallel: RowParallel does all-reduce, ColumnParallel has no fwd collective.
+        num_row_parallel = len(
+            [m for m in unwrapped_model.modules() if is_row_parallel_linear(m)]
+        )
+        num_col_parallel = len(
+            [m for m in unwrapped_model.modules() if is_column_parallel_linear(m)]
+        )
+        if self._tp_sequence_parallel:
+            self._num_tp_reduce_scatters = num_row_parallel
+            self._num_tp_all_gathers = num_col_parallel
+            self._num_tp_allreduces = 0
+        else:
+            self._num_tp_allreduces = num_row_parallel
+            self._num_tp_reduce_scatters = 0
+            self._num_tp_all_gathers = 0
+        self._num_moe_layers = len(
+            [m for m in unwrapped_model.modules() if isinstance(m, MoELayer)]
+        )
+
+        # Measure TP bandwidth with the collective that the model actually uses.
+        if tp_size > 1 and self.pg_collection.tp is not None:
+            if self._tp_sequence_parallel:
+                self._measured_tp_rs_bw = measure_reduce_scatter_bandwidth(self.pg_collection.tp)
+                self._measured_tp_allreduce_bw = 0
+            else:
+                self._measured_tp_allreduce_bw = measure_allreduce_bandwidth(self.pg_collection.tp)
+                self._measured_tp_rs_bw = 0
+        else:
+            self._measured_tp_allreduce_bw = 0
+            self._measured_tp_rs_bw = 0
+
+        # Measure EP all-to-all bandwidth.
+        if ep_size > 1 and self.context.expert_model_parallel_group is not None:
+            self._measured_ep_alltoall_bw = measure_alltoall_bandwidth(
+                self.context.expert_model_parallel_group
+            )
+        else:
+            self._measured_ep_alltoall_bw = 0
+
+        if torch.distributed.get_rank() == 0:
+            sol_parts = [
+                f"model weights = {self._model_weight_bytes / 1e9:.2f} GB",
+                f"measured HBM bandwidth = {self._measured_hbm_bandwidth / 1e9:.0f} GB/s",
+                f"per-GPU FLOPs divisor = {self._inference_world_size} "
+                f"(tp={tp_size} * pp={pp_size} * ep={ep_size})",
+            ]
+            if self._tp_sequence_parallel and self._measured_tp_rs_bw > 0:
+                sol_parts.append(
+                    f"TP reduce-scatter bandwidth = {self._measured_tp_rs_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size}, {self._num_tp_reduce_scatters} RS + "
+                    f"{self._num_tp_all_gathers} AG per step)"
+                )
+            elif self._measured_tp_allreduce_bw > 0:
+                sol_parts.append(
+                    f"TP allreduce bandwidth = {self._measured_tp_allreduce_bw / 1e9:.1f} GB/s "
+                    f"(tp={tp_size}, {self._num_tp_allreduces} allreduces/step)"
+                )
+            if self._measured_ep_alltoall_bw > 0:
+                sol_parts.append(
+                    f"EP all-to-all bandwidth = {self._measured_ep_alltoall_bw / 1e9:.1f} GB/s "
+                    f"(ep={ep_size}, {self._num_moe_layers} MoE layers)"
+                )
+            logging.info(f"SOL latency baseline: {', '.join(sol_parts)}")
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -530,7 +721,13 @@ class DynamicInferenceEngine(AbstractEngine):
         tp_rank = get_pg_rank(self.pg_collection.tp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
 
-        self.is_mp_coordinator = tp_rank == 0 and pp_rank == 0
+        # Use the actual mp_group rank rather than (tp_rank, pp_rank) so the
+        # coordinator predicate is consistent with whatever dimensions mp_group
+        # spans. With CP>1 and mp_group=[tp, cp, pp], this restricts the
+        # coordinator to cp_rank=0 — otherwise every CP-peer of the (0,0) TP/PP
+        # coordinate becomes its own coordinator and the engines split across
+        # multiple DP coordinator subprocesses, deadlocking _world_barrier.
+        self.is_mp_coordinator = get_pg_rank(mp_group) == 0
         self.is_dp_coordinator = (dp_rank == 0) and self.is_mp_coordinator
 
         local_ip = hostname or socket.gethostname()
@@ -695,20 +892,20 @@ class DynamicInferenceEngine(AbstractEngine):
             rank_str = torch.distributed.get_rank()
             dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
             relative_time_str = f"{end_time - start_time:.3f} sec"
-            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1e9:.1f} GB"
 
             if HAVE_PSUTIL:
                 process = psutil.Process()
                 mem_info = process.memory_info()
-                cpu_mem_str = f"{mem_info.rss / 1024**3:.1f} gb"
+                cpu_mem_str = f"{mem_info.rss / 1e9:.1f} GB"
             else:
                 cpu_mem_str = "--"
 
             total_mem_str = ", ".join(
                 (
                     f"cpu: {cpu_mem_str}",
-                    f"gpu: alloc {end_mem_alloc / 1024**3:.1f} gb",
-                    f"res {end_mem_res / 1024**3:.1f} gb",
+                    f"gpu: alloc {end_mem_alloc / 1e9:.1f} GB",
+                    f"res {end_mem_res / 1e9:.1f} GB",
                 )
             )
             logging.info(
@@ -1757,6 +1954,185 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _compute_sol_metrics(self, context_state, step_time):
+        """Compute SOL (speed-of-light) latency metrics for decode-only steps."""
+        kv_bytes, mamba_bytes = self.context.get_active_state_memory_bytes()
+        state_bytes = kv_bytes + mamba_bytes
+        sol_mem_s = (self._model_weight_bytes + state_bytes) / self._measured_hbm_bandwidth
+
+        batch_tokens = context_state["active_token_count"]
+        hidden_bytes = self._model_config.hidden_size * self._model_config.params_dtype.itemsize
+        msg_bytes = batch_tokens * hidden_bytes
+        if self._tp_sequence_parallel:
+            # RS and AG have symmetric bandwidth; use RS measurement for both.
+            num_tp_ops = self._num_tp_reduce_scatters + self._num_tp_all_gathers
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_rs_bw)
+                if self._measured_tp_rs_bw > 0
+                else 0
+            )
+        else:
+            num_tp_ops = self._num_tp_allreduces
+            sol_tp_comm_s = (
+                (num_tp_ops * msg_bytes / self._measured_tp_allreduce_bw)
+                if self._measured_tp_allreduce_bw > 0
+                else 0
+            )
+        moe_topk = self._model_config.moe_router_topk if self._model_config.num_moe_experts else 0
+        a2a_dim = self._model_config.moe_latent_size or self._model_config.hidden_size
+        a2a_token_bytes = a2a_dim * self._model_config.params_dtype.itemsize
+        a2a_vol = 2 * self._num_moe_layers * batch_tokens * moe_topk * a2a_token_bytes
+        sol_ep_comm_s = (
+            (a2a_vol / self._measured_ep_alltoall_bw) if self._measured_ep_alltoall_bw > 0 else 0
+        )
+        sol_latency_s = sol_mem_s + sol_tp_comm_s + sol_ep_comm_s
+        sol_pct = sol_latency_s / step_time * 100.0
+
+        return {
+            "kv_bytes": kv_bytes,
+            "mamba_bytes": mamba_bytes,
+            "state_bytes": state_bytes,
+            "sol_mem_s": sol_mem_s,
+            "sol_tp_comm_s": sol_tp_comm_s,
+            "sol_ep_comm_s": sol_ep_comm_s,
+            "sol_latency_s": sol_latency_s,
+            "sol_pct": sol_pct,
+            "num_tp_ops": num_tp_ops,
+            "msg_bytes": msg_bytes,
+            "a2a_vol": a2a_vol,
+        }
+
+    def _format_sol_log(self, sol):
+        """Format the SOL portion of the step log string."""
+        if sol["mamba_bytes"] > 0:
+            mem_str = (
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['kv_bytes'] / 1e9:.2f} GB kv + "
+                f"{sol['mamba_bytes'] / 1e9:.2f} GB mamba) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+            )
+        else:
+            mem_str = (
+                f"({self._model_weight_bytes / 1e9:.2f} GB weights + "
+                f"{sol['state_bytes'] / 1e9:.2f} GB state) / "
+                f"{self._measured_hbm_bandwidth / 1e9:.0f} GB/s"
+            )
+
+        comm_parts = []
+        if sol["sol_tp_comm_s"] > 0:
+            tp_total_bytes = sol["num_tp_ops"] * sol["msg_bytes"]
+            if self._tp_sequence_parallel:
+                comm_parts.append(
+                    f"tp_rs_ag {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_rs_bw / 1e9:.1f} GB/s)"
+                )
+            else:
+                comm_parts.append(
+                    f"tp_ar {sol['sol_tp_comm_s'] * 1000:.3f} ms "
+                    f"({tp_total_bytes / 1e6:.2f} MB / "
+                    f"{self._measured_tp_allreduce_bw / 1e9:.1f} GB/s)"
+                )
+        if sol["sol_ep_comm_s"] > 0:
+            comm_parts.append(
+                f"ep_a2a {sol['sol_ep_comm_s'] * 1000:.3f} ms "
+                f"({sol['a2a_vol'] / 1e6:.2f} MB / "
+                f"{self._measured_ep_alltoall_bw / 1e9:.1f} GB/s)"
+            )
+
+        if comm_parts:
+            return (
+                f" ... SOL: {sol['sol_pct']:.1f}% "
+                f"(proj {sol['sol_latency_s'] * 1000:.3f} ms = "
+                f"mem {sol['sol_mem_s'] * 1000:.3f} ms [{mem_str}] + "
+                f"comm [{' + '.join(comm_parts)}])"
+            )
+        else:
+            return (
+                f" ... SOL: {sol['sol_pct']:.1f}% "
+                f"(proj {sol['sol_latency_s'] * 1000:.3f} ms = {mem_str})"
+            )
+
+    def _format_step_log(self, context_state, step_time, step_flops_info=None):
+        """Build the per-step console log string."""
+        mem = torch.cuda.memory_stats()
+        step_type = "decode" if context_state["is_decode_only"] else "non-decode"
+        cg_status = (
+            "OFF"
+            if not self.context.using_cuda_graph_this_step()
+            else self.context.padded_batch_dimensions
+        )
+        active_reqs = context_state["total_request_count"] - context_state["paused_request_count"]
+
+        output = (
+            f"* rank {self.rank} | step {self.context.step_count} | "
+            f"{datetime.now().strftime('%H:%M:%S')} ... "
+            f"time: {step_time * 1000:.3f} ms "
+            f"[{step_type} + real config {self.context.batch_dimensions} + "
+            f"cuda graph {cg_status}] ... "
+            f"reqs: a {active_reqs}/{context_state['max_requests']}, "
+            f"p {context_state['paused_request_count']}, "
+            f"w {context_state['waiting_request_count']}, "
+            f"f {context_state['finished_request_count']}, "
+            f"e {context_state['evicted_request_count']} ... "
+            f"blocks: a {context_state['total_active_used_blocks']}"
+            f"/{context_state['total_active_block_count']}, "
+            f"p {context_state['total_paused_used_blocks']}"
+            f"/{context_state['total_paused_block_count']} ... "
+            f"mem: tensors {mem['allocation.all.current']}, "
+            f"alloc {mem['allocated_bytes.all.current'] / 1e9:.1f} GB, "
+            f"res {mem['reserved_bytes.all.current'] / 1e9:.1f} GB."
+        )
+
+        if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
+            spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
+            output += (
+                f" ... spec: accept {spec_rate:.1f}% "
+                f"({self._spec_tokens_accepted}/{self._spec_tokens_proposed} "
+                f"in {self._spec_steps} steps)"
+            )
+
+        if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
+            output += (
+                f" ... prefix cache: {self._prefix_cache_hits} hits, "
+                f"{self._prefix_cache_blocks_matched} blocks matched"
+            )
+
+        batch_dims = self.context.batch_dimensions
+        total_tokens = batch_dims.token_count if batch_dims else 0
+        if step_time > 0 and total_tokens > 0:
+            toks_per_sec_per_gpu = total_tokens / step_time
+            output += f" toks/s/GPU: {toks_per_sec_per_gpu:.0f},"
+        if step_flops_info is not None:
+            step_tflops = step_flops_info['total_flops'] / 1e12
+            step_throughput = step_tflops / step_time if step_time > 0 else 0
+            output += f" {step_throughput:.1f} TFLOP/s/GPU"
+            if self.gpu_peak_tflops > 0:
+                mfu = step_throughput / self.gpu_peak_tflops * 100.0
+                output += f", MFU: {mfu:.1f}%"
+
+            # Per-phase prefill/decode split (computed the same way as
+            # async_bookkeep accumulates them into Megatron timers).
+            tot_f = step_flops_info['total_flops']
+            if tot_f > 0:
+                prefill_time = step_time * step_flops_info['prefill_flops'] / tot_f
+                decode_time = step_time * step_flops_info['decode_flops'] / tot_f
+            elif context_state["is_decode_only"]:
+                prefill_time, decode_time = 0.0, step_time
+            else:
+                prefill_time, decode_time = step_time, 0.0
+            output += (
+                f" [prefill: {prefill_time * 1000:.1f}ms"
+                f", decode: {decode_time * 1000:.1f}ms]"
+            )
+
+        if context_state["is_decode_only"]:
+            sol = self._compute_sol_metrics(context_state, step_time)
+            output += self._format_sol_log(sol)
+            output = f"\033[94m{output}\033[0m"
+
+        return output
+
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
     ):
@@ -1869,6 +2245,84 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
 
+        # Compute inference FLOPs for this step.
+        step_flops_info = None
+        if self.flops_calculator is not None:
+            batch_dims = self.context.batch_dimensions
+            decode_tokens = batch_dims.decode_req_count if batch_dims else 0
+            prefill_reqs = batch_dims.prefill_req_count if batch_dims else 0
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            prefill_tokens = total_tokens - decode_tokens
+
+            step_flops_info = self.flops_calculator.compute_step_flops(
+                decode_tokens=decode_tokens,
+                prefill_tokens=prefill_tokens,
+                total_tokens=total_tokens,
+                active_blocks=context_state["total_active_used_blocks"],
+                active_reqs=context_state["total_request_count"]
+                - context_state["paused_request_count"],
+                num_prefill_reqs=prefill_reqs,
+            )
+            # Normalize unsharded model FLOPs to per-GPU FLOPs so MFU is
+            # comparable across model-parallel configurations and to the
+            # per-GPU training MFU computed in megatron/training/training.py.
+            step_flops_info['total_flops'] /= self._inference_world_size
+            step_flops_info['decode_flops'] /= self._inference_world_size
+            step_flops_info['prefill_flops'] /= self._inference_world_size
+            self.cumulative_inference_flops += step_flops_info['total_flops']
+            self.cumulative_inference_time += step_time
+
+        # Split step time into prefill/decode phases based on FLOPs proportion.
+        # For decode-only steps: all time is decode.  For mixed/prefill steps:
+        # split by FLOPs.  This gives a clean per-phase timing breakdown that
+        # we can both push into Megatron timers (`infer-prefill`, `infer-decode`)
+        # and report per-step / per-iteration TFLOPS for prefill vs decode.
+        if step_flops_info is not None and step_flops_info['total_flops'] > 0:
+            total_flops = step_flops_info['total_flops']
+            prefill_time = step_time * step_flops_info['prefill_flops'] / total_flops
+            decode_time = step_time * step_flops_info['decode_flops'] / total_flops
+        elif context_state["is_decode_only"]:
+            prefill_time = 0.0
+            decode_time = step_time
+        else:
+            prefill_time = step_time
+            decode_time = 0.0
+
+        # Accumulate into Megatron timers so prefill/decode appear in the
+        # per-RL-iteration timer log alongside forward-backward, rollout-collection,
+        # etc.  Timers.log() resets elapsed, so the accumulation is automatically
+        # per-iteration.  Stored in seconds (matching the rest of Megatron's
+        # internal Timer._elapsed convention).
+        try:
+            from megatron.training.global_vars import get_timers
+            _timers = get_timers()
+            _timers('infer-prefill', log_level=2)._elapsed += prefill_time
+            _timers('infer-decode', log_level=2)._elapsed += decode_time
+        except Exception:
+            pass
+
+        if step_flops_info is not None:
+            try:
+                from megatron.training.mfu_tracker import get_mfu_tracker
+
+                tracker = get_mfu_tracker()
+                tracker.add_inference_flops(
+                    step_flops_info['total_flops'], step_time, tokens=total_tokens
+                )
+                # Per-phase accumulation for prefill vs decode TFLOPS reporting.
+                tracker.add_inference_prefill_flops(
+                    step_flops_info['prefill_flops'],
+                    prefill_time,
+                    tokens=prefill_tokens,
+                )
+                tracker.add_inference_decode_flops(
+                    step_flops_info['decode_flops'],
+                    decode_time,
+                    tokens=decode_tokens,
+                )
+            except Exception:
+                pass
+
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
         if context_state["kv_stats"] is not None:
@@ -1882,6 +2336,45 @@ class DynamicInferenceEngine(AbstractEngine):
                 'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
                 'inference/total_requests_dict_size': int(len(self.requests)),
             }
+
+            batch_dims = self.context.batch_dimensions
+            total_tokens = batch_dims.token_count if batch_dims else 0
+            if step_time > 0 and total_tokens > 0:
+                metrics['inference/tokens_per_sec_per_gpu'] = float(total_tokens / step_time)
+
+            if step_flops_info is not None:
+                step_tflops = step_flops_info['total_flops'] / 1e12
+                step_throughput = step_tflops / step_time if step_time > 0 else 0
+                metrics['inference/step_flops_tflop'] = float(step_tflops)
+                metrics['inference/throughput_tflops_per_gpu'] = float(step_throughput)
+                metrics['inference/t_avg'] = float(step_flops_info['t_avg'])
+                metrics['inference/cumulative_flops_tflop'] = float(
+                    self.cumulative_inference_flops / 1e12
+                )
+                if self.gpu_peak_tflops > 0:
+                    mfu = step_throughput / self.gpu_peak_tflops * 100.0
+                    cumulative_throughput = (
+                        (self.cumulative_inference_flops / 1e12) / self.cumulative_inference_time
+                        if self.cumulative_inference_time > 0
+                        else 0
+                    )
+                    cumulative_mfu = cumulative_throughput / self.gpu_peak_tflops * 100.0
+                    metrics['inference/mfu_percent'] = float(mfu)
+                    metrics['inference/cumulative_mfu_percent'] = float(cumulative_mfu)
+
+            # Per-phase prefill/decode timing split (and per-phase TFLOPS).
+            metrics['inference/prefill_time_s'] = float(prefill_time)
+            metrics['inference/decode_time_s'] = float(decode_time)
+            if step_flops_info is not None:
+                if prefill_time > 0:
+                    metrics['inference/prefill_tflops_per_gpu'] = float(
+                        step_flops_info['prefill_flops'] / 1e12 / prefill_time
+                    )
+                if decode_time > 0:
+                    metrics['inference/decode_tflops_per_gpu'] = float(
+                        step_flops_info['decode_flops'] / 1e12 / decode_time
+                    )
+
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
             for key, value in context_state["kv_stats"].items():
@@ -1905,6 +2398,35 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/prefix_cache_blocks_matched'] = int(
                     self._prefix_cache_blocks_matched
                 )
+
+            # Add Mamba state metrics.
+            if self.context.is_hybrid_model:
+                if "mamba_active_requests" in context_state:
+                    metrics['inference/mamba_active_requests'] = int(
+                        context_state["mamba_active_requests"]
+                    )
+                if "mamba_paused_requests" in context_state:
+                    metrics['inference/mamba_paused_requests'] = int(
+                        context_state["mamba_paused_requests"]
+                    )
+                if "mamba_cache_slots_used" in context_state:
+                    metrics['inference/mamba_cache_slots_used'] = int(
+                        context_state["mamba_cache_slots_used"]
+                    )
+                    metrics['inference/mamba_cache_slots_total'] = int(
+                        context_state["mamba_cache_slots_total"]
+                    )
+
+            # Add SOL latency metrics for decode-only steps.
+            if context_state["is_decode_only"]:
+                sol = self._compute_sol_metrics(context_state, step_time)
+                metrics['inference/sol_latency_pct'] = float(sol["sol_pct"])
+                metrics['inference/sol_latency_ms'] = float(sol["sol_latency_s"] * 1000)
+                metrics['inference/sol_mem_ms'] = float(sol["sol_mem_s"] * 1000)
+                metrics['inference/sol_tp_comm_ms'] = float(sol["sol_tp_comm_s"] * 1000)
+                metrics['inference/sol_ep_comm_ms'] = float(sol["sol_ep_comm_s"] * 1000)
+                metrics['inference/sol_kv_bytes'] = float(sol["kv_bytes"])
+                metrics['inference/sol_mamba_bytes'] = float(sol["mamba_bytes"])
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
@@ -2260,6 +2782,93 @@ class DynamicInferenceEngine(AbstractEngine):
         except asyncio.CancelledError:
             pass
 
+    async def _check_mp_divergence(self, local_pending: int) -> None:
+        """Diagnostic: detect active_request_count divergence across mp_group.
+
+        With mp_group = [tp, cp, pp] and the MP coordinator on cp_rank=0, requests
+        are fanned out to CP-peers via a ZMQ PUB/SUB socket. A dropped PUBLISH (e.g.
+        slow-joiner handshake race) leaves cp_rank=1 unaware of an in-flight request
+        — cp_rank=0 keeps decoding alone, all other DP groups eventually block at
+        the world barrier, run hangs silently.
+
+        Two failure modes are surfaced:
+        - **Value mismatch**: all mp_group members reach the check but
+          local_pending differs. Raises iff MEGATRON_RL_CP_DIVERGENCE_FAIL=1
+          (otherwise just logs — useful when monitoring without crashing).
+        - **all_reduce timeout**: at least one mp_group member never reached
+          the check (it's stuck at an earlier collective like world_barrier).
+          Always raises, because the engine cannot make progress and the run
+          would hang indefinitely otherwise. THIS is the production CP=2 hang
+          fingerprint — cp_rank=1 blocked at suspend()'s world_barrier while
+          cp_rank=0 keeps decoding alone.
+
+        Auto-enabled whenever mp_group spans >1 rank (i.e. CP>1 or PP>1).
+        Set MEGATRON_RL_CP_DIVERGENCE_OFF=1 to disable. Tuning:
+        MEGATRON_RL_CP_DIVERGENCE_INTERVAL (default 10 = check every 10th
+        engine step to keep overhead minimal); MEGATRON_RL_CP_DIVERGENCE_TIMEOUT
+        (default 30 s before declaring the peer stuck).
+
+        Earlier versions required MEGATRON_RL_CP_DIVERGENCE_CHECK=1 to opt in,
+        but that env var was being stripped between the submitting shell and
+        the training container in our pyxis setup — the detector silently
+        no-op'd and the run still hung. Auto-on avoids that.
+        """
+        if os.environ.get("MEGATRON_RL_CP_DIVERGENCE_OFF"):
+            return
+        mp_group = self.pg_collection.mp
+        if get_pg_size(mp_group) <= 1:
+            return
+        if not getattr(self, "_mp_divergence_announced", False):
+            logging.info(
+                f"MP divergence detector active: mp_size={get_pg_size(mp_group)} "
+                f"interval={os.environ.get('MEGATRON_RL_CP_DIVERGENCE_INTERVAL', '10')} "
+                f"timeout_s={os.environ.get('MEGATRON_RL_CP_DIVERGENCE_TIMEOUT', '30')}"
+            )
+            self._mp_divergence_announced = True
+        interval = int(os.environ.get("MEGATRON_RL_CP_DIVERGENCE_INTERVAL", "10"))
+        if self.context.step_count % max(interval, 1) != 0:
+            return
+        timeout_s = float(os.environ.get("MEGATRON_RL_CP_DIVERGENCE_TIMEOUT", "30"))
+        # max(local), max(-local) -> global_max, -global_min in one collective.
+        t = torch.tensor(
+            [local_pending, -local_pending], dtype=torch.int64, device="cuda"
+        )
+        work = torch.distributed.all_reduce(
+            t, op=torch.distributed.ReduceOp.MAX, group=mp_group, async_op=True
+        )
+        deadline = time.monotonic() + timeout_s
+        while not work.is_completed():
+            if time.monotonic() > deadline:
+                # The all_reduce hasn't completed within timeout_s, so an
+                # mp_group peer never entered this check. That stuckness IS the
+                # bug. Raise instead of looping forever — NCCL state is shot
+                # at this point anyway (the pending op blocks the comm stream),
+                # so there's no safe way to continue.
+                raise RuntimeError(
+                    f"MP divergence-check all_reduce timed out after "
+                    f"{timeout_s:.0f}s. rank={torch.distributed.get_rank()} "
+                    f"mp_rank={get_pg_rank(mp_group)} "
+                    f"local_pending={local_pending} "
+                    f"step={self.context.step_count}. At least one CP peer in "
+                    f"mp_group never entered _check_mp_divergence — it is "
+                    f"stuck at an earlier collective (likely suspend()'s "
+                    f"world barrier in rl_utils.py). This matches the "
+                    f"production CP=2 long-tail-decode hang signature."
+                )
+            await asyncio.sleep(0.005)
+        global_max = int(t[0].item())
+        global_min = -int(t[1].item())
+        if global_max != global_min:
+            msg = (
+                f"MP divergence: rank={torch.distributed.get_rank()} "
+                f"mp_rank={get_pg_rank(mp_group)} local_pending={local_pending} "
+                f"mp_max={global_max} mp_min={global_min} "
+                f"step={self.context.step_count}"
+            )
+            logging.error(msg)
+            if os.environ.get("MEGATRON_RL_CP_DIVERGENCE_FAIL"):
+                raise RuntimeError(msg)
+
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
     ) -> tuple[int, bool]:
@@ -2388,6 +2997,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         #    had some work.
                         # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
+                        await self._check_mp_divergence(local_pending)
                         self._last_ep_consensus = await self._ep_establish_consensus(
                             local_pending, signal_consensus=(self.state == EngineState.PAUSING)
                         )

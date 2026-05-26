@@ -555,10 +555,12 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            _temperature = req.get("temperature")
+            temperature = float(1.0 if _temperature is None else _temperature)
+            _top_p = req.get("top_p")
+            top_p = float(1.0 if _top_p is None else _top_p)
+            top_k = int(req.get("top_k") or 0)
+            n = int(req.get("n") or 1)  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
@@ -566,7 +568,7 @@ try:
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
+            top_n_logprobs = int(req.get("top_logprobs") or 0) if return_log_probs else 0
             skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
             add_BOS = bool(req.get("add_BOS", False))
 
@@ -728,13 +730,31 @@ try:
             if "reasoning" in metadata:
                 message["reasoning_content"] = metadata["reasoning"]
 
-            # Replicate data in the message field for compatibility.
+            num_evictions = sum(
+                1 for e in result["events"] if e.get("type") == "EVICT"
+            )
+
+            # Replicate data in the message field for compatibility. Some downstream
+            # consumers (e.g. NeMo-Gym's chat-completion -> response converter) only
+            # inspect choice.message and silently default missing per-request fields,
+            # so policy_epoch/kv_cache_epoch/num_evictions must live here too or
+            # off-policyness telemetry collapses to the (0, 0) fallback.
+            #
+            # Note the shape difference between the two copies. The engine emits
+            # `policy_epoch` / `kv_cache_epoch` as a flat list of `(start_idx, epoch)`
+            # boundaries for this single response, and that flat shape is what the
+            # direct OpenAI-client path (MegatronLocal.base_generate) expects via
+            # `InferenceResponse.policy_epoch: list[tuple[int, int]]`, so the
+            # choice-level copies stay flat. NeMo-Gym's `TokenIDLogProbMixin` uses
+            # `list[list[tuple[int, int]]]` (outer dim = per-turn) and `list[int]`
+            # for `num_evictions`, so the message-level copies are wrapped to
+            # match — otherwise NeMo-Gym's pydantic validation 500s the /run call.
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", [])
-            message["policy_epoch"] = result["policy_epoch"]
-            message["kv_cache_epoch"] = result["kv_cache_epoch"]
-            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
+            message["policy_epoch"] = [result["policy_epoch"]]
+            message["kv_cache_epoch"] = [result["kv_cache_epoch"]]
+            message["num_evictions"] = [num_evictions]
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -763,6 +783,9 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
+            choice_data["policy_epoch"] = result["policy_epoch"]
+            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
+            choice_data["num_evictions"] = num_evictions
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 

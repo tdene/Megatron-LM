@@ -97,7 +97,14 @@ def build_inference_pg_collection(
     cp_group = decoder_grid.create_pg("cp")
     pp_group = decoder_grid.create_pg("pp")
     dp_group = decoder_grid.create_pg("dp")
-    mp_group = decoder_grid.create_pg(["tp", "pp"])
+    # Include CP so dynamic-inference's mp_coordinator election and
+    # mp_publisher fan-out cover CP-peers. With CP>1, mp_group=[tp, pp] makes
+    # every CP-peer of the (tp=0, pp=0) coordinate independently elect itself
+    # as mp_coordinator, spawning multiple DP coordinator subprocesses and
+    # splitting engines across them — _world_barrier (which spans the full
+    # torch world) then deadlocks because only some ranks receive the state
+    # transition signals. With CP=1 this is a no-op.
+    mp_group = decoder_grid.create_pg(["tp", "cp", "pp"])
     tp_cp_group = decoder_grid.create_pg(["tp", "cp"])
     dp_cp_group = decoder_grid.create_pg(["cp", "dp"])
     tp_dp_cp_group = decoder_grid.create_pg(["tp", "cp", "dp"])

@@ -187,8 +187,48 @@ class WeightedMultiTask(
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
         agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
-        agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
+
+        # In streaming mode, ensure every active (non-evaluation, non-zero-weight) agent
+        # gets a sub-generator even when num_groups < num_active_agents.  Without this,
+        # _distribute_counts(1) with 5 equal-weight envs gives [1,0,0,0,0]: only env 0
+        # ever generates rollouts, all others get None generators and are permanently skipped.
+        # Over 64 anext() calls that means 100% of rollouts come from a single env.
+        if request.streaming:
+            for i, (config, w) in enumerate(zip(self.agent_configs, self.weights)):
+                if not config.evaluation_only and w > 0 and agent_groups[i] == 0:
+                    agent_groups[i] = 1
+            # Redistribute parallel_generation_tasks proportional to agent_groups,
+            # floored at agent_groups[i] so each sub-agent has at least num_groups
+            # parallel slots — required by GroupedRolloutGenerator.get_grouped_rollouts's
+            # `assert self.parallel_generation_tasks >= groups_per_worker`.
+            # Even distribution (the previous logic) fails this assertion for high-weight
+            # envs when parallel_generation_tasks is small (e.g. lag=0 + HF blend weights:
+            # parallel_generation_tasks=64 / n_active=6 → base=10, but code_gen gets
+            # num_groups=16 and 10 < 16 → assertion fails silently in the async generator,
+            # zero rollouts for that env).
+            total_active_groups = sum(g for g in agent_groups if g > 0)
+            if total_active_groups > 0:
+                for i, g in enumerate(agent_groups):
+                    if g > 0:
+                        proportional = int(self.parallel_generation_tasks * g / total_active_groups)
+                        agent_pgts[i] = max(g, proportional)
+                    else:
+                        agent_pgts[i] = 0
+
+        # agent_slots controls how many groups each agent yields per outer-loop round.
+        # Derive it from the (possibly corrected) agent_groups so that all active agents
+        # participate each round — not just the one that got the remainder in a 1-group request.
+        if request.streaming and any(agent_groups[i] > 0 for i in range(len(agent_groups))
+                                      if not self.agent_configs[i].evaluation_only and self.weights[i] > 0):
+            raw_slots = list(agent_groups)
+        else:
+            raw_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
+
+        gcd_val = np.gcd.reduce(raw_slots)
+        if gcd_val == 0:
+            raw_slots = self._distribute_counts(request.num_groups)
+            gcd_val = np.gcd.reduce(raw_slots) or 1
+        agent_slots = np.array(raw_slots) / gcd_val
 
         # Create tasks for each agent with non-zero groups
         generators = []

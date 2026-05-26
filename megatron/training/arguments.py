@@ -1064,6 +1064,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.mamba_ssm_state_dtype = map_dtype(args.mamba_ssm_state_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1991,6 +1992,10 @@ def _add_inference_args(parser):
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference SSM states tensor')
+    group.add_argument('--mamba-ssm-state-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for Mamba SSM states during training. '
+                            'Matches the inference-side --mamba-inference-ssm-states-dtype default.')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,
@@ -2075,6 +2080,8 @@ def _add_network_size_args(parser):
         "use_te_rng_tracker",
         "log_max_attention_logit",
         "barrier_with_L1_time",
+        # registered manually in _add_inference_args (string-with-choices interface)
+        "mamba_ssm_state_dtype",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",
@@ -2402,6 +2409,35 @@ def _add_rl_args(parser):
                        help="Default top-p for model inference.")
     group.add_argument('--rl-default-top-k', type=int, default=-1,
                        help="Default top-k for model inference.")
+    # Speculative rollout arguments
+    group.add_argument('--rl-speculative-exit-layer', type=int, default=None,
+                       help='Enable speculative rollout generation using an early-exit draft '
+                            'model that runs only the first N transformer layers.  When set, '
+                            'the inference engine uses the draft model to generate '
+                            '--rl-speculative-oversample-factor * rollouts_per_group candidates '
+                            'and selects the best rollouts_per_group via '
+                            '--rl-speculative-selection-strategy.  Must satisfy '
+                            '1 <= exit_layer < total_layers.')
+    def _positive_int(s):
+        v = int(s)
+        if v < 1:
+            raise argparse.ArgumentTypeError(
+                f"--rl-speculative-oversample-factor must be >= 1; got {v}"
+            )
+        return v
+    group.add_argument('--rl-speculative-oversample-factor', type=_positive_int, default=4,
+                       help='How many times more rollout candidates to generate with the draft '
+                            'model before selection.  Must be >= 1.  Only used when '
+                            '--rl-speculative-exit-layer is set.  Default: 4.')
+    group.add_argument('--rl-speculative-selection-strategy', type=str,
+                       default='variance_maximizing',
+                       choices=['top_k', 'variance_maximizing', 'reward_distance_from_mean'],
+                       help='Strategy for selecting rollouts from oversampled candidates.  '
+                            'top_k: keep highest-reward rollouts.  '
+                            'variance_maximizing: maximise reward variance (best for GRPO).  '
+                            'reward_distance_from_mean: keep rollouts furthest from group mean.  '
+                            'Only used when --rl-speculative-exit-layer is set.  '
+                            'Default: variance_maximizing.')
     group.add_argument('--rl-offload-optimizer-during-inference', action='store_true',
                        help='Offload optimizer state to CPU during inference/rollout to save GPU memory')
     group.add_argument('--rl-kv-cache-management-mode', type=str, default='persist',
