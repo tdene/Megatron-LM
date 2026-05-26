@@ -217,7 +217,9 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
-        self.ssm_state_dtype = config.mamba_ssm_state_dtype  # None = let kernel decide
+        self.mamba_training_ssm_states_dtype = (
+            config.mamba_training_ssm_states_dtype
+        )  # None = let kernel decide
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -740,8 +742,11 @@ class MambaMixer(MegatronModule):
             seq_idx = packed_seq_params.seq_idx
 
         _split_kwargs = {}
-        if _MAMBA_SPLIT_HAS_STATE_DTYPE and self.ssm_state_dtype is not None:
-            _split_kwargs["state_dtype"] = self.ssm_state_dtype
+        if (
+            _MAMBA_SPLIT_HAS_STATE_DTYPE
+            and self.mamba_training_ssm_states_dtype is not None
+        ):
+            _split_kwargs["state_dtype"] = self.mamba_training_ssm_states_dtype
         y = mamba_split_conv1d_scan_combined(
             zxBCdt,
             rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
@@ -1053,7 +1058,11 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
-                **({} if self.ssm_state_dtype is None else {"state_dtype": self.ssm_state_dtype}),
+                **(
+                    {}
+                    if self.mamba_training_ssm_states_dtype is None
+                    else {"state_dtype": self.mamba_training_ssm_states_dtype}
+                ),
             )
 
             if ssm_state is not None:

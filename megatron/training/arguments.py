@@ -1064,7 +1064,7 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
     args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
     args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
-    args.mamba_ssm_state_dtype = map_dtype(args.mamba_ssm_state_dtype)
+    args.mamba_training_ssm_states_dtype = map_dtype(args.mamba_training_ssm_states_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1992,7 +1992,7 @@ def _add_inference_args(parser):
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference SSM states tensor')
-    group.add_argument('--mamba-ssm-state-dtype', type=str,
+    group.add_argument('--mamba-training-ssm-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for Mamba SSM states during training. '
                             'Matches the inference-side --mamba-inference-ssm-states-dtype default.')
@@ -2081,7 +2081,7 @@ def _add_network_size_args(parser):
         "log_max_attention_logit",
         "barrier_with_L1_time",
         # registered manually in _add_inference_args (string-with-choices interface)
-        "mamba_ssm_state_dtype",
+        "mamba_training_ssm_states_dtype",
         # args uses same var with a different name
         "num_moe_experts",
         "fp8_param",

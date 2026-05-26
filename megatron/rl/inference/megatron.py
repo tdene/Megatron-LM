@@ -77,9 +77,13 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             logprobs=choice.generation_log_probs,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.prompt_token_ids),
-            policy_epoch=choice.message.policy_epoch,
-            kv_cache_epoch=choice.message.kv_cache_epoch,
-            num_evictions=choice.message.num_evictions,
+            # Read the choice-level (flat) shape, not the message-level
+            # (wrapped) shape. chat_completions.py emits both: flat for
+            # InferenceResponse here (list[tuple[int,int]] / int), wrapped
+            # for NeMo-Gym (list[list[tuple[int,int]]] / list[int]).
+            policy_epoch=choice.policy_epoch,
+            kv_cache_epoch=choice.kv_cache_epoch,
+            num_evictions=choice.num_evictions,
         )
 
     @classmethod
