@@ -64,7 +64,7 @@ class PackingContext:
     original_trajs: torch.Tensor
     packed_trajs: torch.Tensor
     packed_position_ids: torch.Tensor
-    packed_attention_mask: torch.Tensor
+    packed_attention_mask: Optional[torch.Tensor]
     packed_loss_mask: torch.Tensor
     original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
@@ -708,9 +708,6 @@ class SequencePacker:
         position_ids = torch.zeros(
             (num_bins, self.bin_size), dtype=torch.long, device=device, requires_grad=False
         )
-        attention_mask = torch.zeros(
-            (num_bins, 1, self.bin_size, self.bin_size), dtype=torch.bool, device=device
-        )
         loss_mask = torch.zeros((num_bins, self.bin_size), dtype=torch.float, device=device)
 
         # Track packing information for unpacking later
@@ -741,12 +738,6 @@ class SequencePacker:
                     len(seq), device=device, requires_grad=False
                 )
 
-                # Causal attention mask within each sequence
-                seq_len = end - start
-                attention_mask[bin_idx, 0, start:end, start:end] = torch.tril(
-                    torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
-                )
-
                 # Loss mask (excluding padding)
                 loss_mask[bin_idx, start:end] = 1.0
 
@@ -763,9 +754,6 @@ class SequencePacker:
 
         # Note: We'll store the actual padded length later when we know it
         # (it depends on the original trajectories passed to pack_sequences)
-
-        # Invert attention mask, before inversion: (True = attend, False = mask)
-        attention_mask.bitwise_not_()
 
         # Create the PackingInfo dataclass
         packing_info = PackingInfo(
@@ -795,7 +783,7 @@ class SequencePacker:
         )
         log_single_rank(logger, logging.DEBUG, f"  - First 20 bins: {seq_per_bin[:20]}")
 
-        return packed_sequences, position_ids, attention_mask, loss_mask, packing_info
+        return packed_sequences, position_ids, None, loss_mask, packing_info
 
 def distribute_packed_bins(
     packed_trajs: torch.Tensor,
