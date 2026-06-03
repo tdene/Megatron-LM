@@ -422,9 +422,9 @@ class TestMTPCudaGraphInference:
             context._using_cuda_graph_this_step = True
 
             # Greedy sampling for all active requests.
-            context.active_request_metadata["temperature"][:active_request_count] = 1.0
-            context.active_request_metadata["top_k"][:active_request_count] = 1
-            context.active_request_metadata["top_p"][:active_request_count] = 0.0
+            context.request_metadata["temperature"][:active_request_count] = 1.0
+            context.request_metadata["top_k"][:active_request_count] = 1
+            context.request_metadata["top_p"][:active_request_count] = 0.0
 
             ctrl._compute_serial_mtp_and_sample()
 
@@ -523,9 +523,9 @@ class TestMTPCudaGraphInference:
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
                 # Greedy sampling for all active requests.
-                context.active_request_metadata["temperature"][:active_request_count] = 1.0
-                context.active_request_metadata["top_k"][:active_request_count] = 1
-                context.active_request_metadata["top_p"][:active_request_count] = 0.0
+                context.request_metadata["temperature"][:active_request_count] = 1.0
+                context.request_metadata["top_k"][:active_request_count] = 1
+                context.request_metadata["top_p"][:active_request_count] = 0.0
 
                 ctrl._compute_serial_mtp_and_sample()
                 # CUDA graph replay is asynchronous, and this test reuses the controller's

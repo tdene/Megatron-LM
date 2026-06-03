@@ -39,9 +39,9 @@ class ContextGPUView:
         #   max_mamba_chunks == 0).
         tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
         tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
-        # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
-        # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
-        # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
+        # Request-level fields are all 4 bytes wide. 2 int32 (in_prefill_status,
+        # kv_length_offsets) + 2 int32-with-sentinel (query_lengths,
+        # active_request_last_token_idxs) = 4 fields.
         # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra slot.
         req_4byte_bytes = max_requests * 4
         req_4byte_with_sentinel_bytes = (max_requests + 1) * 4
@@ -95,7 +95,7 @@ class ContextGPUView:
         total_bytes = (
             2 * tok_int64_bytes
             + 4 * tok_int32_bytes
-            + 5 * req_4byte_bytes
+            + 2 * req_4byte_bytes
             + 2 * req_4byte_with_sentinel_bytes
             + mha_query_lengths_bytes
             + mha_cu_query_seq_lengths_bytes
@@ -142,15 +142,6 @@ class ContextGPUView:
         )
         off += req_4byte_with_sentinel_bytes
         self.request_kv_length_offsets = self._buf[off : off + req_4byte_bytes].view(torch.int32)
-        off += req_4byte_bytes
-        # Sampling parameters (consumed by FlashInfer sampling).
-        # Mirror the active slice of `active_request_metadata[{label}]`;
-        # padded slots get neutral defaults from `pad_cpu_active_slices` (T=1.0, top_k=0, top_p=0.0).
-        self.temperature = self._buf[off : off + req_4byte_bytes].view(torch.float32)
-        off += req_4byte_bytes
-        self.top_k = self._buf[off : off + req_4byte_bytes].view(torch.int32)
-        off += req_4byte_bytes
-        self.top_p = self._buf[off : off + req_4byte_bytes].view(torch.float32)
         off += req_4byte_bytes
         # Per-request last-token row indices (consumed by sampling kernels as `gather_indices`).
         # The CPU side of this slot IS `context.active_request_last_token_idxs`,

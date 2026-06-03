@@ -97,7 +97,7 @@ class LogProbsDecode:
         # trailing entries past log_prob_request_count are sliced off later, during extract.
         padded_count = context.padded_active_request_count
         return torch.nonzero_static(
-            context.gpu_return_log_probs_mask[:padded_count], size=padded_count
+            context.request_metadata["return_log_probs"][:padded_count], size=padded_count
         ).squeeze(1)
 
     @staticmethod
@@ -186,7 +186,7 @@ class LogProbsDecode:
             # per-request top_n_per_req[i] tells us how many to actually return.
             top_n_v_cpu = top_n_values[:log_prob_request_count].cpu()
             top_n_i_cpu = top_n_indices[:log_prob_request_count].cpu()
-            top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
+            top_n_per_req: List[int] = context.request_metadata["top_n_logprobs"][
                 :active_request_count
             ].tolist()
             built: Dict[int, List[Tuple[Tensor, Tensor]]] = {}

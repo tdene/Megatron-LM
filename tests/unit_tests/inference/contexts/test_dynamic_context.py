@@ -1110,8 +1110,8 @@ class TestDynamicContext:
             dtype=torch.float32,
         )
         # Mark all active requests as wanting log probs.
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
+        dynamic_context.request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.request_metadata["return_log_probs"][:num_active_requests] = True
 
         # Call the function for prefill
         prefill_log_probs, _ = calculate_log_probs(
@@ -1171,8 +1171,8 @@ class TestDynamicContext:
             dtype=torch.float32,
         )
         # Mark all active requests as wanting log probs.
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][:num_active_requests] = True
+        dynamic_context.request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.request_metadata["return_log_probs"][:num_active_requests] = True
 
         decode_log_probs, _ = calculate_log_probs(
             dynamic_context,
@@ -1239,8 +1239,8 @@ class TestDynamicContext:
         ).long()
 
         # Mark all active requests as wanting log probs.
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][
+        dynamic_context.request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.request_metadata["return_log_probs"][
             :num_active_requests_mixed_step
         ] = True
 
@@ -1359,14 +1359,14 @@ class TestDynamicContext:
         top_n = 5
 
         def _set_active_metadata(n: int):
-            # build_cpu_active_slices (run from initialize_attention_state) overwrites
-            # active_request_metadata from request_metadata, so we patch it after.
-            dynamic_context.active_request_metadata["top_n_logprobs"][:n].fill_(top_n)
-            dynamic_context.active_request_metadata["skip_prompt_log_probs"][:n].fill_(
+            # request_metadata is the GPU source of truth and is not overwritten by
+            # initialize_attention_state, so we set the per-request fields directly.
+            dynamic_context.request_metadata["top_n_logprobs"][:n].fill_(top_n)
+            dynamic_context.request_metadata["skip_prompt_log_probs"][:n].fill_(
                 skip_prompt_log_probs
             )
-            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-            dynamic_context.active_request_metadata["return_log_probs"][:n] = True
+            dynamic_context.request_metadata["return_log_probs"].fill_(False)
+            dynamic_context.request_metadata["return_log_probs"][:n] = True
 
         prefill_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').long()
 
@@ -1498,9 +1498,9 @@ class TestDynamicContext:
         log_prob_request_count = len(log_prob_indices)
 
         def _set_mask():
-            dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
+            dynamic_context.request_metadata["return_log_probs"].fill_(False)
             for i in log_prob_indices:
-                dynamic_context.active_request_metadata["return_log_probs"][i] = True
+                dynamic_context.request_metadata["return_log_probs"][i] = True
 
         # ── Prefill step ──
         new_tokens = torch.randint(0, 100, (num_active,), device='cuda').long()
@@ -1639,8 +1639,8 @@ class TestDynamicContext:
         assert dynamic_context.num_decode_requests == num_active
 
         # Mark all requests as wanting log probs.
-        dynamic_context.active_request_metadata["return_log_probs"].fill_(False)
-        dynamic_context.active_request_metadata["return_log_probs"][:num_active] = True
+        dynamic_context.request_metadata["return_log_probs"].fill_(False)
+        dynamic_context.request_metadata["return_log_probs"][:num_active] = True
 
         # Decode logits: padded to padded_active_token_count to match production.
         vocab_size = 50000
@@ -3576,7 +3576,7 @@ class TestDynamicContext:
         assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
-    #  Tests for active_logit_idxs / last_token_logits / pad_cpu_active_slices
+    #  Tests for active_logit_idxs / last_token_logits / pad_gpu_active_slices
     # ------------------------------------------------------------------ #
 
     def _build_speculative_ctx(self, num_speculative_tokens=2, block_size=256):

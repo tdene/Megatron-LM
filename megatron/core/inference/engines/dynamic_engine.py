@@ -386,11 +386,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
                 )
 
-            # Force all dummy requests to request log probs so graphs cover
-            # the full padded shape. Write to `request_metadata` (the source
-            # of truth) since `_dynamic_step_log_probs_bookkeeping` reads
-            # `request_metadata[:active_count]` — `active_request_metadata`
-            # at this point still holds the previous step's snapshot.
+            # Force all dummy requests to request log probs so graphs cover the full padded shape.
             active_request_count = context.total_request_count - context.paused_request_count
             context.request_metadata["return_log_probs"][:active_request_count] = True
 

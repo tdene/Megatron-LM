@@ -123,7 +123,7 @@ class TorchSampling(Sampling):
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
-        md = context.active_request_metadata
+        md = context.request_metadata
         device = torch.cuda.current_device()
 
         bucket_map: dict = defaultdict(list)

@@ -981,8 +981,8 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
 
         # calculate_log_probs
         new_tokens = torch.randint(0, vocab_size, (5,), device=torch.cuda.current_device())
-        ctx.active_request_metadata["return_log_probs"][:5] = True
-        ctx.active_request_metadata["return_log_probs"][5 : ctx.padded_active_request_count] = False
+        ctx.request_metadata["return_log_probs"][:5] = True
+        ctx.request_metadata["return_log_probs"][5 : ctx.padded_active_request_count] = False
         log_probs_list, _ = calculate_log_probs(ctx, logits, new_tokens, log_prob_request_count=5)
         assert len(log_probs_list) == 5
         assert len(log_probs_list[0]) == 1

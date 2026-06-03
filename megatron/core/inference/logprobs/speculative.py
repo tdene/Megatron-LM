@@ -208,13 +208,19 @@ class LogProbsSpeculative:
 
     @staticmethod
     def prefill_indexing_kernel(
-        context, prefill_offset_pinned: Tensor, *, eager: bool = False, cache_key=None
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Build prefill offset, mask out decode entries, build prefill indices, restore mask.
+        context,
+        prefill_offset_pinned: Tensor,
+        active_count_gpu: Tensor,
+        *,
+        eager: bool = False,
+        cache_key=None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Build prefill offset and per-token prefill log-prob indices.
 
         Args:
             context: The active DynamicInferenceContext.
             prefill_offset_pinned (Tensor): pinned CPU scalar holding `num_decode * spec_plus_one`.
+            active_count_gpu (Tensor): GPU scalar of the active request count.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
@@ -234,25 +240,22 @@ class LogProbsSpeculative:
             empty = torch.zeros(0, dtype=torch.int64, device=device)
             return prefill_offset_gpu, empty, empty, empty, empty, empty
 
-        padded_decode_count = context.padded_batch_dimensions.decode_req_count
+        padded_count = context.padded_active_request_count
 
-        # LogProbsPrefill.indexing_kernel reads `gpu_return_log_probs_mask` to pick
-        # which requests to index. In speculative mode the prefill kernel must only
-        # process *prefill* requests (decode is handled by gather_kernel above), so
-        # temporarily mask out the decode entries on the GPU mirror.
-        # Saved mask is restored before returning so the rest of the system never sees it.
-        saved_mask = context.gpu_return_log_probs_mask[:padded_decode_count].clone()
-        context.gpu_return_log_probs_mask[:padded_decode_count] = False
+        decode_offset = context.padded_batch_dimensions.decode_req_count
+        active_count = active_count_gpu
+        idx = torch.arange(padded_count, device=device)
+        return_log_probs_mask = (
+            context.request_metadata["return_log_probs"][:padded_count]
+            & (idx >= decode_offset)
+            & (idx < active_count)
+        )
 
         # Count of prefill requests asking for log probs.
         # Stays on GPU; the engine .item()s it later when it actually needs the value.
-        prefill_log_prob_count_gpu = context.gpu_return_log_probs_mask[
-            : context.padded_active_request_count
-        ].sum()
+        prefill_log_prob_count_gpu = return_log_probs_mask.sum()
 
-        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
-
-        context.gpu_return_log_probs_mask[:padded_decode_count] = saved_mask
+        ri, cu_ml, li, mt = LogProbsPrefill._indices_from_mask(context, return_log_probs_mask)
 
         return prefill_offset_gpu, ri, cu_ml, li, mt, prefill_log_prob_count_gpu
 
@@ -323,7 +326,7 @@ class LogProbsSpeculative:
 
         # D2H pulls. Batched up front so we hit GPU<->CPU traffic only once for the metadata;
         # per-tensor copies happen in their respective sections.
-        full_mask_cpu: List[bool] = context.active_request_metadata["return_log_probs"][
+        full_mask_cpu: List[bool] = context.request_metadata["return_log_probs"][
             :active_request_count
         ].tolist()
         need_top_n_per_req = (
@@ -335,7 +338,7 @@ class LogProbsSpeculative:
         )
         top_n_per_req_cpu = None
         if need_top_n_per_req:
-            top_n_per_req_cpu: List[int] = context.active_request_metadata["top_n_logprobs"][
+            top_n_per_req_cpu: List[int] = context.request_metadata["top_n_logprobs"][
                 :active_request_count
             ].tolist()
         mask_cpu = full_mask_cpu[:num_decode]
@@ -405,7 +408,11 @@ class LogProbsSpeculative:
         self._prefill_offset_pinned[0] = context.num_decode_requests * spec_plus_one
         key = ("spec_fp_idx", context.padded_batch_dimensions)
         return self.prefill_indexing_kernel(
-            context, self._prefill_offset_pinned, eager=eager, cache_key=key
+            context,
+            self._prefill_offset_pinned,
+            context.active_request_count_gpu,
+            eager=eager,
+            cache_key=key,
         )
 
     def softmax(

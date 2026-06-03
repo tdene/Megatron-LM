@@ -970,7 +970,7 @@ class TextGenerationController:
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # `speculative_required_logit_indices()` already returns padded indices when
         # running a captured graph (`num_last_token_logits` uses the padded counts and
-        # `pad_cpu_active_slices` zero-pads the trailing slots), so the call site does not
+        # `pad_gpu_active_slices` zero-pads the trailing slots), so the call site does not
         # need to re-pad here.
         required_logit_indices = context.speculative_required_logit_indices()
 
@@ -1099,10 +1099,6 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        # Bookkeeping fires before `_dynamic_step_context_init` populates
-        # `active_request_metadata`, so reading the source-of-truth
-        # `request_metadata` (whose `[:active_count]` prefix IS the active
-        # set in the [active|paused|dead] layout) is the up-to-date view.
         self._log_prob_count = int(
             context.request_metadata["return_log_probs"][:active_request_count].sum().item()
         )
@@ -1435,12 +1431,9 @@ class TextGenerationController:
         active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
 
-        # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
         active_request_mask = (
             sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
+            != context.request_metadata["termination_id"][:active_request_count]
         ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
 
         # Mark requests as finished if they hit stop words

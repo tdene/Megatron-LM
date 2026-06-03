@@ -117,17 +117,6 @@ def calculate_log_probs(
     if log_prob_request_count == 0:
         return [], None
 
-    # Refresh `gpu_return_log_probs_mask` from CPU pinned `active_request_metadata`.
-    # Production runs `transfer_bookkeeping_to_gpu` before this entry point; tests
-    # often mutate the CPU mask between the H2D and the call here, so re-stage the
-    # GPU mirror to make this helper safe to call standalone.
-    padded = context.padded_active_request_count
-    context.gpu_return_log_probs_mask[:padded].copy_(
-        context.active_request_metadata["return_log_probs"][:padded]
-    )
-    if padded < context.max_requests:
-        context.gpu_return_log_probs_mask[padded:].fill_(False)
-
     # Local naming (kept short to keep kernel call sites compact):
     #   ri              request_indices (output of indexing_kernel)
     #   cu_ml           cu_masked_lengths (cumulative per-request masked lengths)
@@ -182,7 +171,9 @@ def calculate_log_probs(
     else:
         # Mixed prefill+decode path: per-token logits across each request's query length.
         # See module docstring for the indexing/roll example.
-        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(context)
+        ri, cu_ml, li, mt = LogProbsPrefill.indexing_kernel(
+            context, context.active_request_count_gpu
+        )
         lse = LogProbsPrefill.lse_kernel(logits, li)
         slp = LogProbsPrefill.gather_kernel(logits, new_tokens, ri, cu_ml, li, mt, lse)
 

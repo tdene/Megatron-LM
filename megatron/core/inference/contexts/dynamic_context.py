@@ -938,27 +938,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             pin_memory=True,
         )
 
-        # Track request metadata. Backed by pinned CPU memory: bookkeeping is
-        # CPU-resident; GPU consumers read from the active-slice mirror in
-        # `active_request_metadata` (also CPU pinned, refreshed each step).
+        # Track request metadata.
         self.request_metadata = {
-            label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
+            label: torch.zeros(
+                (self.max_requests,), dtype=dtype, device=torch.cuda.current_device()
+            )
             for label, dtype in self.request_metadata_types
         }
 
-        # Static tensor addresses of active slices to enable fast inference
-        # kernels. Pinned CPU mirrors of `request_metadata`, refreshed each
-        # step by `build_cpu_active_slices()` from the active subrange.
-        self.active_request_metadata = {
-            label: torch.empty_like(tensor, pin_memory=True)
-            for label, tensor in self.request_metadata.items()
-        }
+        # Active request count (= total_request_count - paused_request_count) mirrored to GPU.
+        self._active_request_count_cpu = torch.zeros(
+            1, dtype=torch.int32, device='cpu', pin_memory=True
+        )
+        self.active_request_count_gpu = torch.zeros(
+            1, dtype=torch.int32, device=torch.cuda.current_device()
+        )
 
         # Coalesced pinned CPU buffer for the bookkeeping fields that get
         # transferred to GPU each step via transfer_bookkeeping_to_gpu().
         # Layout matches ContextGPUView._buf so a single cudaMemcpyAsync
         # suffices. Int64 token fields come first (8-byte aligned automatically),
-        # then int32 token fields, then int32/float32 request-staging fields.
+        # then int32 token fields, then int32 request-staging fields.
         #   token_to_input_ids                         (int64,   max_tokens)
         #   token_to_pos_ids                           (int64,   max_tokens)
         #   token_to_block_idx                         (int32,   max_tokens)
@@ -968,9 +968,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   request_in_prefill_status        (staging) (int32,   max_requests)
         #   request_query_lengths            (staging) (int32,   max_requests + 1)
         #   request_kv_length_offsets        (staging) (int32,   max_requests)
-        #   temperature                      (staging) (float32, max_requests)
-        #   top_k                            (staging) (int32,   max_requests)
-        #   top_p                            (staging) (float32, max_requests)
         #   active_request_last_token_idxs   (alias)   (int32,   max_requests + 1)
         #
         # Token fields are aliased with the source-of-truth attributes
@@ -986,7 +983,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `active_request_last_token_idxs` is set each step in `pad_cpu_active_slices`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
-        # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
+        # Request-level fields are all 4 bytes wide (2 int32 + 2 int32-with-sentinel = 4 fields).
         _req_4byte_bytes = self.max_requests * 4
         _req_4byte_with_sentinel_bytes = (self.max_requests + 1) * 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
@@ -1023,7 +1020,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _total_bytes = (
             2 * _tok_int64_bytes
             + 4 * _tok_int32_bytes
-            + 5 * _req_4byte_bytes
+            + 2 * _req_4byte_bytes
             + 2 * _req_4byte_with_sentinel_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
@@ -1098,22 +1095,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ].view(torch.int32)
         _off += _req_4byte_bytes
 
-        # Sampling-parameter staging slots, refreshed from `active_request_metadata`
-        # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
-        # `gpu_view.{temperature, top_k, top_p}`.
-        self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
-            torch.float32
-        )
-        _off += _req_4byte_bytes
-        self._staging_top_k = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
-            torch.int32
-        )
-        _off += _req_4byte_bytes
-        self._staging_top_p = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
-            torch.float32
-        )
-        _off += _req_4byte_bytes
-
         # Per-request last-token row indices. Aliased with the matching gpu_view slot:
         # build_cpu_active_slices/pad_cpu_active_slices populate this CPU view.
         # Has one extra trailing slot at index `max_requests` used as a sentinel.
@@ -1129,12 +1110,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._decode_logit_idxs = torch.arange(
             max_logit_idxs, dtype=torch.int32, device=torch.cuda.current_device()
-        )
-
-        # GPU mirror of `active_request_metadata["return_log_probs"]`,
-        # refreshed in `transfer_bookkeeping_to_gpu`.
-        self.gpu_return_log_probs_mask = torch.zeros(
-            self.max_requests, dtype=torch.bool, device=torch.cuda.current_device()
         )
 
         # MHA flash-attention metadata views (write-only on CPU, read-only on
@@ -1423,18 +1398,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self.total_request_count - self.paused_request_count
 
     def build_cpu_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step.
+        """Build the CPU-side active slices. Run on every forward step.
 
         Post-switch ([active | paused | dead] layout), the active region of
         the persistent tensors is `[:batch_size]` directly — no `padded_slice`
         offset needed.
         """
-        # Request metadata all needs to be sliced.
-        for label in self.request_metadata:
-            self.active_request_metadata[label][:batch_size].copy_(
-                self.request_metadata[label][:batch_size], non_blocking=True
-            )
-
         torch.cumsum(
             self.request_query_lengths[:batch_size],
             dim=0,
@@ -1443,7 +1412,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_request_last_token_idxs[:batch_size].sub_(1)
 
     def pad_cpu_active_slices(self):
-        """Pad the active slices of specific tensors."""
+        """Pad the CPU-side active slices. Run on every forward step."""
+        active_request_count = self.total_request_count - self.paused_request_count
+        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
+
+        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
+        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
+        # `active_request_last_token_idxs` reserves a permanent sentinel slot at
+        # index `max_requests` (size is `max_requests + 1`).
+        self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
+
+    def pad_gpu_active_slices(self):
+        """Pad the GPU-side active slices. Run on every forward step."""
         active_request_count = self.total_request_count - self.paused_request_count
         active_decode_count = self.num_decode_requests
         active_prefill_count = active_request_count - active_decode_count
@@ -1466,22 +1446,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefill_dst.copy_(prefill_cumsum, non_blocking=True)
 
         self.active_logit_idxs[active_decode_token_count + active_prefill_count :].zero_()
-
-        # Request-level padding.
-        padding_request_slice = slice(active_request_count, self.padded_active_request_count)
-
-        # Sampling metadata: pad with neutral defaults, so that the kernel early-exits.
-        self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
-        self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
-        self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
-        # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
-        self.active_request_last_token_idxs[padding_request_slice].fill_(0)
-        # Padded slots must opt out of log-prob computation.
-        self.active_request_metadata["return_log_probs"][padding_request_slice] = False
-
-        # `active_request_last_token_idxs` reserves a permanent sentinel slot at
-        # index `max_requests` (size is `max_requests + 1`).
-        self.active_request_last_token_idxs[self.max_requests] = self.padded_active_token_count - 1
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -1826,7 +1790,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_block_counts[request_slice] = block_counts
         for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
-                metadata_cols[i], dtype=dtype, device='cpu'
+                metadata_cols[i], dtype=dtype, device=self.request_metadata[label].device
             )
 
         dummy_block_idx = self.kv_block_allocator.dummy_block_idx
@@ -2119,10 +2083,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_cpu_active_slices(
-            min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
+        active_slice_count = min(
+            self.padded_active_request_count, self.max_requests - self.paused_request_count
         )
+        self.build_cpu_active_slices(active_slice_count)
         self.pad_cpu_active_slices()
+        self.pad_gpu_active_slices()
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -2327,7 +2293,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_active = max(n_active, self.padded_active_request_count)
 
         # Refresh request-level staging slots from the persistent CPU source.
-        # CPU-to-CPU slice assignment on pinned memory (~15 KB total for 6
+        # CPU-to-CPU slice assignment on pinned memory (~7.3 KB total for 3
         # 4-byte fields at max_requests=624). Negligible vs. the launch overhead
         # we save by merging the H2D memcpys into 1.
         self._staging_request_in_prefill_status[:n_active] = self.request_in_prefill_status_tensor[
@@ -2337,14 +2303,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._staging_request_kv_length_offsets[:n_active] = self.request_kv_length_offsets[
             active_slice
         ]
-        # Sampling-parameter staging slots: read from `active_request_metadata`,
-        # which `build_cpu_active_slices` + `pad_cpu_active_slices` already populated for
-        # `[:padded_active]` (active values + neutral padding defaults).
-        self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
-            :padded_active
-        ]
-        self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
-        self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
 
         # Full-iteration CUDA graphs may have captured GPU consumers with the
         # padded graph request count. Keep those padded staging rows bounded so
@@ -2360,12 +2318,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # 8 redundant launch overheads vs. the prior per-field copies.
         self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
 
-        # `return_log_probs` is bool (1 byte per slot, doesn't share the int32-aligned buffer).
-        self.gpu_return_log_probs_mask[:padded_active].copy_(
-            self.active_request_metadata["return_log_probs"][:padded_active], non_blocking=True
-        )
-        if padded_active < self.max_requests:
-            self.gpu_return_log_probs_mask[padded_active:].fill_(False)
+        self._active_request_count_cpu[0] = n_active
+        self.active_request_count_gpu.copy_(self._active_request_count_cpu, non_blocking=True)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying

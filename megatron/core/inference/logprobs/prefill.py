@@ -81,12 +81,13 @@ class LogProbsPrefill:
 
     @staticmethod
     def indexing_kernel(
-        context, *, eager: bool = False, cache_key=None
+        context, active_count_gpu: Tensor, *, eager: bool = False, cache_key=None
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Build per-token indices for prefill log probs.
 
         Args:
             context: The active DynamicInferenceContext.
+            active_count_gpu (Tensor): GPU scalar of the active request count.
             eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
 
         Returns:
@@ -94,10 +95,21 @@ class LogProbsPrefill:
         """
         # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
+        device = torch.cuda.current_device()
         padded_count = context.padded_active_request_count
-        padded_token_count = context.padded_active_token_count
+        idx = torch.arange(padded_count, device=device)
+        return_log_probs_mask = context.request_metadata["return_log_probs"][:padded_count] & (
+            idx < active_count_gpu
+        )
+        return LogProbsPrefill._indices_from_mask(context, return_log_probs_mask)
 
-        return_log_probs_mask = context.gpu_return_log_probs_mask[:padded_count]
+    @staticmethod
+    def _indices_from_mask(
+        context, return_log_probs_mask: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Turn a per-request log-probs mask into per-token gather indices."""
+        padded_count = return_log_probs_mask.shape[0]
+        padded_token_count = context.padded_active_token_count
         # `gpu_view.request_query_lengths` and `gpu_view.active_request_last_token_idxs`
         # both reserve a permanent slot at index `max_requests` so the
         # `nonzero_static(..., fill_value=max_requests)` sentinel below indexes
@@ -267,12 +279,12 @@ class LogProbsPrefill:
             # skip_prompt determines whether to emit per-token or only last-token.
             top_n_v_cpu = top_n_values[:selected_token_count].cpu()
             top_n_i_cpu = top_n_indices[:selected_token_count].cpu()
-            top_n_per_req: List[int] = context.active_request_metadata["top_n_logprobs"][
+            top_n_per_req: List[int] = context.request_metadata["top_n_logprobs"][
                 :active_request_count
             ].tolist()
-            skip_prompt_per_req: List[bool] = context.active_request_metadata[
-                "skip_prompt_log_probs"
-            ][:active_request_count].tolist()
+            skip_prompt_per_req: List[bool] = context.request_metadata["skip_prompt_log_probs"][
+                :active_request_count
+            ].tolist()
             built: Dict[int, List[Tuple[Tensor, Tensor]]] = {}
             token_offset = 0
             for i, req_idx in enumerate(req_idx_list):
@@ -297,7 +309,9 @@ class LogProbsPrefill:
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Run indexing kernel with optional CUDA graph capture/replay."""
         key = ("prefill_idx", context.padded_batch_dimensions)
-        return self.indexing_kernel(context, eager=eager, cache_key=key)
+        return self.indexing_kernel(
+            context, context.active_request_count_gpu, eager=eager, cache_key=key
+        )
 
     def lse(self, context, logits: Tensor, li: Tensor, *, eager: bool = False) -> Tensor:
         """Run LSE precompute on the side stream so it overlaps with sampling."""

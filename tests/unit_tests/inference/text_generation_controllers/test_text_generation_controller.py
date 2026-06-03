@@ -325,9 +325,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         temp_values = torch.Tensor([s.temperature for s in rev_sampling_dict])
         top_k_values = torch.Tensor([s.top_k for s in rev_sampling_dict]).to(torch.int32)
         top_p_values = torch.Tensor([s.top_p for s in rev_sampling_dict])
-        context.active_request_metadata["temperature"][:batch_size].copy_(temp_values)
-        context.active_request_metadata["top_k"][:batch_size].copy_(top_k_values)
-        context.active_request_metadata["top_p"][:batch_size].copy_(top_p_values)
+        context.request_metadata["temperature"][:batch_size].copy_(temp_values)
+        context.request_metadata["top_k"][:batch_size].copy_(top_k_values)
+        context.request_metadata["top_p"][:batch_size].copy_(top_p_values)
 
         context.padded_active_token_count = batch_size
         context.request_query_lengths = torch.ones(batch_size, dtype=torch.int32, device='cuda')
@@ -335,6 +335,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         context.total_request_count = batch_size
         context.num_prefill_requests = 0
         context.pad_cpu_active_slices()
+        context.pad_gpu_active_slices()
 
         # Sampling.
         logits = torch.arange(0, self.vocab_size).repeat(batch_size, 1).unsqueeze(0).float().cuda()
@@ -869,6 +870,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )  # 1 sampled + 2 spec
         ctx.num_prefill_requests = 0
         ctx.pad_cpu_active_slices()
+        ctx.pad_gpu_active_slices()
 
         # Init accepted tokens tensors
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1119,6 +1121,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctx.request_query_lengths = torch.tensor([4, 4], dtype=torch.int32, device='cuda')
         ctx.num_prefill_requests = 0
         ctx.pad_cpu_active_slices()
+        ctx.pad_gpu_active_slices()
 
         # Setup inputs
         input_ids = torch.randint(0, self.vocab_size, (1, 8), device='cuda')
@@ -1129,9 +1132,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         # Drive sampling onto the multinomial path (top_p > 0, top_k == 0) via metadata.
         # We do NOT mock the sampling kernel: we want it to run natively to prove it doesn't crash.
-        ctx.active_request_metadata["temperature"][:2] = 1.0
-        ctx.active_request_metadata["top_k"][:2] = 0
-        ctx.active_request_metadata["top_p"][:2] = 0.9
+        ctx.request_metadata["temperature"][:2] = 1.0
+        ctx.request_metadata["top_k"][:2] = 0
+        ctx.request_metadata["top_p"][:2] = 0.9
 
         try:
             self.text_generation_controller._dynamic_step_sample_logits_and_verify_tokens(
@@ -1377,9 +1380,9 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
 
         # Greedy sampling: top_k=1 selects the argmax token deterministically.
-        ctx.active_request_metadata["temperature"][:active_request_count] = 1.0
-        ctx.active_request_metadata["top_k"][:active_request_count] = 1
-        ctx.active_request_metadata["top_p"][:active_request_count] = 0.0
+        ctx.request_metadata["temperature"][:active_request_count] = 1.0
+        ctx.request_metadata["top_k"][:active_request_count] = 1
+        ctx.request_metadata["top_p"][:active_request_count] = 0.0
 
         # Run the MTP forward pass
         ctrl._compute_serial_mtp_and_sample()
