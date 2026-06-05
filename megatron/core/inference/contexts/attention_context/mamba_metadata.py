@@ -948,7 +948,7 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         if prefill_count == 0:
             return None, None
 
-        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+        prefill_start = ctx.batch_dimensions.decode_req_count
         offsets = self._intermediate_offsets_cpu[prefill_start : prefill_start + prefill_count]
         counts = self._intermediate_counts_cpu[prefill_start : prefill_start + prefill_count]
         return offsets, counts
@@ -957,7 +957,7 @@ class PrefixCachedMambaMetadata(MambaMetadata):
         """Clear per-request intermediate state for the current prefill batch."""
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count > 0:
-            prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+            prefill_start = ctx.batch_dimensions.decode_req_count
             end = prefill_start + prefill_count
             self._intermediate_counts_cpu[prefill_start:end].fill_(0)
             self._intermediate_offsets_cpu[prefill_start:end].fill_(0)

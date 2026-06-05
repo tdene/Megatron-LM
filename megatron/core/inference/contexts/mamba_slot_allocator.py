@@ -386,7 +386,7 @@ class MambaSlotAllocator:
             metadata.clear_intermediate_state(ctx)
             return None
 
-        prefill_start = ctx.paused_request_count + ctx.batch_dimensions.decode_req_count
+        prefill_start = ctx.batch_dimensions.decode_req_count
 
         # Block IDs and EOS block IDs live on CPU (no GPU sync needed).
         intermediate_count = metadata.intermediate_count

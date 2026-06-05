@@ -88,8 +88,11 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
 @pytest.mark.parametrize(
     "scope,paused,total,counts,expected_active,expected_paused",
     [
-        # active_used = sum over [paused:total]; paused_used = sum over [:paused].
-        ("nonempty", 1, 4, [1, 2, 3, 4, 0, 0, 0, 0], 9, 1),
+        # Layout [active | paused | dead], active_count = total - paused:
+        # active_used = sum over [:active_count]; paused_used = sum over [active_count:total].
+        # nonempty: active_count = 3, active = counts[:3] = 1+2+3 = 6; paused = counts[3:4] = 4.
+        ("nonempty", 1, 4, [1, 2, 3, 4, 0, 0, 0, 0], 6, 4),
+        # paused_only: active_count = 0, active = counts[:0] = 0; paused = counts[0:2] = 5+7 = 12.
         ("paused_only", 2, 2, [5, 7, 0, 0, 0, 0, 0, 0], 0, 12),
     ],
 )
@@ -97,7 +100,8 @@ def test_block_usage_counts_no_prefix_caching(
     scope, paused, total, counts, expected_active, expected_paused
 ):
     """get_active_used / get_paused_used sum request_kv_block_counts over the
-    [paused:total] and [:paused] slices respectively."""
+    [:active_count] and [active_count:total] slices respectively, where
+    active_count = total - paused ([active | paused | dead] layout)."""
     ctx = _make_context(
         paused_request_count=paused,
         total_request_count=total,
@@ -178,9 +182,12 @@ def test_prefix_caching_allocate_and_hash_registration():
 @pytest.mark.parametrize(
     "paused,total,active_assignments,paused_assignments,expected_active,expected_paused",
     [
-        # active rows [1:3] reference {2,3,4,5}; no paused rows assigned.
-        (1, 3, {1: [2, 3, -1, -1], 2: [3, 4, 5, -1]}, {}, 4, 0),
-        # paused rows [:2] reference {1,2,3}; no active rows assigned.
+        # Layout [active | paused | dead], active_count = total - paused.
+        # active_count = 2: active rows [:2] = {row0(empty), row1=[2,3]} -> {2,3} (2 unique);
+        # paused rows [2:3] = {row2=[3,4,5]} -> {3,4,5} (3 unique).
+        (1, 3, {1: [2, 3, -1, -1], 2: [3, 4, 5, -1]}, {}, 2, 3),
+        # active_count = 0: active rows [:0] empty -> 0;
+        # paused rows [0:2] = {[1,2], [1,3]} -> {1,2,3} (3 unique).
         (2, 2, {}, {0: [1, 2, -1, -1], 1: [1, 3, -1, -1]}, 0, 3),
     ],
 )
@@ -188,7 +195,9 @@ def test_block_usage_counts_with_prefix_caching(
     paused, total, active_assignments, paused_assignments, expected_active, expected_paused
 ):
     """With prefix caching, get_active_used / get_paused_used count UNIQUE
-    block IDs (since multiple requests can reference the same cached block)."""
+    block IDs (since multiple requests can reference the same cached block).
+    Slices follow the [active | paused | dead] layout: active = [:active_count],
+    paused = [active_count:total], where active_count = total - paused."""
     request_to_kv = -torch.ones((MAX_REQUESTS, MAX_BLOCKS_PER_REQ), dtype=torch.int32)
     for row_idx, ids in {**active_assignments, **paused_assignments}.items():
         request_to_kv[row_idx] = torch.tensor(ids, dtype=torch.int32)
