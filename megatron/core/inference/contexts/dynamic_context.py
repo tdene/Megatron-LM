@@ -933,6 +933,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 f"Please move tensor '{key}'."
             )
 
+        # GPU mirrors of the host counters that consumers may want to read without a host sync.
+        _synced_counter_names = ()
+        self._synced_counters_buf = torch.zeros(
+            len(_synced_counter_names), dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        self._synced_counters_map: Dict[str, torch.Tensor] = {
+            name: self._synced_counters_buf[i : i + 1]
+            for i, name in enumerate(_synced_counter_names)
+        }
+
         # Per-request state (CPU, pinned memory for fast H2D transfer).
         self.request_ids = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device='cpu', pin_memory=True
@@ -981,7 +991,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Static tensor addresses of active slices to enable fast inference
         # kernels. Pinned CPU mirrors of `request_metadata`, refreshed each
-        # step by `build_active_slices()` from the active subrange.
+        # step by `build_cpu_active_slices()` from the active subrange.
         self.active_request_metadata = {
             label: torch.empty_like(tensor, pin_memory=True)
             for label, tensor in self.request_metadata.items()
@@ -1016,7 +1026,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # `request_query_lengths` and `active_request_last_token_idxs` reserve one extra trailing
         # slot at index `max_requests` to be used as a sentinel by the log probs kernels
         # (per_request_logprobs's `nonzero_static(fill_value=max_requests)` lands there).
-        # `active_request_last_token_idxs` is set each step in `pad_active_slices`.
+        # `active_request_last_token_idxs` is set each step in `pad_cpu_active_slices`.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
@@ -1158,7 +1168,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _off += _req_4byte_bytes
 
         # Per-request last-token row indices. Aliased with the matching gpu_view slot:
-        # build_active_slices/pad_active_slices populate this CPU view.
+        # build_cpu_active_slices/pad_cpu_active_slices populate this CPU view.
         # Has one extra trailing slot at index `max_requests` used as a sentinel.
         self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
             _off : _off + _req_4byte_with_sentinel_bytes
@@ -1473,8 +1483,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns the current number of active requests."""
         return self.total_request_count - self.paused_request_count
 
-    def build_active_slices(self, batch_size: int):
-        """Build the active slices of specific tensors. This is run on every forward step."""
+    def build_cpu_active_slices(self, batch_size: int):
+        """Build the active slices of specific tensors. This is run on every forward step.
+
+        If the context is reordered to active -> paused -> finished, this can be graphed.
+        """
         for label in self.request_metadata:
             self.active_request_metadata[label][:batch_size].copy_(
                 self.request_metadata[label][:batch_size], non_blocking=True
@@ -1487,7 +1500,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.active_request_last_token_idxs[:batch_size].sub_(1)
 
-    def pad_active_slices(self):
+    def pad_cpu_active_slices(self):
         """Pad the active slices of specific tensors."""
         active_request_count = self.total_request_count - self.paused_request_count
         active_decode_count = self.num_decode_requests
@@ -2175,10 +2188,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = self.padded_batch_dimensions.req_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
 
-        self.build_active_slices(
+        self.build_cpu_active_slices(
             min(self.padded_active_request_count, self.max_requests - self.paused_request_count)
         )
-        self.pad_active_slices()
+        self.pad_cpu_active_slices()
 
         # Update token position indexes.
         self.token_to_block_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -2394,7 +2407,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_slice
         ]
         # Sampling-parameter staging slots: read from `active_request_metadata`,
-        # which `build_active_slices` + `pad_active_slices` already populated for
+        # which `build_cpu_active_slices` + `pad_cpu_active_slices` already populated for
         # `[:padded_active]` (active values + neutral padding defaults).
         self._staging_temperature[:padded_active] = self.active_request_metadata["temperature"][
             :padded_active
@@ -2487,6 +2500,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
+        # Mirror the just-zeroed counters into the GPU bridge. Pairs with
+        # the lockstep mutators in ``add_request`` / ``update_requests``
+        # so the bridge tracks the host counters at every transition.
+        self._sync_counters_to_gpu()
+
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
@@ -2495,6 +2513,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+    def _sync_counters_to_gpu(self) -> None:
+        """Mirror every host-int counter listed in `_synced_counters_map` into its GPU view."""
+        for name, view in self._synced_counters_map.items():
+            view.fill_(getattr(self, name))
+
+    def sync_counters_to_cpu(self) -> None:
+        """Refresh every host-int counter from its GPU view."""
+        vals = self._synced_counters_buf.cpu().tolist()
+        for (name, _), value in zip(self._synced_counters_map.items(), vals):
+            setattr(self, name, int(value))
 
     def reset(self) -> None:
         """Reset entire context.
@@ -2968,6 +2997,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
+        # Mirror the post-admit counters to the GPU bridge.
+        self._sync_counters_to_gpu()
+
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens=None, new_speculative_tokens=None
     ):
@@ -3342,6 +3374,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_block_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
+            self._sync_counters_to_gpu()
 
             # Reset Mamba state.
             self.reset_mamba_state()
@@ -3721,6 +3754,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+
+        # Mirror the post-step counters to the GPU bridge.
+        self._sync_counters_to_gpu()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
