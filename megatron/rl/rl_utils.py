@@ -1464,6 +1464,11 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    # DAPO-style overlong filtering (gated by --rl-overlong-filtering): drop from the
+    # loss any turn truncated at the sequence-length boundary (filled the window without
+    # an EOS). See the per-turn check below.
+    overlong_filtering = getattr(get_args(), "rl_overlong_filtering", False)
+    overlong_filtered = 0
     for rollout in rollouts:
         # traj, gen mask and logprobs are lists now.
         # each list entry is a turn, single-turn environments just have a single-element list.
@@ -1491,6 +1496,20 @@ def prepare_trajectories(
                 trajectory.extend([tokenizer.pad] * (seq_length - length))
                 if generation_mask:
                     generation_mask.extend([False] * (seq_length - length))
+            # DAPO-style overlong filtering: a turn that filled the entire window
+            # (length == seq_length) without ending in EOS was truncated at the
+            # sequence-length boundary. Exclude it from the loss by zeroing its
+            # generation mask -- the same zero-loss/zero-grad mechanism the DP-split
+            # padding below relies on. Advantages were computed upstream (see the
+            # data-parallel split) and are unaffected.
+            if (
+                overlong_filtering
+                and generation_mask is not None
+                and length == seq_length
+                and trajectory[length - 1] != tokenizer.eod
+            ):
+                generation_mask = [False] * len(generation_mask)
+                overlong_filtered += 1
             trajs.append(trajectory)
             generation_masks.append(generation_mask)
 
@@ -1507,6 +1526,13 @@ def prepare_trajectories(
         logger.info(f"[{dist.get_rank()}] Rollout counts:")
         for env_id, count in env_id_counts.items():
             logger.info(f"[{dist.get_rank()}] \t{env_id}: {count}")
+
+    if overlong_filtering and overlong_filtered:
+        rank_str = str(dist.get_rank()) if torch.distributed.is_initialized() else "0"
+        logger.info(
+            f"[{rank_str}] overlong filtering: zeroed loss for {overlong_filtered} truncated turn(s) "
+            f"(hit seq_length={seq_length} without EOS) out of {len(trajs)} total turns"
+        )
 
     generation_masks = torch.tensor(generation_masks, dtype=torch.bool, device='cpu')
     trajs = torch.tensor(trajs, device='cpu')
