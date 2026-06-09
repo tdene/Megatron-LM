@@ -182,7 +182,13 @@ class _Qwen3CoderToolParser:
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
         for match_text in self.tool_call_parameter_regex.findall(parameters):
-            idx = match_text.index(">")
+            idx = match_text.find(">")
+            if idx == -1:
+                # Malformed parameter block with no name/value delimiter, e.g. a tool
+                # call truncated at the max-sequence-length boundary. Skip it rather
+                # than raising ValueError (consistent with the function-name handling
+                # above, which returns None on a missing ">").
+                continue
             param_name = match_text[:idx]
             param_value = str(match_text[idx + 1 :])
             # Remove prefix and trailing \n

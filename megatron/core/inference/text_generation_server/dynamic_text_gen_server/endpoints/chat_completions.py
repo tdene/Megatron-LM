@@ -343,12 +343,19 @@ def _replace_prefix_tokens(
     from the previous generation (rather than the ones from the chat template application)."""
 
     # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
-    # Find the last EOS token id in the previous turn token ids
+    # Find the last EOS token id in the previous turn token ids. We scan over the
+    # retokenized previous turn but index into current_turn_token_ids, which can be
+    # SHORTER when the prompt is truncated at/near the max-sequence-length boundary
+    # (multi-turn agentic rollouts overflow SL). Bound the scan to the shorter of the
+    # two so we never index past the end (previously raised IndexError). When current
+    # is shorter and no EOS is found, the default below yields an empty additional
+    # slice => we fall back to the previous turn tokens, which is the correct no-op.
     last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
         if current_turn_token_ids[i] == eos_token_id:
             last_eos_token_id_index = i
             break
