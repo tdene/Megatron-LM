@@ -42,9 +42,6 @@ class MockInferenceInterface(ReturnsRaw):
                 response=LLMChatMessage(role="assistant", content=prompt),
                 raw_text=prompt,
                 finish_reason="stop",
-                policy_epoch=[(0, 0)],
-                kv_cache_epoch=[(0, 0)],
-                num_evictions=0,
             )
         finally:
             self.active_requests -= 1
@@ -79,9 +76,6 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
                 trajectory=[response.raw_text],
                 reward=float(response_idx),
                 env_id=self.env_id,
-                policy_epoch=[response.policy_epoch],
-                kv_cache_epoch=[response.kv_cache_epoch],
-                num_evictions=[response.num_evictions],
             )
 
         return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
