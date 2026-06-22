@@ -1,15 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
 
-from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
+from megatron.core.inference.utils import asyncio_Queue
 from megatron.core.utils import trace_async_exceptions
 
 from ..__init__ import Request, TypeLookupable
@@ -35,13 +33,15 @@ class RolloutRequest(Request):
 class GroupedRolloutRequest(Request):
     """Request to agent to generate grouped Rollouts."""
 
-    num_groups: int
+    groups_per_batch: int
     rollouts_per_group: int
     inference_interface: InferenceInterface
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    enforce_order: bool = False
+    oversubscription_factor: int = 1
+    submission_granularity: Literal["R", "G", "B"] = "B"
+    consumption_granularity: Literal["R", "G", "B"] = "B"
 
 
 class Rollout(AgentBaseModel):
@@ -191,110 +191,127 @@ class TokenizedRolloutGenerator(Agent, ABC):
 class GroupedRolloutGenerator(Agent, ABC):
     """An interface to return grouped Rollout objects to support algorithms like GRPO."""
 
-    parallel_generation_tasks: int = 512
     buffer_size: int = 10
 
-    def __init__(self, *, parallel_generation_tasks: int | None = None, **kwargs):
-        super().__init__(**kwargs)
-        if parallel_generation_tasks is not None:
-            self.parallel_generation_tasks = parallel_generation_tasks
+    async def prepare_group(self, request: GroupedRolloutRequest):
+        raise NotImplementedError
 
-    @abstractmethod
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
+    async def generate_rollout(self, request: GroupedRolloutRequest, prepared) -> Rollout:
+        raise NotImplementedError
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
 
-        # When streaming, use buffer_size to create backpressure
-        # for balanced generation in a multi-task setting.
-        grouped_rollouts: asyncio_Queue[RolloutGroup] = asyncio_Queue(
-            maxsize=self.buffer_size if request.streaming else 0
-        )
-        submitted_groups = 0
+        groups_per_batch = request.groups_per_batch
+        rollouts_per_group = request.rollouts_per_group
 
-        # num_groups controls how many groups each worker generates and yields together.
-        # When it's 1, the semaphore is a no-op.
-        groups_per_worker = request.num_groups
-        if groups_per_worker > 1:
-            assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
-        num_workers = self.parallel_generation_tasks // groups_per_worker
-        unused = self.parallel_generation_tasks % groups_per_worker
-        if unused:
-            logging.warning(
-                f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                f"divisible by num_groups ({groups_per_worker}); "
-                f"{unused} generation task(s) will be unused."
-            )
-        submission_gate = asyncio.Semaphore(num_workers)
+        num_workers = request.oversubscription_factor * groups_per_batch * rollouts_per_group
+        gate = asyncio.Semaphore(num_workers)
+        work_queue: asyncio_Queue = asyncio_Queue()  # dispatch -> production
+        produced_rollouts: asyncio_Queue = asyncio_Queue()  # production -> assemble
+        regen_groups: asyncio_Queue = asyncio_Queue()  # assemble -> regen worker
+        filtered_groups: asyncio_Queue = asyncio_Queue()  # assemble -> consumption
 
-        async def generate_and_enqueue(batch_id, index_in_batch):
-            group = await self.group_rollout(request=request)
-            if (
-                not request.filter_groups_with_same_reward
-                or np.std([r.reward for r in group]) > 1e-6
-            ):
-                await grouped_rollouts.put(
-                    RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
-                )
-                return True
-            return False
+        # Because GRPO's training granularity is inherently group-level, anything above that level
+        # must release the gate on consumption to correctly implement the desired lag shape.
+        release_on_consume = request.consumption_granularity == "B"
+
+        def release_group_permits():
+            for _ in range(rollouts_per_group):
+                gate.release()
+
+        async def dispatch_group(batch_id, index_in_batch, acquire):
+            ctx = await self.prepare_group(request)
+            for _ in range(rollouts_per_group):
+                if acquire:
+                    await gate.acquire()
+                await work_queue.put((batch_id, index_in_batch, ctx))
 
         @trace_async_exceptions(verbose=True)
-        async def generate_task():
-            nonlocal submitted_groups
-            while request.streaming or submitted_groups < request.num_groups:
-                await submission_gate.acquire()
-                batch_id = submitted_groups // groups_per_worker
-                submitted_groups += groups_per_worker
-                if groups_per_worker > 1:
-                    await asyncio.gather(*[
-                        generate_and_enqueue(batch_id, i)
-                        for i in range(groups_per_worker)
-                    ])
+        async def regen_worker():
+            regen_acquire = not release_on_consume
+            while True:
+                await dispatch_group(*await regen_groups.get(), acquire=regen_acquire)
+
+        @trace_async_exceptions(verbose=True)
+        async def dispatch_worker():
+            batch_id = 0
+            while request.streaming or batch_id < 1:
+                # Acquire the batch's rollout units at the submission granularity, then dispatch.
+                if request.submission_granularity == "B":
+                    for _ in range(groups_per_batch * rollouts_per_group):
+                        await gate.acquire()
+                for index_in_batch in range(groups_per_batch):
+                    if request.submission_granularity == "G":
+                        for _ in range(rollouts_per_group):
+                            await gate.acquire()
+                    await dispatch_group(
+                        batch_id, index_in_batch, acquire=request.submission_granularity == "R"
+                    )
+                batch_id += 1
+
+        @trace_async_exceptions(verbose=True)
+        async def production_worker():
+            while True:
+                batch_id, index_in_batch, ctx = await work_queue.get()
+                rollout = await self.generate_rollout(request, ctx)
+                if not release_on_consume:
+                    gate.release()  # on finish -> bounds (dispatched - finished)
+                await produced_rollouts.put((batch_id, index_in_batch, rollout))
+
+        @trace_async_exceptions(verbose=True)
+        async def assemble_worker():
+            rollout_buffers: dict[tuple[int, int], Rollouts] = {}
+            batch_buffers: dict[int, dict[int, RolloutGroup]] = {}
+            next_batch_id = 0
+            while True:
+                # Collate rollouts into a group.
+                batch_id, index_in_batch, rollout = await produced_rollouts.get()
+                buffer = rollout_buffers.setdefault((batch_id, index_in_batch), [])
+                buffer.append(rollout)
+                if len(buffer) < rollouts_per_group:
+                    continue
+                del rollout_buffers[(batch_id, index_in_batch)]
+                group = RolloutGroup(
+                    rollouts=buffer, batch_id=batch_id, index_in_batch=index_in_batch
+                )
+
+                if request.filter_groups_with_same_reward:
+                    if np.std([r.reward for r in group]) <= 1e-6:
+                        # Drop and regenerate the slot.
+                        regen_groups.put_nowait((batch_id, index_in_batch))
+                        continue
+
+                # Assemble according to consumption granularity.
+                if request.consumption_granularity == "B":
+                    batch_buffers.setdefault(batch_id, {})[index_in_batch] = group
+                    while len(batch_buffers.get(next_batch_id, {})) == groups_per_batch:
+                        ready = batch_buffers.pop(next_batch_id)
+                        next_batch_id += 1
+                        await filtered_groups.put([ready[i] for i in range(groups_per_batch)])
                 else:
-                    if not await generate_and_enqueue(batch_id, 0):
-                        submitted_groups -= groups_per_worker
-                        submission_gate.release()
+                    await filtered_groups.put([group])
 
-        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
+        async def consumption_worker():
+            delivered_groups = 0
+            while request.streaming or delivered_groups < groups_per_batch:
+                for group in await filtered_groups.get():
+                    yield group
+                    delivered_groups += 1
+                    if release_on_consume:
+                        release_group_permits()  # on consume -> bounds (dispatched - consumed)
 
-        async def shutdown_queue_when_done():
-            """Wait for all workers to finish, then shut down the queue."""
-            await asyncio.gather(*tasks)
-            grouped_rollouts.shutdown()
-
-        shutdown_task = asyncio.create_task(shutdown_queue_when_done())
+        tasks = [asyncio.create_task(production_worker()) for _ in range(num_workers)]
+        tasks.append(asyncio.create_task(assemble_worker()))
+        tasks.append(asyncio.create_task(dispatch_worker()))
+        tasks.append(asyncio.create_task(regen_worker()))
 
         try:
-            next_batch_id = 0
-            pending: dict[int, GroupedRollouts] = {}
-            while True:
-                try:
-                    group = await grouped_rollouts.get()
-                except asyncio_QueueShutDown:
-                    break
-                if request.enforce_order:
-                    # Accumulate groups and enforce submission order across batches.
-                    pending.setdefault(group.batch_id, []).append(group)
-                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
-                        assert l == groups_per_worker
-                        batch = pending.pop(next_batch_id)
-                        batch.sort(key=lambda g: g.index_in_batch)
-                        next_batch_id += 1
-                        for g in batch:
-                            yield g
-                        submission_gate.release()
-                else:
-                    # Yield groups as soon as they're completed.
-                    yield group
-                    submission_gate.release()
+            async for group in consumption_worker():
+                yield group
         finally:
-            shutdown_task.cancel()
             for task in tasks:
                 task.cancel()
 

@@ -532,7 +532,7 @@ def align_unpacked_inference_logprobs(
     return padded_inference_logprobs
 
 
-def get_agent(args, parallel_generation_tasks: int | None = None):
+def get_agent(args):
     """Get an agent based on environment configuration.
 
     If args.langrl_env_config is provided, uses weighted environment selection.
@@ -541,10 +541,7 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
     with open(args.langrl_env_config, 'r') as f:
         config = yaml.safe_load(f)
 
-    return WeightedMultiTask.from_config(
-        config,
-        parallel_generation_tasks=parallel_generation_tasks,
-    )
+    return WeightedMultiTask.from_config(config)
 
 
 _INFERENCE_INTERFACE = None
@@ -569,9 +566,10 @@ _ROLLOUT_GENERATOR = None
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     global _ROLLOUT_GENERATOR
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
+        agent = get_agent(args)
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            groups_per_batch=n_prompts,
+            oversubscription_factor=args.rl_generation_lag + 1,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -582,7 +580,8 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            submission_granularity=args.rl_submission_granularity,
+            consumption_granularity=args.rl_consumption_granularity,
         )
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR

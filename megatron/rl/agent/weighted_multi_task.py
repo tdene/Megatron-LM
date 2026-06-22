@@ -66,9 +66,7 @@ class WeightedMultiTask(
                 self.weights.append(config.weight / total_weight)
 
     @classmethod
-    def from_config(
-        cls, config: list[dict[str, Any]], *, parallel_generation_tasks: int | None = None
-    ) -> 'WeightedMultiTask':
+    def from_config(cls, config: list[dict[str, Any]]) -> 'WeightedMultiTask':
         """Create a WeightedMultiTask from a config list.
 
         Args:
@@ -85,7 +83,6 @@ class WeightedMultiTask(
             if not all(k in entry for k in ['agent_type', 'agent_args', 'weight']):
                 raise ValueError(f"Missing required keys in config entry: {entry}")
             agent_args = entry.get('agent_args', {})
-            agent_args['parallel_generation_tasks'] = parallel_generation_tasks
 
             # Import and instantiate the agent class
             agent_type = import_class(entry['agent_type'])
@@ -98,10 +95,7 @@ class WeightedMultiTask(
                 )
             )
 
-        instance = cls(agent_configs)
-        if parallel_generation_tasks is not None:
-            instance.parallel_generation_tasks = parallel_generation_tasks
-        return instance
+        return cls(agent_configs)
 
     def _distribute_counts(self, total_count: int, distribute_remainder: bool = True) -> list[int]:
         """Helper method to distribute counts according to weights.
@@ -153,11 +147,6 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
-        raise NotImplementedError(
-            "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
-        )
-
     async def rollout(self, request: RolloutRequest) -> Rollout:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_reward_rollouts instead to generate rollouts."
@@ -185,29 +174,29 @@ class WeightedMultiTask(
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
-        agent_groups = self._distribute_counts(request.num_groups)
-        agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
-        agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
+        agent_groups = self._distribute_counts(request.groups_per_batch)
+        agent_slots = self._distribute_counts(request.groups_per_batch, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
-            if num_groups > 0:
+        for agent, groups_per_batch in zip(self.agents, agent_groups, strict=True):
+            if groups_per_batch > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
-                agent.parallel_generation_tasks = pgt
                 agent_request = GroupedRolloutRequest(
-                    num_groups=num_groups,
+                    groups_per_batch=groups_per_batch,
+                    oversubscription_factor=request.oversubscription_factor,
                     streaming=request.streaming,
-                    enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
+                    submission_granularity=request.submission_granularity,
+                    consumption_granularity=request.consumption_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:

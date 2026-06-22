@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
 from typing import Any
 
 import numpy as np
@@ -135,16 +134,17 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
         return await self.rollout_from_response(request, response, golden)
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
-
+    async def prepare_group(self, request: GroupedRolloutRequest):
         prompt, golden = await self.get_prompt(validation=request.validation)
-
         inference_request = request.inference_interface.prepare_request(
             prompt, request.generation_args
         )
+        return inference_request, golden
 
-        responses = await asyncio.gather(*[request.inference_interface.agenerate(inference_request) for _ in range(request.rollouts_per_group)])
-        return [await self.rollout_from_response(request, response, golden) for response in responses]
+    async def generate_rollout(self, request: GroupedRolloutRequest, prepared) -> Rollout:
+        inference_request, golden = prepared
+        response = await request.inference_interface.agenerate(inference_request)
+        return await self.rollout_from_response(request, response, golden)
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
