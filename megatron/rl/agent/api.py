@@ -25,6 +25,7 @@ from ..rollout_granularity import (
     ReleaseState,
     SubmissionGranularity,
 )
+from ..inflight_tracker import add_inflight, remove_inflight
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -324,6 +325,11 @@ class _RolloutPipeline:
                     await self.gate.acquire_for("G")
                     params: GroupedRolloutRequest = await self.agent.prepare_group_rollout(self.request)
 
+                    # This group's rollouts now enter flight (generation starting). They
+                    # leave it when consumed into a training batch (rollout consumer) or
+                    # dropped by the all-equal-reward filter in stage_assemble.
+                    add_inflight(self.request.rollouts_per_group)
+
                     for rollout_idx in range(self.request.rollouts_per_group):
                         await self.gate.acquire_for("R")
                         await self.infer_queue.put(
@@ -395,6 +401,10 @@ class _RolloutPipeline:
                             index_in_batch=first.item.index_in_batch,
                         )
                     )
+                else:
+                    # Filtered out (all-equal reward): these rollouts are dropped and
+                    # will never be consumed, so they leave the in-flight set here.
+                    remove_inflight(self.request.rollouts_per_group)
         finally:
             self.output_queue.shutdown()
 
