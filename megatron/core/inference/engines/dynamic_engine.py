@@ -45,6 +45,7 @@ from megatron.core.inference.inference_request import (
     Status,
     resolve_multimodal_data_for_engine,
 )
+from megatron.core.inference.inference_step_trace import get_inference_step_tracer
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -2502,6 +2503,20 @@ class DynamicInferenceEngine(AbstractEngine):
             }
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
+
+        # Opt-in per-step batch-size trace (RL systems metric). Recorded post-schedule
+        # so it reflects the batch about to be processed this step.
+        _step_tracer = get_inference_step_tracer()
+        if _step_tracer is not None:
+            _step_tracer.record(
+                step=self.context.step_count,
+                active=self.context.get_active_request_count(),
+                waiting=len(self.waiting_request_ids),
+                paused=self.context.paused_request_count,
+                prefill=self.context.num_prefill_requests,
+                decode=self.context.num_decode_requests,
+                active_tokens=self.context.active_token_count,
+            )
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

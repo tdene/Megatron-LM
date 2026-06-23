@@ -467,6 +467,7 @@ class TestRLUtils:
             cuda_graph_impl="local",
             cuda_graph_modules=[CudaGraphModule.attn],
             inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            rl_log_inference_batch_trace=False,
         )
         interface, _ = self._patch_rl_inference_mode_deps(monkeypatch, args)
         toggle_cuda_graphs = self._make_toggle_cuda_graphs_mock()
