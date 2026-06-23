@@ -1633,6 +1633,9 @@ class TestRLUtils:
         # "env/timeout" sits outside KNOWN_ROLLOUT_STATUSES and needs key sanitization.
         rollout_statuses = [["graded", "ok"], ["env/timeout", "ok"]]
         failure_reasons = [[None, None], [None, None]]
+        # env id is shared within a group; problem/prompt id is too (GRPO group = one prompt).
+        env_ids = [["gsm8k", "gsm8k"], ["math", "math"]]
+        problem_ids = [["q0", "q0"], ["q1", "q1"]]
         current_iteration = 6
         if inject_placeholders:
             for lst, sentinel in (
@@ -1674,6 +1677,8 @@ class TestRLUtils:
             kv_cache_epoch_segments=kv_cache_epoch_segments,
             completed_epochs=completed_epochs,
             num_evictions=num_evictions,
+            env_ids=env_ids,
+            problem_ids=problem_ids,
             current_iteration=current_iteration,
             rollout_statuses=rollout_statuses,
             failure_reasons=failure_reasons,
@@ -1745,26 +1750,76 @@ class TestRLUtils:
         assert metrics["mean_num_turns"] == 15.5
         assert metrics["max_num_turns"] == 42
         assert metrics["min_num_turns"] == 2
-        # true_policy_staleness = [6-4, 6-2, 6-5, 6-0] = [2, 4, 1, 6] -> mean=3.25, max=6, min=1
-        assert metrics["mean_policy_staleness"] == np.mean([2, 4, 1, 6])
-        assert metrics["max_policy_staleness"] == 6
-        assert metrics["min_policy_staleness"] == 1
-        # true_kv_staleness = [6-4, 6-3, 6-5, 6-1] = [2, 3, 1, 5] -> mean=2.75, max=5, min=1
-        assert metrics["mean_kv_cache_staleness"] == np.mean([2, 3, 1, 5])
-        assert metrics["max_kv_cache_staleness"] == 5
-        assert metrics["min_kv_cache_staleness"] == 1
-        # last_token (max epoch per rollout): policy=[5, 3, 5, 1] -> staleness=[1, 3, 1, 5]
-        assert metrics["mean_policy_last_token_staleness"] == np.mean([1, 3, 1, 5])
-        assert metrics["max_policy_last_token_staleness"] == 5
-        assert metrics["min_policy_last_token_staleness"] == 1
-        # last_token (max epoch per rollout): kv=[5, 4, 5, 2] -> staleness=[1, 2, 1, 4]
-        assert metrics["mean_kv_cache_last_token_staleness"] == np.mean([1, 2, 1, 4])
-        assert metrics["max_kv_cache_last_token_staleness"] == 4
-        assert metrics["min_kv_cache_last_token_staleness"] == 1
+        # first-token policy lag = [6-4, 6-2, 6-5, 6-0] = [2, 4, 1, 6] -> mean=3.25, max=6, min=1
+        assert metrics["staleness/policy/first/mean"] == np.mean([2, 4, 1, 6])
+        assert metrics["staleness/policy/first/max"] == 6
+        assert metrics["staleness/policy/first/min"] == 1
+        # avg-token policy lag is token-weighted over the (epoch, token_count) segments:
+        # rollout 0 = 6-(4*1+5*2)/3, rollout 1 = 6-(2*2+3*1)/3, rollout 2 = 6-5,
+        # rollout 3 = 6-(0*3+1*1)/4 = [4/3, 11/3, 1, 5.75]
+        assert np.isclose(metrics["staleness/policy/avg/mean"], np.mean([4 / 3, 11 / 3, 1, 5.75]))
+        # first-token kv lag = [6-4, 6-3, 6-5, 6-1] = [2, 3, 1, 5] -> mean=2.75, max=5, min=1
+        assert metrics["staleness/kv_cache/first/mean"] == np.mean([2, 3, 1, 5])
+        assert metrics["staleness/kv_cache/first/max"] == 5
+        assert metrics["staleness/kv_cache/first/min"] == 1
+        # avg-token kv lag: rollout 0 = 6-(4*2+5*1)/3, rollout 1 = 6-(3*1+4*2)/3,
+        # rollout 2 = 6-5, rollout 3 = 6-(1*2+2*2)/4 = [5/3, 7/3, 1, 4.5]
+        assert np.isclose(metrics["staleness/kv_cache/avg/mean"], np.mean([5 / 3, 7 / 3, 1, 4.5]))
+        # last-token policy epoch=[5, 3, 5, 1] -> lag=[1, 3, 1, 5]
+        assert metrics["staleness/policy/last/mean"] == np.mean([1, 3, 1, 5])
+        assert metrics["staleness/policy/last/max"] == 5
+        assert metrics["staleness/policy/last/min"] == 1
+        # last-token kv epoch=[5, 4, 5, 2] -> lag=[1, 2, 1, 4]
+        assert metrics["staleness/kv_cache/last/mean"] == np.mean([1, 2, 1, 4])
+        assert metrics["staleness/kv_cache/last/max"] == 4
+        assert metrics["staleness/kv_cache/last/min"] == 1
         assert metrics["total_eviction_count"] == 1
         assert metrics["max_num_evictions"] == 1
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
+        # Native wandb.Histogram is logged for every staleness + length distribution...
+        for key in [
+            "staleness/policy/first/histogram",
+            "staleness/policy/avg/histogram",
+            "staleness/policy/last/histogram",
+            "staleness/kv_cache/first/histogram",
+            "staleness/kv_cache/avg/histogram",
+            "staleness/kv_cache/last/histogram",
+            "length/traj/histogram",
+            "length/turn/histogram",
+        ]:
+            assert key in metrics, f"missing native histogram {key}"
+        # ...but not for evictions.
+        assert "evictions/per_rollout/histogram" not in metrics
+        # The Table-backed histogram charts are kept for all distributions (incl. evictions).
+        for key in [
+            "staleness/policy/first_hist",
+            "length/traj_hist",
+            "length/turn_hist",
+            "evictions/per_rollout_hist",
+        ]:
+            assert key in metrics, f"missing table-backed histogram {key}"
+
+    def test_rollout_epoch_summary(self):
+        # On-policy single turn/epoch: first == avg == last.
+        assert rl_utils.rollout_epoch_summary([[(0, 5)]], [10]) == (5, 5.0, 5)
+
+        # Off-policy mid-generation: 4 tokens @ epoch 3, 6 tokens @ epoch 5.
+        # Token-weighted avg = (3*4 + 5*6)/10 = 4.2 (a per-boundary mean would be 4.0).
+        first, avg, last = rl_utils.rollout_epoch_summary([[(0, 3), (4, 5)]], [10])
+        assert (first, last) == (3, 5)
+        assert np.isclose(avg, 4.2)
+
+        # Multi-turn: segments concatenate across turns in order.
+        first, avg, last = rl_utils.rollout_epoch_summary([[(0, 2)], [(0, 3), (2, 4)]], [5, 6])
+        assert (first, last) == (2, 4)
+        assert np.isclose(avg, (2 * 5 + 3 * 2 + 4 * 4) / 11)
+
+        # No tokens -> None.
+        assert rl_utils.rollout_epoch_summary([], []) is None
+
+        # Raw RLE expansion yields (epoch, token_count) run lengths.
+        assert rl_utils.expand_epoch_segments([[(0, 3), (4, 5)]], [10]) == [(3, 4), (5, 6)]
 
         # Case where every episode has failed: the wave still reports the failure
         # counters (now status series + reason table) and skips the rollout tables.
