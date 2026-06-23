@@ -18,6 +18,7 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
+from ..inflight_tracker import add_inflight, remove_inflight
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -233,6 +234,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         submission_gate = asyncio.Semaphore(num_workers)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
+            # Mark this group's rollouts as in-flight for the duration of generation.
+            add_inflight(request.rollouts_per_group)
             group = await self.group_rollout(request=request)
             if (
                 not request.filter_groups_with_same_reward
@@ -242,6 +245,8 @@ class GroupedRolloutGenerator(Agent, ABC):
                     RolloutGroup(rollouts=group, batch_id=batch_id, index_in_batch=index_in_batch)
                 )
                 return True
+            # Filtered out (all-equal reward): these rollouts will never be consumed.
+            remove_inflight(request.rollouts_per_group)
             return False
 
         @trace_async_exceptions(verbose=True)
