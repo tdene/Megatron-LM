@@ -20,6 +20,7 @@ Usage:
 """
 
 import csv
+import glob
 import json
 import logging
 import os
@@ -706,11 +707,22 @@ def log_iteration_profile(
 
 
 def shutdown_rl_profiler():
-    """Shutdown the global RL profiler and export final data."""
+    """Shutdown the global RL profiler and export final data.
+
+    Also closes the per-step inference batch tracer and, on rank 0, auto-renders
+    the RL logging plots (staleness + inference batch size) if those were enabled.
+    """
     global _RL_PROFILER
     if _RL_PROFILER:
         _RL_PROFILER.close()
         _RL_PROFILER = None
+    # Close the per-step inference tracer (lazy import keeps the analysis CLI light).
+    try:
+        from megatron.core.inference.inference_step_trace import shutdown_inference_step_tracer
+        shutdown_inference_step_tracer()
+    except ImportError:
+        pass
+    maybe_render_rl_logging_plots()
 
 
 # ============================================================================
@@ -862,6 +874,359 @@ def analyze_bottlenecks(profile_path: str, top_n: int = 10) -> str:
 
 
 # ============================================================================
+# Staleness & inference batch-size plotting (RL logging)
+#
+# These read the JSONL produced by the RL loop (staleness dump) and the dynamic
+# inference engine (per-step batch trace) and render matplotlib figures. matplotlib
+# is imported lazily so it is only required for plotting, never for training.
+# ============================================================================
+
+def _get_plt():
+    """Lazily import matplotlib with a non-interactive backend."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as e:
+        raise ImportError(
+            "matplotlib is required for rl_profiling plots. Install it with "
+            "`pip install matplotlib` (analysis-only dependency)."
+        ) from e
+    return plt
+
+
+def _expand_rle(boundaries, total_len):
+    """Expand [(start_idx, epoch), ...] + total_len into [(epoch, token_count), ...] segments."""
+    segments = []
+    if not boundaries:
+        return segments
+    for i, (start, epoch) in enumerate(boundaries):
+        end = boundaries[i + 1][0] if i + 1 < len(boundaries) else total_len
+        if end - start > 0:
+            segments.append((epoch, end - start))
+    return segments
+
+
+def _rollout_first_avg_last(turns, key):
+    """Token-weighted (first, avg, last) epoch across a rollout's turns for `key`."""
+    segments = []
+    for turn in turns:
+        segments.extend(_expand_rle(turn[key], turn["token_count"]))
+    if not segments:
+        return None
+    total = sum(c for _, c in segments)
+    return segments[0][0], sum(e * c for e, c in segments) / total, segments[-1][0]
+
+
+def _rollout_lags(record):
+    """Per-rollout first/avg/last lag for policy and kv-cache, or None if no tokens."""
+    policy = _rollout_first_avg_last(record["turns"], "policy_epoch")
+    kv = _rollout_first_avg_last(record["turns"], "kv_cache_epoch")
+    if policy is None or kv is None:
+        return None
+    it = record["iteration"]
+    return {
+        ("policy", "first"): it - policy[0],
+        ("policy", "avg"): it - policy[1],
+        ("policy", "last"): it - policy[2],
+        ("kv_cache", "first"): it - kv[0],
+        ("kv_cache", "avg"): it - kv[1],
+        ("kv_cache", "last"): it - kv[2],
+    }
+
+
+def _scope_key(record, scope):
+    """Label a rollout by the requested grouping scope."""
+    if scope == "batch":
+        return "all"
+    if scope == "env":
+        return record["env_id"] or "?"
+    if scope == "group":
+        return f"b{record['batch_id']}/g{record['group_idx']}"
+    raise ValueError(f"Unknown scope: {scope}")
+
+
+# ---- Inference per-step batch trace ----------------------------------------
+
+def load_inference_step_traces(trace_dir, run_id=None):
+    """Load per-rank inference step traces. Returns {dp_rank: [records sorted by step]}."""
+    by_dp = defaultdict(list)
+    pattern = os.path.join(trace_dir, "inference_steps_*rank*_dp*.jsonl")
+    for path in sorted(glob.glob(pattern)):
+        if run_id is not None and f"_{run_id}_" not in os.path.basename(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rec = json.loads(line)
+                    by_dp[rec["dp_rank"]].append(rec)
+    for dp in by_dp:
+        by_dp[dp].sort(key=lambda r: r["step"])
+    return dict(by_dp)
+
+
+def _aggregate_inference_traces(by_dp):
+    """Sum active and active+waiting across DP ranks per step (assumes lockstep steps);
+    take the in-flight rollout series from DP rank 0 (where it is sampled)."""
+    active_sum = defaultdict(int)
+    total_sum = defaultdict(int)
+    inflight = {}
+    for dp, recs in by_dp.items():
+        for r in recs:
+            active_sum[r["step"]] += r["active"]
+            total_sum[r["step"]] += r["active"] + r["waiting"]
+            if dp == 0 and "inflight_rollouts" in r:
+                inflight[r["step"]] = r["inflight_rollouts"]
+    steps = sorted(active_sum)
+    return steps, active_sum, total_sum, inflight
+
+
+def plot_inference_batch_aggregate(by_dp, out_path):
+    """Plot 1: aggregate batch size over inference steps (active / active+waiting / in-flight)."""
+    plt = _get_plt()
+    steps, active_sum, total_sum, inflight = _aggregate_inference_traces(by_dp)
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(steps, [active_sum[s] for s in steps], lw=1.2, label="active (processing in engines)")
+    ax.plot(steps, [total_sum[s] for s in steps], lw=1.2, label="active + waiting (in engines)")
+    if inflight:
+        isteps = sorted(inflight)
+        ax.plot(isteps, [inflight[s] for s in isteps], lw=1.2,
+                label="in-flight rollouts (incl. buffered)")
+    ax.set_xlabel("inference step since start")
+    ax.set_ylabel("batch size (requests / rollouts)")
+    ax.set_title("Inference batch size over time (aggregate across DP ranks)")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
+def plot_inference_batch_per_dp(by_dp, out_path):
+    """Plot 2: active batch size over inference steps, one line per DP rank."""
+    plt = _get_plt()
+    fig, ax = plt.subplots(figsize=(12, 5))
+    for dp in sorted(by_dp):
+        recs = by_dp[dp]
+        ax.plot([r["step"] for r in recs], [r["active"] for r in recs], lw=1.0, label=f"DP {dp}")
+    ax.set_xlabel("inference step since start")
+    ax.set_ylabel("active batch size (requests)")
+    ax.set_title("Active inference batch size per DP rank")
+    ax.legend(ncol=max(1, len(by_dp) // 8), fontsize=8)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
+def render_inference_plots(trace_dir, out_dir, run_id=None):
+    """Render both inference batch-size plots from a directory of per-rank traces."""
+    by_dp = load_inference_step_traces(trace_dir, run_id=run_id)
+    if not by_dp:
+        logger.warning(f"[rl-logging] No inference step traces found in {trace_dir}")
+        return []
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    return [
+        plot_inference_batch_aggregate(by_dp, out / "inference_batch_aggregate.png"),
+        plot_inference_batch_per_dp(by_dp, out / "inference_batch_per_dp.png"),
+    ]
+
+
+# ---- Staleness & length distributions / per-rollout curves -----------------
+
+def load_staleness_records(path, run="latest"):
+    """Load staleness dump records. `path` may be a JSONL file or a directory.
+
+    For a directory, reads the most recent staleness_*.jsonl by default, or all of
+    them when run='all' (also searches a `staleness/` subdirectory).
+    """
+    p = Path(path)
+    if p.is_dir():
+        files = sorted(p.glob("staleness_*.jsonl")) or sorted((p / "staleness").glob("staleness_*.jsonl"))
+        if not files:
+            return []
+        files = files if run == "all" else [files[-1]]
+    else:
+        files = [p]
+    records = []
+    for f in files:
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    return records
+
+
+def _grouped_violin(ax, labels, data, ylabel, title):
+    """Violin plot of one list of values per label (empty groups drawn as [0])."""
+    data = [d if d else [0] for d in data]
+    ax.violinplot(data, showmeans=True)
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
+def plot_staleness_distributions(records, out_path, scope="batch", title_suffix=""):
+    """Grid of first/avg/last lag distributions (rows: policy/kv-cache) grouped by scope."""
+    plt = _get_plt()
+    sources = ["policy", "kv_cache"]
+    cats = ["first", "avg", "last"]
+    grouped = {(s, c): defaultdict(list) for s in sources for c in cats}
+    for rec in records:
+        lags = _rollout_lags(rec)
+        if lags is None:
+            continue
+        label = _scope_key(rec, scope)
+        for s in sources:
+            for c in cats:
+                grouped[(s, c)][label].append(lags[(s, c)])
+    labels = sorted({l for d in grouped.values() for l in d})
+    if not labels:
+        return None
+    fig, axes = plt.subplots(len(sources), len(cats),
+                             figsize=(max(6, 1.0 * len(labels)) + 2, 6), squeeze=False)
+    for i, s in enumerate(sources):
+        for j, c in enumerate(cats):
+            data = [grouped[(s, c)].get(l, []) for l in labels]
+            _grouped_violin(axes[i][j], labels, data, "lag (iterations)",
+                            f"{s} lag ({c}-token)")
+    fig.suptitle(f"Staleness distributions by {scope}{title_suffix}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
+def plot_length_distributions(records, out_path, scope="batch", title_suffix=""):
+    """Rollout-length (token) distribution grouped by scope."""
+    plt = _get_plt()
+    grouped = defaultdict(list)
+    for rec in records:
+        grouped[_scope_key(rec, scope)].append(rec["traj_len"])
+    labels = sorted(grouped)
+    if not labels:
+        return None
+    fig, ax = plt.subplots(figsize=(max(6, 1.0 * len(labels)) + 2, 5))
+    _grouped_violin(ax, labels, [grouped[l] for l in labels],
+                    "rollout length (tokens)", f"Rollout length by {scope}{title_suffix}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
+def _draw_rollout_lag(ax, record):
+    """Draw a single rollout's per-token lag step-curves (policy + kv-cache overlaid)."""
+    it = record["iteration"]
+    for key, style, color, lbl in [
+        ("policy_epoch", "-", "C0", "policy"),
+        ("kv_cache_epoch", "--", "C1", "kv-cache"),
+    ]:
+        xs, ys, offset = [], [], 0
+        for turn in record["turns"]:
+            for epoch, count in _expand_rle(turn[key], turn["token_count"]):
+                xs.append(offset)
+                ys.append(it - epoch)
+                offset += count
+        if xs:
+            xs.append(offset)
+            ys.append(ys[-1])
+            ax.step(xs, ys, where="post", linestyle=style, color=color, lw=1.4, label=f"{lbl} lag")
+    # Prompt/generation boundary (green) and inter-turn boundaries (dotted gray).
+    offset = 0
+    for t_i, turn in enumerate(record["turns"]):
+        if turn.get("prompt_length") is not None:
+            ax.axvline(offset + turn["prompt_length"], color="green", alpha=0.4, lw=0.8)
+        offset += turn["token_count"]
+        if t_i < len(record["turns"]) - 1:
+            ax.axvline(offset, color="gray", alpha=0.3, lw=0.6, linestyle=":")
+    ax.set_xlabel("token index")
+    ax.set_ylabel("lag (iters)")
+    ax.set_title(
+        f"it{it} {record['env_id']} b{record['batch_id']}/g{record['group_idx']}/"
+        f"r{record['rollout_idx']}  evictions={record['num_evictions']}",
+        fontsize=8,
+    )
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+
+def plot_rollout_lag_curves(records, out_path, max_rollouts=12, selector=None):
+    """Grid of per-rollout lag step-curves; kv-cache drops mark recompute/eviction effects."""
+    plt = _get_plt()
+    recs = [r for r in records if selector is None or selector(r)][:max_rollouts]
+    if not recs:
+        return None
+    cols = min(3, len(recs))
+    rows = (len(recs) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 3 * rows), squeeze=False)
+    for idx, rec in enumerate(recs):
+        _draw_rollout_lag(axes[idx // cols][idx % cols], rec)
+    for idx in range(len(recs), rows * cols):
+        axes[idx // cols][idx % cols].axis("off")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return str(out_path)
+
+
+def render_staleness_plots(staleness_path, out_dir, scopes=("batch", "env", "group"),
+                           iteration=None, max_rollout_curves=12, run="latest"):
+    """Render staleness + length distributions and example rollout curves for one iteration."""
+    records = load_staleness_records(staleness_path, run=run)
+    if not records:
+        logger.warning(f"[rl-logging] No staleness records found at {staleness_path}")
+        return []
+    iters = sorted({r["iteration"] for r in records})
+    target = iteration if iteration is not None else iters[-1]
+    recs = [r for r in records if r["iteration"] == target]
+    suffix = f" (iteration {target})"
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    for scope in scopes:
+        written.append(plot_staleness_distributions(
+            recs, out / f"staleness_by_{scope}_it{target}.png", scope=scope, title_suffix=suffix))
+        written.append(plot_length_distributions(
+            recs, out / f"length_by_{scope}_it{target}.png", scope=scope, title_suffix=suffix))
+    written.append(plot_rollout_lag_curves(
+        recs, out / f"rollout_lag_examples_it{target}.png", max_rollouts=max_rollout_curves))
+    return [w for w in written if w]
+
+
+def maybe_render_rl_logging_plots():
+    """On rank 0 at shutdown, auto-render plots if RL logging was enabled."""
+    try:
+        from megatron.training.global_vars import get_args
+        args = get_args()
+    except (ImportError, AssertionError):
+        return
+    if not (args.rl_log_staleness_data or args.rl_log_inference_batch_trace):
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    from megatron.rl.rl_utils import get_rl_logging_dir
+    base = Path(get_rl_logging_dir(args))
+    out = base / "plots"
+    try:
+        if args.rl_log_inference_batch_trace:
+            render_inference_plots(str(base / "inference"), str(out))
+        if args.rl_log_staleness_data:
+            render_staleness_plots(str(base / "staleness"), str(out))
+        logger.info(f"[rl-logging] Rendered RL logging plots to {out}")
+    except Exception as e:  # rendering is end-of-run convenience; data is safe on disk
+        logger.warning(f"[rl-logging] Failed to render plots ({e}); data is on disk, "
+                       f"render later with `python -m megatron.rl.rl_profiling plot-* ...`")
+
+
+# ============================================================================
 # CLI for analysis (can be run as: python -m megatron.rl.rl_profiling ...)
 # ============================================================================
 
@@ -888,6 +1253,35 @@ def main():
     list_parser.add_argument("profile", help="Path to JSONL profile file")
     list_parser.add_argument("--last", type=int, default=10, help="Show last N iterations")
 
+    # plot-inference command
+    pinf = subparsers.add_parser("plot-inference", help="Plot inference batch size over steps")
+    pinf.add_argument("trace_dir", help="Directory of inference_steps_*.jsonl traces")
+    pinf.add_argument("--out", default="rl_logging_plots", help="Output directory for PNGs")
+    pinf.add_argument("--run-id", default=None, help="Only use traces from this run id")
+
+    # plot-staleness command
+    pstale = subparsers.add_parser("plot-staleness", help="Plot staleness/length distributions")
+    pstale.add_argument("staleness", help="staleness JSONL file or directory")
+    pstale.add_argument("--out", default="rl_logging_plots", help="Output directory for PNGs")
+    pstale.add_argument("--scope", nargs="+", default=["batch", "env", "group"],
+                        choices=["batch", "env", "group"], help="Grouping scope(s)")
+    pstale.add_argument("--iteration", type=int, default=None,
+                        help="Iteration to plot (default: latest in the data)")
+    pstale.add_argument("--max-curves", type=int, default=12,
+                        help="Max per-rollout lag curves to render")
+    pstale.add_argument("--run", default="latest", choices=["latest", "all"],
+                        help="Use the latest staleness file or all of them in a directory")
+
+    # plot-rollout command (per-rollout lag curves, optionally filtered)
+    proll = subparsers.add_parser("plot-rollout", help="Plot per-rollout lag curves")
+    proll.add_argument("staleness", help="staleness JSONL file or directory")
+    proll.add_argument("--out", default="rl_logging_plots", help="Output directory for PNGs")
+    proll.add_argument("--iteration", type=int, default=None, help="Filter to this iteration")
+    proll.add_argument("--env", default=None, help="Filter to this env_id")
+    proll.add_argument("--group", type=int, default=None, help="Filter to this group_idx")
+    proll.add_argument("--n", type=int, default=12, help="Number of rollouts to render")
+    proll.add_argument("--run", default="latest", choices=["latest", "all"])
+
     args = parser.parse_args()
 
     if args.command == "analyze":
@@ -898,6 +1292,30 @@ def main():
         profiles = load_profile_jsonl(args.profile)
         for p in profiles[-args.last:]:
             print(f"Iteration {p['iteration']}: {p['elapsed_time_ms']:.1f}ms")
+    elif args.command == "plot-inference":
+        for p in render_inference_plots(args.trace_dir, args.out, run_id=args.run_id):
+            print(f"Wrote {p}")
+    elif args.command == "plot-staleness":
+        for p in render_staleness_plots(args.staleness, args.out, scopes=tuple(args.scope),
+                                        iteration=args.iteration, max_rollout_curves=args.max_curves,
+                                        run=args.run):
+            print(f"Wrote {p}")
+    elif args.command == "plot-rollout":
+        records = load_staleness_records(args.staleness, run=args.run)
+
+        def _sel(r):
+            if args.iteration is not None and r["iteration"] != args.iteration:
+                return False
+            if args.env is not None and r["env_id"] != args.env:
+                return False
+            if args.group is not None and r["group_idx"] != args.group:
+                return False
+            return True
+
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+        out_path = plot_rollout_lag_curves(records, os.path.join(args.out, "rollout_lag.png"),
+                                           max_rollouts=args.n, selector=_sel)
+        print(f"Wrote {out_path}" if out_path else "No matching rollouts to plot")
     else:
         parser.print_help()
 
