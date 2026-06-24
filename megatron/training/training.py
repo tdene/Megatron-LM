@@ -2970,6 +2970,10 @@ def save_checkpoint_and_time(
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
 
+    # PPO-EWMA: persist the proximal policy alongside persistent checkpoints (per rank).
+    if _RL_PROX_PI_STATE_DICT is not None and not non_persistent_ckpt and args.save is not None:
+        save_prox_pi_state(_RL_PROX_PI_STATE_DICT, args.save, iteration)
+
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
@@ -3207,6 +3211,39 @@ def checkpoint_and_decide_exit(
     return False
 
 
+# PPO-EWMA (arxiv 2110.00641) proximal-policy checkpoint persistence: a per-rank file
+# in the iter_XXXXXXX dir (pruned with the checkpoint). Keyed by global rank, so restore
+# is valid for same-layout (singleton-chain) restarts.
+def _prox_pi_checkpoint_path(checkpoints_path, iteration):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    d = os.path.join(checkpoints_path, 'iter_{:07d}'.format(iteration), 'prox_pi')
+    return d, os.path.join(d, 'prox_pi_rank_{:05d}.pt'.format(rank))
+
+
+def save_prox_pi_state(prox_pi_state_dict, checkpoints_path, iteration):
+    if checkpoints_path is None or prox_pi_state_dict is None:
+        return
+    d, path = _prox_pi_checkpoint_path(checkpoints_path, iteration)
+    os.makedirs(d, exist_ok=True)
+    torch.save(prox_pi_state_dict, path)
+
+
+def load_prox_pi_state(checkpoints_path, iteration):
+    if checkpoints_path is None:
+        return None
+    _, path = _prox_pi_checkpoint_path(checkpoints_path, iteration)
+    return torch.load(path, map_location='cpu') if os.path.exists(path) else None
+
+
+# Current proximal policy; persisted by save_checkpoint_and_time on every save path.
+_RL_PROX_PI_STATE_DICT = None
+
+
+def _set_current_prox_pi(prox_pi_state_dict):
+    global _RL_PROX_PI_STATE_DICT
+    _RL_PROX_PI_STATE_DICT = prox_pi_state_dict
+
+
 def train(
     forward_step_func,
     model,
@@ -3290,7 +3327,12 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
-            prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            prox_pi_state_dict = load_prox_pi_state(args.load, args.iteration)
+            if prox_pi_state_dict is None:
+                print_rank_0("> No saved PPO-EWMA proximal policy; initializing from current weights.")
+                prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            else:
+                print_rank_0(f"> Restored PPO-EWMA proximal policy at iteration {args.iteration}.")
 
             args.no_load_optim = no_load_optim
 
@@ -3689,6 +3731,14 @@ def train(
                 fault_injector_config, iteration
             ):
                 setup_fault_injection(fault_injector_config)
+        # PPO-EWMA: update proximal policy (EWMA of post-update weights) before any save
+        # this iteration, so save_checkpoint_and_time persists a value consistent with the
+        # saved weights. beta=0 => prox == current weights (vanilla GRPO baseline).
+        if args.perform_rl_step:
+            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            b = args.grpo_prox_ewma_beta
+            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
+            _set_current_prox_pi(prox_pi_state_dict)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3758,10 +3808,6 @@ def train(
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             iteration_sequences = batch_size
-        if args.perform_rl_step:
-            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
-            b = args.grpo_prox_ewma_beta
-            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
