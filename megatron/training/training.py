@@ -2969,7 +2969,7 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
-    
+
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
     save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
@@ -3257,6 +3257,7 @@ def train(
             ref_state_dict = {
                 k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
             }
+            prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
         else:
             print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
             load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
@@ -3289,6 +3290,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            prox_pi_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
             args.no_load_optim = no_load_optim
 
@@ -3639,7 +3641,7 @@ def train(
                 torch.cuda.empty_cache()
             with torch.no_grad():
                 train_data_iterator = rl_utils.get_grpo_data_iterator(
-                    model, inference_model, optimizer, iteration, ref_state_dict,
+                    model, inference_model, optimizer, iteration, ref_state_dict, prox_pi_state_dict,
                     grpo_iterations=args.grpo_iterations,
                     grpo_prompts_per_step=args.grpo_prompts_per_step,
                     grpo_group_size=args.grpo_group_size,
@@ -3756,6 +3758,10 @@ def train(
                 mpu.get_data_parallel_world_size() * args.micro_batch_size * get_num_microbatches()
             )
             iteration_sequences = batch_size
+        if args.perform_rl_step:
+            cur_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
+            b = args.grpo_prox_ewma_beta
+            prox_pi_state_dict = {k: ((1. - b) * cur_state_dict[k] + b * v if v is not None else v) for k, v in prox_pi_state_dict.items()}
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences

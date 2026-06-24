@@ -426,7 +426,7 @@ class TestRLUtils:
         rollouts = [[r1, r2] for _ in range(dp)]
         try:
             rl_utils.prepare_data_for_update(
-                [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+                [model], {}, {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
             )
         except AssertionError as e:
             # We expect trajectories to come padded there.
@@ -456,7 +456,7 @@ class TestRLUtils:
         )
         rollouts = [[r1, r2] for _ in range(dp)]
         data_iter, _, _ = rl_utils.prepare_data_for_update(
-            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+            [model], {}, {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
         )
 
         _, _, old_logprobs, _, _, _, _ = next(data_iter)

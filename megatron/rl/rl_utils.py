@@ -1666,6 +1666,7 @@ def compute_logprobs_batch(
 def prepare_data_for_update(
     model: list[LanguageModule],
     ref_state_dict: Dict[str, Any],
+    prox_pi_state_dict: Dict[str, Any],
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
@@ -1933,7 +1934,11 @@ def prepare_data_for_update(
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
 
+            cur_st_dict = {
+                k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
+            }
             with torch.no_grad(), nvtx_range("rl/compute-old-logprobs", time=True):
+                model.load_state_dict(prox_pi_state_dict)
                 old_logprobs = compute_logprobs_batch(
                     model=model,
                     data_loader=data_loader,
@@ -1949,10 +1954,6 @@ def prepare_data_for_update(
                 )
 
             with torch.no_grad(), nvtx_range("rl/compute-ref-logprobs", time=True):
-                # We need to load the ref model state dict and compute the logprobs for the ref model
-                cur_st_dict = {
-                    k: (v.cpu() if v is not None else v) for k, v in model.state_dict().items()
-                }
                 model.load_state_dict(ref_state_dict)
                 ref_logprobs = compute_logprobs_batch(
                     model=model,
@@ -2072,6 +2073,7 @@ def get_grpo_data_iterator(
     optimizer: MegatronOptimizer,
     iteration: int,
     ref_state_dict: Dict[str, torch.Tensor],
+    prox_pi_state_dict: Dict[str, torch.Tensor],
     grpo_iterations: int,
     grpo_prompts_per_step: int,
     grpo_group_size: int,
@@ -2121,6 +2123,7 @@ def get_grpo_data_iterator(
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,
+            prox_pi_state_dict=prox_pi_state_dict,
             rollouts=rollouts,
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,

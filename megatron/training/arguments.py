@@ -2398,6 +2398,8 @@ def _add_rl_args(parser):
                        help="Upper GRPO clipping bound. In vanilla implementation, equals to the lower one.")
     group.add_argument('--grpo-kl-beta', type=float, default=0.001,
                        help="KL term weight in the GRPO loss.")
+    group.add_argument('--grpo-prox-ewma-beta', type=float, default=0.0,
+                       help="Moving average controlling the age of the proximal policy.")
     group.add_argument('--grpo-entropy-term-weight', type=float, default=0.0,
                        help="Entropy term weight in GRPO loss.")
     group.add_argument('--grpo-filter-groups-with-same-reward', action='store_true',
