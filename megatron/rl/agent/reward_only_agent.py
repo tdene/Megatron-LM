@@ -1,23 +1,18 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import asyncio
 from typing import Any
 
 import numpy as np
 from tqdm.asyncio import tqdm
 
-from ..inference import (
-    InferenceResponse,
-    LLMChatMessage,
-    ReturnsRaw,
-    ReturnsTokens,
-)
+from ..inference import InferenceResponse, LLMChatMessage, ReturnsRaw, ReturnsTokens
 from .api import (
     EvaluationAgent,
     EvaluationRequest,
     EvaluationResponse,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
+    GroupRolloutParams,
     RewardEvaluationResult,
     Rollout,
     RolloutGenerator,
@@ -206,8 +201,8 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
                 num_evictions=[r.num_evictions for r in responses],
             )
 
-    async def rollout_from_response(
-        self, request: RolloutRequest, response: InferenceResponse, golden: Any
+    async def _rollout_from_response(
+        self, request: RolloutRequest | GroupedRolloutRequest, response: InferenceResponse, golden: Any
     ) -> Rollout:
         assert isinstance(
             request.inference_interface, ReturnsRaw
@@ -250,23 +245,21 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
         return await self._run_episode(prompt, golden, request)
 
-    async def group_rollout(
+    async def prepare_group_rollout(
         self,
         request: GroupedRolloutRequest,
-        submission_gate: asyncio.Semaphore | None = None,
-    ) -> list[Rollout]:
+    ) -> GroupRolloutParams:
+
         prompt, golden = await self.get_prompt(validation=request.validation)
 
-        async def generate_one():
-            if submission_gate is None:
-                return await self._run_episode(prompt, golden, request)
-            else:
-                async with submission_gate:
-                    return await self._run_episode(prompt, golden, request)
+        inference_request = request.inference_interface.prepare_request(
+            prompt, request.generation_args
+        )
 
-        return list(await asyncio.gather(*[
-            generate_one() for _ in range(request.rollouts_per_group)
-        ]))
+        async def build_rollout(response: InferenceResponse) -> Rollout:
+            return await self._rollout_from_response(request, response, golden)
+
+        return GroupRolloutParams(inference_request=inference_request, build_rollout=build_rollout)
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest
