@@ -618,10 +618,6 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
-        num_groups = n_prompts
-        if streaming and args.rl_submission_granularity != "B":
-            num_groups = 1
-
         # When speculative rollout is enabled, inflate rollouts_per_group so the
         # draft engine generates oversample_factor * samples_per_group candidates.
         # A thin async wrapper then down-selects to the original samples_per_group
@@ -633,7 +629,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             else samples_per_group
         )
         request = GroupedRolloutRequest(
-            num_groups=num_groups,
+            num_groups=n_prompts,
             streaming=streaming,
             rollouts_per_group=effective_rollouts_per_group,
             inference_interface=inference_interface,
