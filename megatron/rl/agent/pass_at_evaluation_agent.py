@@ -23,6 +23,22 @@ def pass_at_k(n_samples: int, n_correct: int, k: int) -> float:
     return 1.0 - np.prod(1.0 - k / np.arange(n_samples - n_correct + 1, n_samples + 1))
 
 
+def _coerce_response(response: Any) -> LLMChatMessage:
+    """Normalize a single per-rollout response to an ``LLMChatMessage``.
+
+    Per-rollout ``EvaluationResult.response`` is typed ``str | LLMChatMessage``,
+    so an aggregated list across rollouts can be mixed: some rollouts return an
+    ``LLMChatMessage`` (assistant text) while others return a bare ``str`` --
+    notably ``''`` for over-context / dropped rollouts (common in the SWE
+    setup). Pydantic validates ``list[str] | list[LLMChatMessage]`` as a single
+    consistent type, so a mixed list crashes. Coerce every entry to
+    ``LLMChatMessage`` to keep the aggregated list homogeneous.
+    """
+    if isinstance(response, LLMChatMessage):
+        return response
+    return LLMChatMessage(role="assistant", content=response if response else "")
+
+
 class PassAtEvaluationResult(RewardEvaluationResult):
     pass_at: dict[int, float]
     response: list[str] | list[LLMChatMessage]
@@ -66,7 +82,8 @@ class PassAtEvaluationAgent(EvaluationAgent, ABC):
             result.reward for result in sum([response.results for response in responses], [])
         ]
         response_texts = [
-            result.response for result in sum([response.results for response in responses], [])
+            _coerce_response(result.response)
+            for result in sum([response.results for response in responses], [])
         ]
 
         # Count number of passing solutions (reward == 1.0)
