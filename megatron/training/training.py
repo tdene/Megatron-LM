@@ -3723,18 +3723,6 @@ def train(
             continue
 
         args.curr_iteration = iteration
-
-        if should_fire(callback_manager, "on_train_step_start"):
-            callback_manager.fire(
-                "on_train_step_start",
-                CallbackContext(
-                    model=model,
-                    user_state=callback_manager.user_state,
-                    optimizer=optimizer,
-                    scheduler=opt_param_scheduler,
-                ),
-            )
-
         # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
         # It is similar to a PPO epoch.
 
@@ -3771,6 +3759,17 @@ def train(
         else:
             ft_integration.on_training_step_start()
 
+            if should_fire(callback_manager, "on_train_step_start"):
+                callback_manager.fire(
+                    "on_train_step_start",
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                        optimizer=optimizer,
+                        scheduler=opt_param_scheduler,
+                    ),
+                )
+
             (
                 loss_dict,
                 skipped_iter,
@@ -3786,6 +3785,20 @@ def train(
                 p2p_communicator=p2p_communicator, schedule_pg_collection=schedule_pg_collection
             )
 
+            if should_fire(callback_manager, "on_train_step_end"):
+                callback_manager.fire(
+                    "on_train_step_end",
+                    CallbackContext(
+                        model=model,
+                        user_state=callback_manager.user_state,
+                        optimizer=optimizer,
+                        scheduler=opt_param_scheduler,
+                        loss_dict=loss_dict,
+                        grad_norm=grad_norm,
+                        skipped_iter=bool(skipped_iter),
+                    ),
+                )
+
             ft_integration.on_training_step_end()
             if _maybe_raise_workload_exception is not None and iteration != start_iteration:
                 _maybe_raise_workload_exception()
@@ -3796,25 +3809,6 @@ def train(
                 fault_injector_config, iteration
             ):
                 setup_fault_injection(fault_injector_config)
-
-        # One per-iteration end hook, at loop level so it fires for inference-only
-        # (skip_train) iterations too, and before should_exit so the exiting iteration
-        # still gets it. loss_dict/grad_norm are empty/zero when skip_train; callbacks
-        # read args.skip_train to tell whether a gradient step ran.
-        if should_fire(callback_manager, "on_train_step_end"):
-            callback_manager.fire(
-                "on_train_step_end",
-                CallbackContext(
-                    model=model,
-                    user_state=callback_manager.user_state,
-                    optimizer=optimizer,
-                    scheduler=opt_param_scheduler,
-                    loss_dict=loss_dict,
-                    grad_norm=grad_norm,
-                    skipped_iter=bool(skipped_iter),
-                ),
-            )
-
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
