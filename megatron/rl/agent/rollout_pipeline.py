@@ -258,6 +258,9 @@ class RolloutPipeline:
         self.infer_queue = asyncio_Queue()
         self.assemble_queue = asyncio_Queue()
         self.output_queue = asyncio_Queue()
+        self.bank = asyncio_Queue()
+        self.banked_batches = 0
+        self.consumed_batches = 0
 
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -287,6 +290,7 @@ class RolloutPipeline:
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
+            asyncio.create_task(self.stage_bank()),
         )
         try:
             async for group in self.stage_consume():
@@ -435,10 +439,10 @@ class RolloutPipeline:
             self.output_queue.shutdown()
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
-        """Record how long a group sat in output_queue before being yielded.
+        """Record how long a group waited between assembly and being yielded.
 
         Args:
-            group: The group being handed to the consumer.
+            group: The group being yielded to the consumer.
         """
         key = (group.batch_id, group.index_in_batch)
         enqueued_at = self._output_enqueued_at.pop(key, 0.0)
@@ -448,31 +452,73 @@ class RolloutPipeline:
         self.yielded_groups_per_env[self.gran_policy.env_of_index(group.index_in_batch)] += 1
 
     async def _next_group(self) -> RolloutGroup | None:
-        """Pop the next group off output_queue and record its dwell.
+        """Pop the next group off output_queue.
 
         Returns:
             The next RolloutGroup, or None once the queue shuts down.
         """
         try:
-            group = await self.output_queue.get()
+            return await self.output_queue.get()
         except asyncio_QueueShutDown:
             return None
-        self._record_output_dwell(group)
-        return group
 
-    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
-        """Deliver groups in the order defined by the consumption granularity.
+    @property
+    def ready_batches(self) -> int:
+        """Full batches banked and not yet dequeued for consumption."""
+        return self.banked_batches - self.consumed_batches
 
-        Yields:
-            RolloutGroup: Groups ordered by the configured consumption mode.
-        """
-        consume = {
+    @trace_async_exceptions(verbose=True)
+    async def stage_bank(self) -> None:
+        """Bank complete batches cut from the consumption-ordered group stream."""
+        order = {
             "G": self._consume_completion_order,
             "E": self._consume_env_units,
             "B": self._consume_batch_order,
         }[self.gran_policy.consumption]
-        async for group in consume():
-            yield group
+        batch: list[RolloutGroup] = []
+        try:
+            async for group in order():
+                batch.append(group)
+                if len(batch) == self.gran_policy.num_groups_per_batch:
+                    self.bank.put_nowait(batch)
+                    self.banked_batches += 1
+                    batch = []
+            assert self.request.streaming or not (batch or self._consume_pending), (
+                "Stream ended with groups not forming a full batch."
+            )
+        finally:
+            self.bank.shutdown()
+
+    async def stage_consume(self) -> AsyncIterator[RolloutGroup]:
+        """Unwrap banked batches for the consumer, freeing gate slots as it goes.
+
+        Yields:
+            RolloutGroup: Groups ordered by the configured consumption mode.
+        """
+        while True:
+            try:
+                batch = await self.bank.get()
+            except asyncio_QueueShutDown:
+                return
+            self.consumed_batches += 1
+            consumed_per_env = [0] * len(self.gran_policy.num_groups_per_env)
+            for group in batch:
+                self._record_output_dwell(group)
+                yield group
+                # G/E/B slots free on trainer consumption: the release for a
+                # group fires when the consumer comes back for the next one.
+                # Releasing in the ordering generators instead would fire at
+                # banking time, uncapping generation run-ahead.
+                self.gate.release_for("G")
+                env_index = self.gran_policy.env_of_index(group.index_in_batch)
+                consumed_per_env[env_index] += 1
+                # E and B consumption bank each env's unit contiguously, so the
+                # unit's slot frees with its last group. (Under G consumption
+                # envs may interleave, but then submission is R or G and the E
+                # release is a no-op.)
+                if consumed_per_env[env_index] == self.gran_policy.num_groups_per_env[env_index]:
+                    self.gate.release_for("E")
+            self.gate.release_for("B")
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
         """G consumption: deliver each group as soon as it assembles.
@@ -482,7 +528,6 @@ class RolloutPipeline:
         """
         while (group := await self._next_group()) is not None:
             yield group
-            self.gate.release_for("G")
 
     async def _consume_env_units(self) -> AsyncIterator[RolloutGroup]:
         """Balanced-E consumption.
@@ -515,8 +560,6 @@ class RolloutPipeline:
                     if delivered_units[env] == current_batch and ready_units[env]:
                         for unit_group in ready_units[env].popleft():
                             yield unit_group
-                            self.gate.release_for("G")
-                        self.gate.release_for("E")
                         delivered_units[env] += 1
                         progressed = True
                 if all(count > current_batch for count in delivered_units):
@@ -538,15 +581,9 @@ class RolloutPipeline:
                 >= self.gran_policy.num_groups_per_batch
             ):
                 batch = pending.pop(next_batch_id)
-                batch.sort(key=lambda group: group.index_in_batch)
-                next_batch_id += 1
                 # Env blocks are contiguous in index_in_batch order, so the
                 # sorted batch is env 0's unit, then env 1's, and so on.
-                start = 0
-                for unit_size in self.gran_policy.num_groups_per_env:
-                    for group in batch[start : start + unit_size]:
-                        yield group
-                        self.gate.release_for("G")
-                    self.gate.release_for("E")
-                    start += unit_size
-                self.gate.release_for("B")
+                batch.sort(key=lambda group: group.index_in_batch)
+                next_batch_id += 1
+                for group in batch:
+                    yield group
