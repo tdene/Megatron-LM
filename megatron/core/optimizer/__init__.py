@@ -798,7 +798,15 @@ def _get_megatron_emerging_optimizer(
                     )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
-    config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding
+    # params is configurable via ``config.muon_scalar_optimizer`` (e.g., 'adam' or 'lion');
+    # deep-copy the registry defaults before rewriting so we never mutate shared state.
+    default_param_overrides = copy.deepcopy(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
+    if eopt_name in ('muon', 'adaptive_muon'):
+        for override in default_param_overrides.values():
+            if override.get('optimizer') in ('adam', 'lion'):
+                override['optimizer'] = config.muon_scalar_optimizer
+    config_overrides.update(default_param_overrides)
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
@@ -831,7 +839,10 @@ def _get_megatron_emerging_optimizer(
             "fall back to the legacy LayerWise ping-pong path."
         )
     if use_separate_distributed_optimizer and any(
-        opt_name not in _EMERGING_OPTIMIZERS
+        # A separate DistributedOptimizer with byte-level sharding handles any group
+        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
+        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
+        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
         for (opt_name, _), groups in grouped_param_groups.items()
         if groups
     ):
@@ -870,7 +881,10 @@ def _get_megatron_emerging_optimizer(
 
         model_parallel_group = pg_collection.tp_ep_pp if is_expert else pg_collection.mp
 
-        if opt_name in _EMERGING_OPTIMIZERS:
+        # Only the primary emerging optimizer (stored in ``eopt_name``, e.g., Muon) is
+        # constructed via ``_create_emerging_optimizer``. Scalar optimizers that also appear
+        # in ``_EMERGING_OPTIMIZERS`` (e.g., Lion) fall through to the standard fallback path.
+        if opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS:
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
@@ -895,7 +909,7 @@ def _get_megatron_emerging_optimizer(
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
             if use_separate_distributed_optimizer:
-                # Route non-emerging params through a real DistributedOptimizer
+                # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.
                 for group in groups:
                     assert not group['is_expert_parallel'], (
@@ -1050,10 +1064,12 @@ def get_megatron_optimizer(
     intra_expt_dp_group = process_groups_dict['intra_expt_dp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    expt_tp_pp_with_egtp_remat_group = process_groups_dict['expt_tp_pp_with_egtp_remat_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
+    # ``mp_group`` spans TP×GTP_remat×PP (GTP_remat-merged).
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
@@ -1178,8 +1194,9 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
-        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
-        # Pass Gloo process groups into optimizer only if needed.
+        # Expert analog of dense ``model_parallel_rank``; use the EGTP_remat-merged group so each
+        # EGTP_remat peer gets a distinct distopt ShardedObject key (else DCP "duplicate" error).
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_remat_group)
         if use_gloo_process_groups:
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
@@ -1190,7 +1207,7 @@ def get_megatron_optimizer(
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=expt_tp_pp_group,
+                model_parallel_group=expt_tp_pp_with_egtp_remat_group,
                 data_parallel_group=intra_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,
                 data_parallel_group_idx=expt_model_parallel_rank,
