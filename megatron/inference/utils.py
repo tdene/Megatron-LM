@@ -8,7 +8,10 @@ from typing import Literal, Optional
 import torch
 
 from megatron.core.inference.contexts import DynamicInferenceContext
-from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines import (
+    AutotuneDynamicInferenceEngine,
+    DynamicInferenceEngine,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -374,5 +377,8 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
+    engine_cls = (
+        AutotuneDynamicInferenceEngine if inference_config.autotune else DynamicInferenceEngine
+    )
+    engine = engine_cls(controller, context)
     return engine

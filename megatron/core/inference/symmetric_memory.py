@@ -40,6 +40,8 @@ class SymmetricMemoryBuffer:
 
     def __init__(self, size_in_mb, process_group):
         self.init_failure_reason: Optional[str] = None
+        self.size_in_mb = size_in_mb
+        self.process_group = process_group
         if not HAVE_TORCH_SYMM_MEM:
             self.init_failure_reason = "torch.distributed._symmetric_memory not importable"
             self.symm_buffer = None
@@ -151,12 +153,33 @@ class SymmetricMemoryManager:
     ) -> SymmetricMemoryBuffer:
         """Return the buffer for *key*, creating it on first call.
 
+        When the buffer already exists but is smaller than the requested
+        ``size_mb``, it is destroyed and re-created at the larger size
+        (grow-on-demand); a request at or below the current capacity returns
+        the cached buffer unchanged. Growing performs a fresh rendezvous,
+        which is COLLECTIVE across the buffer's process group: every rank
+        must request the grown size together (e.g. the autotune context
+        rebuilds all_reduce their sizes before any rank allocates). A buffer
+        whose initialization failed is returned as-is — growing cannot fix a
+        missing symmetric-memory backend.
+
         Args:
             key: Unique identifier (e.g. "tp", "ep").
             process_group: Required on the first call for a given key.
-                Subsequent calls may omit it.
-            size_mb: Buffer size in MiB (default 256).
+                Subsequent calls may omit it (a growth re-rendezvous reuses
+                the stored group unless a new one is passed).
+            size_mb: Buffer size in MiB (default 512).
         """
+        existing = cls._buffers.get(key)
+        if (
+            existing is not None
+            and existing.symm_buffer is not None
+            and size_mb is not None
+            and size_mb > existing.size_in_mb
+        ):
+            if process_group is None:
+                process_group = existing.process_group
+            del cls._buffers[key]
         if key not in cls._buffers:
             assert (
                 process_group is not None

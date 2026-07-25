@@ -27,7 +27,11 @@ from examples.inference.utils import (
     get_global_peak_memory_stats_bytes,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.engines import DynamicInferenceEngine, EngineSuspendedError
+from megatron.core.inference.engines import (
+    AutotuneDynamicInferenceEngine,
+    DynamicInferenceEngine,
+    EngineSuspendedError,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -352,7 +356,10 @@ def main():
         )
 
     # Inference engine.
-    engine = DynamicInferenceEngine(controller, context)
+    engine_cls = (
+        AutotuneDynamicInferenceEngine if inference_config.autotune else DynamicInferenceEngine
+    )
+    engine = engine_cls(controller, context)
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")

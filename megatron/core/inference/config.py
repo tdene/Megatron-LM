@@ -194,6 +194,29 @@ class InferenceConfig:
     state tensors for each KV cache block. Only used for hybrid models.
     """
 
+    autotune: bool = False
+    """Automatically tune max_requests, max_tokens, mamba_memory_ratio, and buffer_size_gb.
+    Requires `autotune_average_seq_len` to be set and the engine to be constructed as
+    `AutotuneDynamicInferenceEngine`.
+    Currently only supports an engine initialized with the following options:
+     - `use_cuda_graphs_for_non_decode_steps`
+     - `cuda_graph_all_prefills`
+     - `cuda_graph_impl="local"`
+     - `num_cuda_graphs` set to non-zero
+     - `cuda_graph_mixed_prefill_count` greater than 0
+     - `cuda_graph_sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL`
+     - `inference_moe_token_dispatcher_type="nvls"`
+     - `enable_chunked_prefill`
+     - `unified_memory_level=0`
+    Every item is enforced at engine startup
+    (`AutotuneDynamicInferenceEngine._validate_autotune_requirements`); the CLI path
+    additionally auto-enables the remediable ones with a warning (`validate_args`).
+    """
+
+    autotune_average_seq_len: Optional[int] = None
+    """Expected average runtime sequence length (prompt + generation);
+    the only knob the autosolver needs to maximize throughput."""
+
     max_requests: Optional[int] = None
     """
     Max number of active requests to use for decode-only forward passes.

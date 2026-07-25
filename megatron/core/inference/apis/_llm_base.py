@@ -19,6 +19,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.autotune_engine import AutotuneDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -282,7 +283,10 @@ class _MegatronLLMBase:
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine = DynamicInferenceEngine(controller=controller, context=context)
+        engine_cls = (
+            AutotuneDynamicInferenceEngine if inference_config.autotune else DynamicInferenceEngine
+        )
+        engine = engine_cls(controller=controller, context=context)
 
         if use_coordinator:
             is_primary_rank = dist.get_rank() == 0

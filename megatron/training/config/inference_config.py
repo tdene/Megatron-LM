@@ -96,6 +96,18 @@ class InferenceSetupConfig:
     """Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
     state tensors for each KV cache block. Only used for hybrid models."""
 
+    inference_dynamic_batching_autotune: bool = False
+    """Automatically tune max_requests, max_tokens, buffer_size_gb, and mamba_memory_ratio, based
+    on the expected average sequence length. Requires
+    inference_dynamic_batching_autotune_average_seq_len to be set and the engine to be constructed
+    as AutotuneDynamicInferenceEngine. If inference_dynamic_batching_max_requests is manually
+    provided, the solver will pin it to the user-specified value; useful for situations where the
+    user wants a set request limit instead of maximizing throughput."""
+
+    inference_dynamic_batching_autotune_average_seq_len: int | None = None
+    """Expected average runtime sequence length (prompt + generation tokens); the only knob the
+    autosolver needs to maximize throughput."""
+
     inference_dynamic_batching_block_size: int = 256
     """KV cache block size. It should be a multiple of 256."""
 
@@ -334,6 +346,8 @@ class InferenceSetupConfig:
             buffer_size_gb=self.inference_dynamic_batching_buffer_size_gb,
             paused_buffer_size_gb=self.inference_dynamic_batching_paused_buffer_size_gb,
             mamba_memory_ratio=self.inference_dynamic_batching_mamba_memory_ratio,
+            autotune=self.inference_dynamic_batching_autotune,
+            autotune_average_seq_len=self.inference_dynamic_batching_autotune_average_seq_len,
             num_cuda_graphs=(
                 self.inference_dynamic_batching_num_cuda_graphs if enable_cuda_graphs else None
             ),

@@ -1774,6 +1774,96 @@ def validate_args(args, defaults={}):
             args.cuda_graph_impl == "none"
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
 
+    if args.inference_dynamic_batching_autotune:
+        avg_seq = args.inference_dynamic_batching_autotune_average_seq_len
+        assert avg_seq is not None, (
+            "--inference-dynamic-batching-autotune requires "
+            "--inference-dynamic-batching-autotune-average-seq-len to be set."
+        )
+        assert avg_seq > 0, (
+            f"--inference-dynamic-batching-autotune-average-seq-len must be positive, got {avg_seq}."
+        )
+        if args.inference_dynamic_batching_max_requests is not None:
+            warn_rank_0(
+                '--inference-dynamic-batching-max-requests is set: autotune will pin '
+                'max_requests to it instead of solving for the largest feasible value.'
+            )
+
+        # Auto-enable required prerequisites, warn if we had to set them.
+        if args.cuda_graph_impl == "none":
+            warn_rank_0(
+                'Setting --cuda-graph-impl=local '
+                '(required by --inference-dynamic-batching-autotune).'
+            )
+            args.cuda_graph_impl = "local"
+        if not args.enable_chunked_prefill:
+            warn_rank_0(
+                'Enabling --enable-chunked-prefill '
+                '(required by --inference-dynamic-batching-autotune).'
+            )
+            args.enable_chunked_prefill = True
+        if args.decode_only_cuda_graphs:
+            warn_rank_0(
+                'Disabling --decode-only-cuda-graphs '
+                '(incompatible with --inference-dynamic-batching-autotune).'
+            )
+            args.decode_only_cuda_graphs = False
+        if not args.inference_cuda_graph_all_prefills:
+            warn_rank_0(
+                'Enabling --inference-cuda-graph-all-prefills '
+                '(required by --inference-dynamic-batching-autotune).'
+            )
+            args.inference_cuda_graph_all_prefills = True
+        if args.inference_dynamic_batching_cuda_graph_mixed_prefill_count <= 0:
+            warn_rank_0(
+                'Setting --inference-dynamic-batching-cuda-graph-mixed-prefill-count=16 '
+                '(--inference-dynamic-batching-autotune requires a non-zero value).'
+            )
+            args.inference_dynamic_batching_cuda_graph_mixed_prefill_count = 16
+        if args.inference_dynamic_batching_cuda_graph_sizing_distribution != 'exponential':
+            warn_rank_0(
+                'Setting --inference-dynamic-batching-cuda-graph-sizing-distribution=exponential '
+                '(required by --inference-dynamic-batching-autotune).'
+            )
+            args.inference_dynamic_batching_cuda_graph_sizing_distribution = 'exponential'
+        if args.inference_dynamic_batching_unified_memory_level != 0:
+            warn_rank_0(
+                'Setting --inference-dynamic-batching-unified-memory-level=0 '
+                '(required by --inference-dynamic-batching-autotune).'
+            )
+            args.inference_dynamic_batching_unified_memory_level = 0
+
+        # The nvls dispatcher (only valid for --transformer-impl=inference_optimized)
+        # is required, but the dispatcher type itself has no CLI flag, so gate on
+        # the transformer implementation instead.
+        assert args.transformer_impl == 'inference_optimized', (
+            "--inference-dynamic-batching-autotune requires --transformer-impl=inference_optimized."
+        )
+
+        # Warn about arguments that will be overridden by the auto-tuner.
+        if args.inference_dynamic_batching_max_tokens is not None:
+            warn_rank_0(
+                '--inference-dynamic-batching-max-tokens is set but will be overridden '
+                'by --inference-dynamic-batching-autotune.'
+            )
+        if args.inference_dynamic_batching_mamba_memory_ratio is not None:
+            warn_rank_0(
+                '--inference-dynamic-batching-mamba-memory-ratio is set but will be overridden '
+                'by --inference-dynamic-batching-autotune.'
+            )
+        if args.inference_dynamic_batching_buffer_size_gb != 40.:
+            warn_rank_0(
+                '--inference-dynamic-batching-buffer-size-gb is set but will be overridden '
+                'by --inference-dynamic-batching-autotune.'
+            )
+        if args.inference_cuda_graph_max_tokens != 512:  # 512 == the argparse default
+            warn_rank_0(
+                '--inference-cuda-graph-max-tokens is set but will be ignored: '
+                '--inference-dynamic-batching-autotune enables '
+                '--inference-cuda-graph-all-prefills, which sizes prefill CUDA graphs '
+                'from the tuned max_tokens.'
+            )
+
     # MoE upcycling check
     if args.moe_use_upcycling:
         assert args.save is not None, "When using upcycling, the --save option must be specified."
@@ -2015,6 +2105,18 @@ def _add_inference_args(parser):
                        help='Percentage of memory buffer to allocate for Mamba states. '
                        'If not specified, allocates Mamba state tensors for each KV cache block. '
                        'Only used for hybrid models.')
+    group.add_argument('--inference-dynamic-batching-autotune',
+                       action='store_true', default=False,
+                       help='Automatically tune max_requests, max_tokens, buffer_size_gb, '
+                       'and mamba_memory_ratio, based on the expected average sequence length. '
+                       'Requires --inference-dynamic-batching-autotune-average-seq-len. '
+                       'If --inference-dynamic-batching-max-requests is manually provided, '
+                       'the solver will pin it to the user-specified value; useful for situations '
+                       'where the user wants a set request limit instead of maximizing throughput.')
+    group.add_argument('--inference-dynamic-batching-autotune-average-seq-len',
+                       type=int, default=None,
+                       help='Expected average runtime sequence length (prompt+generation tokens). '
+                       'Needed by the autotune solver.')
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '

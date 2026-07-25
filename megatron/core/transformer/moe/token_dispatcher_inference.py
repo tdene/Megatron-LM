@@ -378,6 +378,71 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._real_token_count_tensor = None
 
     @classmethod
+    def _buffer_specs(cls, per_rank_worst_case_token_count, topk, hidden_size, ep_size):
+        """(key, shape, dtype) of every symmetric buffer allocate_buffers reserves.
+
+        Single source for the allocation sizes, `required_buffer_bytes`, and
+        `release_buffers` — the three must never disagree on the buffer set.
+        """
+        global_max = per_rank_worst_case_token_count * ep_size
+        return (
+            ("ep_agv_h", (global_max, hidden_size), torch.bfloat16),
+            ("ep_agv_r", (global_max, topk), torch.int64),
+            ("ep_agv_p", (global_max, topk), torch.float32),
+            ("ep_rsv", (global_max, hidden_size), torch.float32),
+            # Small scratch buffer for fused metadata allgather (ep_size int32s).
+            ("ep_meta", (ep_size,), torch.int32),
+        )
+
+    @staticmethod
+    def _buffer_size_mb(shape, dtype) -> int:
+        """Whole-MiB size of one symmetric buffer for its exact tensor footprint.
+
+        Each buffer self-sizes from its tensor shape so non-default max_tokens /
+        hidden_size / ep_size combinations don't silently overflow the
+        symmetric-memory cap.
+        """
+        _MB = 1024 * 1024
+        nbytes = reduce(operator.mul, shape, 1) * torch.tensor([], dtype=dtype).element_size()
+        return max(1, (nbytes + _MB - 1) // _MB)
+
+    @classmethod
+    def required_buffer_bytes(
+        cls, per_rank_worst_case_token_count: int, topk: int, hidden_size: int, ep_size: int
+    ) -> int:
+        """Total bytes `allocate_buffers` reserves for the given dimensions.
+
+        Exact, including the per-buffer whole-MiB rounding. Used by the
+        inference-memory autotune solver to charge the dispatcher's staging
+        buffers as a function of the candidate ``max_tokens`` (they scale as
+        ``round_up_tokens(max_tokens) / tp * ep_size``), so keep this in sync
+        with `allocate_buffers` by construction — both read `_buffer_specs`.
+        """
+        return sum(
+            cls._buffer_size_mb(shape, dtype) * 1024 * 1024
+            for _, shape, dtype in cls._buffer_specs(
+                per_rank_worst_case_token_count, topk, hidden_size, ep_size
+            )
+        )
+
+    @classmethod
+    def release_buffers(cls) -> None:
+        """Free the symmetric staging buffers and clear every class reference.
+
+        The buffers are class-level singletons sized from the constructing
+        context's ``max_tokens``; a later context re-creates them via
+        `allocate_buffers` (the manager grows the allocation when needed).
+        Used by the autotune engine when it retires a context, so the
+        re-measured free memory excludes them and the solver charges the tuned
+        size instead. Destroy + re-rendezvous is collective: all EP ranks must
+        release and re-allocate in lockstep.
+        """
+        cls._delete_buffers()
+        # Shapes are irrelevant here; only the buffer keys are consumed.
+        for key, _, _ in cls._buffer_specs(0, 0, 0, 0):
+            SymmetricMemoryManager.destroy(key)
+
+    @classmethod
     def allocate_buffers(
         cls,
         per_rank_worst_case_token_count: int,
@@ -387,9 +452,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     ) -> None:
         """Allocate all symmetric buffers and initialize class-level metadata.
 
-        Called once at model init. Allocates fixed-size AGV and RSV symmetric
-        memory buffers so dispatch/combine can proceed without any allocation on
-        the hot path.
+        Called at model init (and again on autotune context rebuilds — the
+        manager grows each buffer when a larger size is requested). Allocates
+        fixed-size AGV and RSV symmetric memory buffers so dispatch/combine can
+        proceed without any allocation on the hot path.
 
         Args:
             per_rank_worst_case_token_count: Max tokens this rank can contribute,
@@ -400,63 +466,46 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """
         ep_size = get_pg_size(ep_group)
         cls._per_rank_worst_case_token_count = per_rank_worst_case_token_count
-        global_max = per_rank_worst_case_token_count * ep_size
         device = torch.cuda.current_device()
 
-        # Each buffer self-sizes from its exact tensor footprint so non-default
-        # max_tokens / hidden_size / ep_size combinations don't silently overflow
-        # the symmetric-memory cap.
-        _MB = 1024 * 1024
+        specs = cls._buffer_specs(per_rank_worst_case_token_count, topk, hidden_size, ep_size)
+        buffers = {
+            key: SymmetricMemoryManager.get_buffer(
+                key, process_group=ep_group, size_mb=cls._buffer_size_mb(shape, dtype)
+            ).maybe_get_tensor(shape, dtype=dtype)
+            for key, shape, dtype in specs
+        }
+        cls._symm_agv_hidden = buffers["ep_agv_h"]
+        cls._symm_agv_routing = buffers["ep_agv_r"]
+        cls._symm_agv_probs = buffers["ep_agv_p"]
+        cls._symm_rsv = buffers["ep_rsv"]
+        cls._symm_metadata = buffers["ep_meta"]
 
-        def _size_mb(shape, dtype) -> int:
-            nbytes = reduce(operator.mul, shape, 1) * torch.tensor([], dtype=dtype).element_size()
-            return max(1, (nbytes + _MB - 1) // _MB)
-
-        agv_h_shape = [global_max, hidden_size]
-        agv_r_shape = [global_max, topk]
-        agv_p_shape = [global_max, topk]
-        rsv_shape = [global_max, hidden_size]
-        meta_shape = [ep_size]
-
-        cls._symm_agv_hidden = SymmetricMemoryManager.get_buffer(
-            "ep_agv_h", process_group=ep_group, size_mb=_size_mb(agv_h_shape, torch.bfloat16)
-        ).maybe_get_tensor(agv_h_shape, dtype=torch.bfloat16)
-
-        cls._symm_agv_routing = SymmetricMemoryManager.get_buffer(
-            "ep_agv_r", process_group=ep_group, size_mb=_size_mb(agv_r_shape, torch.int64)
-        ).maybe_get_tensor(agv_r_shape, dtype=torch.int64)
-
-        cls._symm_agv_probs = SymmetricMemoryManager.get_buffer(
-            "ep_agv_p", process_group=ep_group, size_mb=_size_mb(agv_p_shape, torch.float32)
-        ).maybe_get_tensor(agv_p_shape, dtype=torch.float32)
-
-        cls._symm_rsv = SymmetricMemoryManager.get_buffer(
-            "ep_rsv", process_group=ep_group, size_mb=_size_mb(rsv_shape, torch.float32)
-        ).maybe_get_tensor(rsv_shape, dtype=torch.float32)
-
-        # Small scratch buffer for fused metadata allgather (WORLD_SIZE int32s).
-        cls._symm_metadata = SymmetricMemoryManager.get_buffer(
-            "ep_meta", process_group=ep_group, size_mb=_size_mb(meta_shape, torch.int32)
-        ).maybe_get_tensor(meta_shape, dtype=torch.int32)
-
-        failed = [
-            (name, SymmetricMemoryManager.get_buffer(name).init_failure_reason)
-            for name, buf in (
-                ("ep_agv_h", cls._symm_agv_hidden),
-                ("ep_agv_r", cls._symm_agv_routing),
-                ("ep_agv_p", cls._symm_agv_probs),
-                ("ep_rsv", cls._symm_rsv),
-                ("ep_meta", cls._symm_metadata),
-            )
-            if buf["handle"] is None
-        ]
+        failed = []
+        for key, shape, dtype in specs:
+            if buffers[key]["handle"] is not None:
+                continue
+            buf = SymmetricMemoryManager.get_buffer(key)
+            if buf.init_failure_reason is not None:
+                failed.append((key, buf.init_failure_reason))
+            else:
+                # The buffer initialized but cannot fit the request — a sizing
+                # bug (get_buffer grows on demand), not a platform limitation.
+                failed.append(
+                    (
+                        key,
+                        f"cached symmetric buffer ({buf.size_in_mb} MiB) too small for "
+                        f"shape {tuple(shape)} {dtype} and was not grown",
+                    )
+                )
         if failed:
-            details = "; ".join(f"{name}: {reason or 'unknown'}" for name, reason in failed)
+            details = "; ".join(f"{name}: {reason}" for name, reason in failed)
             raise RuntimeError(
-                f"NVLSAllGatherVDispatcher: symmetric memory init failed [{details}]. "
-                f"This dispatcher requires Hopper+ GPUs fully connected via NVLink, and torch built"
-                f"with torch.distributed._symmetric_memory plus triton installed. "
-                f"Use inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
+                f"NVLSAllGatherVDispatcher: symmetric buffer allocation failed [{details}]. "
+                f"If initialization failed, this dispatcher requires Hopper+ GPUs fully "
+                f"connected via NVLink, and torch built with "
+                f"torch.distributed._symmetric_memory plus triton installed; use "
+                f"inference_moe_token_dispatcher_type='nccl' on non-NVLS systems."
             )
 
         # Initialise step-metadata tensor and wire base class valid_tokens pointer.

@@ -1,10 +1,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import itertools
 import logging
 import math
 import operator
 import warnings
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -316,7 +318,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     DEFAULT_MAX_TOKENS = 16384
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
-    TMS_TAG = "inference_context"
+    # Thread-safe counter for unique per-context TMS tag suffixes.
+    _tms_counter = itertools.count(1)
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -326,7 +329,37 @@ class DynamicInferenceContext(BaseInferenceContext):
         ),
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
+        # Autotune bootstrap: substitute a tiny warmup context.
+        self.autotune_target_config: Optional[InferenceConfig] = None
+        if inference_config.autotune:
+            self.autotune_target_config = inference_config
+            tp_size = max(model_config.tensor_model_parallel_size, 1)
+            alignment = max(tp_size, self.REQUEST_ROUNDER)
+            inference_config = replace(
+                inference_config,
+                # The substituted config describes the bootstrap context
+                # itself, and the autotune request lives in
+                # autotune_target_config — so clear the flag: self.config must
+                # not claim this tiny context is the requested target, and
+                # rebuilding a context from it must reproduce this context
+                # rather than re-substitute.
+                autotune=False,
+                buffer_size_gb=0.5,
+                max_requests=max(alignment, (16 // alignment) * alignment),
+                max_tokens=None,
+                static_kv_memory_pointers=False,
+                mamba_memory_ratio=None,
+                paused_buffer_size_gb=None,
+                enable_prefix_caching=False,
+                prefix_caching_mamba_gb=None,
+                num_cuda_graphs=None,
+                kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+            )
         super().__init__(inference_config=inference_config)
+
+        # Unique TMS tag names per context instance to avoid conflicts.
+        suffix = next(DynamicInferenceContext._tms_counter)
+        self.TMS_TAG = f"inference_context_{suffix}"
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -524,6 +557,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 intermediate_memory_per_request *= self.num_mamba_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
                 mamba_states_memory_per_request += intermediate_memory_per_request
+        self.mamba_states_memory_per_request = mamba_states_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level

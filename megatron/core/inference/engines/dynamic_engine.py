@@ -304,11 +304,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Initialize engine.
         self.reset()
 
-        # Set callback for getting stop word finished request IDs
-        self.controller.set_stop_word_finished_ids_callback(
-            self._get_and_clear_stop_word_finished_ids
-        )
-
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logging.info(
@@ -337,8 +332,28 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
+        # Hook for subclasses that rebuild the context before graph capture
+        # (e.g. AutotuneDynamicInferenceEngine profiles and re-sizes it here).
+        self._before_cuda_graph_capture()
+
+        # Set callback for getting stop word finished request IDs
+        self.controller.set_stop_word_finished_ids_callback(
+            self._get_and_clear_stop_word_finished_ids
+        )
+
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+        # Log memory state after full initialization.
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            free, total = torch.cuda.mem_get_info()
+            logging.info(
+                "Engine init complete: GPU memory: total %.1f GB, "
+                "used %.1f GB, free %.1f GB",
+                total / (1024 ** 3),
+                (total - free) / (1024 ** 3),
+                free / (1024 ** 3),
+            )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -577,6 +592,13 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+
+    def _before_cuda_graph_capture(self) -> None:
+        """Hook between engine-state init and CUDA-graph capture."""
+        assert self.context.autotune_target_config is None, (
+            "Engine auto-tuning was enabled; please construct the engine as "
+            "`AutotuneDynamicInferenceEngine` instead of `DynamicInferenceEngine`."
+        )
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
