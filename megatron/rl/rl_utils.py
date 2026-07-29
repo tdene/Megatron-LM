@@ -3,7 +3,6 @@
 import asyncio
 import copy
 import gc
-import hashlib
 
 # Keep this to make the env registered.
 import itertools
@@ -11,7 +10,7 @@ import json
 import logging
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
@@ -91,7 +90,7 @@ from megatron.rl.inflight_tracker import (
 )
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
-from megatron.rl.rollout_bank import RolloutBank
+from megatron.rl.rollout_bank import RolloutBank, rollout_request_keys
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -337,6 +336,10 @@ class RLRuntimeState:
         self.last_collection_iteration = 0
         # Persistent ledger of per-request metadata (e.g. staleness stats).
         self.request_ledger = {}
+        # Durable rollout bank runtime state: groups restored from disk awaiting
+        # injection into a collection, and the once-per-process restore latch.
+        self.restored_groups = deque()
+        self.bank_restored = False
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
@@ -717,6 +720,9 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
             agent=get_agent(args),
             request=request,
             parallel_generation_tasks=args.rl_generation_lag + 1,
+            # None (all durable-bank calls skipped) unless --rl-durable-rollout-bank
+            # is set, and then only on rank 0, the single writer.
+            durable_bank=maybe_get_rollout_bank(args),
         )
         _ROLLOUT_GENERATOR = _ROLLOUT_PIPELINE.run()
     return _ROLLOUT_GENERATOR
@@ -848,8 +854,47 @@ def colocated_inference(
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
+            # Durable rollout bank: point appends at this collection and, once per
+            # process, restore the completed groups banked before a restart. This
+            # collection injects a share of them and reduces its fresh pulls so the
+            # trainer still sees exactly n_prompts groups. (Rank-0 only: the bank
+            # is None everywhere else, and on every rank when the feature is off.)
+            runtime_state = get_rl_runtime_state()
+            bank = maybe_get_rollout_bank(args)
+            inject = []
+            if bank is not None:
+                bank.set_collection(args.curr_iteration)
+                if not runtime_state.bank_restored:
+                    runtime_state.restored_groups = deque(bank.restore(args.iteration))
+                    runtime_state.bank_restored = True
+                    if runtime_state.restored_groups:
+                        log_single_rank(
+                            logger,
+                            logging.INFO,
+                            f"RolloutBank restored {len(runtime_state.restored_groups)} completed "
+                            f"groups from disk at resume iteration {args.iteration}",
+                        )
+                if args.rl_partial_rollouts:
+                    # The streaming pipeline buffers across iterations, so a
+                    # partially injected collection just leaves the balance of its
+                    # batch buffered for the next one.
+                    take = min(len(runtime_state.restored_groups), n_prompts)
+                else:
+                    # The non-streaming pipeline is a persistent singleton that
+                    # generates and consumes whole trainer batches (enforced by
+                    # assert_no_inflight_rollouts); a partial injection would leave
+                    # its current batch partially consumed at the iteration
+                    # boundary forever after. Inject in full batches only; a
+                    # smaller remainder stays banked (and queued in
+                    # restored_groups) rather than being trained.
+                    take = n_prompts if len(runtime_state.restored_groups) >= n_prompts else 0
+                inject = [runtime_state.restored_groups.popleft() for _ in range(take)]
+            n_fresh = n_prompts - len(inject)
+
             with nvtx_range("rl/inference-setup", time=True):
-                # Asyncronously run inference and rollout collection
+                # Asyncronously run inference and rollout collection. The pipeline
+                # is a persistent singleton sized to the trainer batch (n_prompts);
+                # only this collection's fresh pulls are reduced by injection.
                 rollout_generator = get_rollout_generator(
                     args, inference_interface, n_prompts, samples_per_group
                 )
@@ -863,16 +908,25 @@ def colocated_inference(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    rollouts = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
+                    fresh = [
+                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_fresh)
                     ]
                     # These groups are now consumed into the training batch: they
                     # leave the in-flight set (decrement here, where consumption is final,
                     # so buffered groups awaiting their batch peers stay counted).
-                    for group in rollouts:
+                    # Injected groups were never in this process's in-flight set.
+                    for group in fresh:
                         remove_inflight(len(group))
                     if not args.rl_partial_rollouts:
                         assert_no_inflight_rollouts(_ROLLOUT_PIPELINE)
+                    # Restored groups first, then freshly generated ones.
+                    rollouts = list(inject) + fresh
+                    # Record consumption for every group handed to the trainer. On a
+                    # rollback (restart at T < this step) the marker > T rule restores
+                    # these; once the checkpoint advances past this step they are pruned.
+                    if bank is not None:
+                        for group in rollouts:
+                            bank.mark_consumed(group.uid, args.curr_iteration)
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
@@ -929,6 +983,11 @@ def get_environment_rollouts(
         # the in-flight set exactly like freshly-collected ones.
         for group in rollouts:
             remove_inflight(len(group))
+        # Durable rollout bank: record consumption exactly like the colocated path.
+        bank = get_rollout_bank()
+        if bank is not None:
+            for group in rollouts:
+                bank.mark_consumed(group.uid, args.curr_iteration)
         # No engine drain on the banked path: these groups' records were drained
         # (and merged into the persistent ledger) by the collection that generated them.
         request_ledger = {}
@@ -947,6 +1006,12 @@ def get_environment_rollouts(
         # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
         torch.distributed.broadcast_object_list(rollouts, src=0)
     logger.debug(f"Got rollouts on rank {rank}")
+
+    # Bank-restored groups carry their persisted finished-request records; the
+    # broadcast above just shipped them to every rank. Merge them into this
+    # collection's drained ledger (identical on all ranks) so compute_group_stats
+    # can join them exactly like live records, and strip the carrier attribute.
+    _merge_restored_request_records(rollouts, request_ledger)
 
     if lang_rl_log_dir:
         inference_pg_collection = get_attr_wrapped_model(
@@ -1466,25 +1531,11 @@ def _pop_request_records(
     """Pop one turn from the per-request metadata ledger."""
     if not isinstance(rollout, TokenRollout):
         return []
-    assert len(rollout.trajectory) == len(rollout.generation_mask), (
-        f"request-ledger join: {len(rollout.trajectory)} trajectory turns but "
-        f"{len(rollout.generation_mask)} generation_mask rows; every turn needs its "
-        "mask row to recover the (prompt, generated) key."
-    )
     records = []
-    for tokens, mask in zip(rollout.trajectory, rollout.generation_mask):
-        if torch.is_tensor(tokens):
-            tokens = tokens.cpu()
-        prompt_length = next((i for i, generated in enumerate(mask) if generated), len(mask))
-        assert all(mask[prompt_length:]), (
-            "request-ledger join: generation_mask must be a False-prefix (prompt) then a "
-            "True-suffix (generation); an interleaved mask cannot recover the streams the "
-            "engine keyed this record by."
-        )
-        key = (
-            hashlib.sha256(np.asarray(tokens[:prompt_length], dtype=np.int64).tobytes()).digest(),
-            hashlib.sha256(np.asarray(tokens[prompt_length:], dtype=np.int64).tobytes()).digest(),
-        )
+    # Per-turn (prompt, generated) content keys; the key math is shared with the
+    # durable rollout bank (rollout_request_keys) so banked copies of these
+    # records always rejoin under the exact keys popped here.
+    for key in rollout_request_keys(rollout):
         bucket = request_ledger.get(key)
         assert bucket, (
             "request-ledger join: a rollout turn matched no finished-request record. Its "
@@ -1493,6 +1544,46 @@ def _pop_request_records(
         )
         records.append(bucket.pop(0))
     return records
+
+
+def _merge_restored_request_records(
+    rollouts: GroupedRollouts,
+    request_ledger: dict[tuple[bytes, bytes], list[FinishedRequestRecord]],
+) -> None:
+    """Re-merge bank-restored groups' finished-request records into the ledger.
+
+    Groups restored by the durable rollout bank carry their persisted records as
+    a ``request_records`` extra attribute (per member, per turn), attached by
+    ``RolloutBank.restore`` and shipped to every rank by the rollout broadcast.
+    Merge them into this collection's drained ledger — keyed exactly as
+    ``_pop_request_records`` will pop them at consumption — and strip the carrier
+    attribute. Groups without the attribute (everything but freshly injected
+    restored groups) are untouched.
+    """
+    for group in rollouts:
+        member_records_list = getattr(group, "request_records", None)
+        if member_records_list is None:
+            continue
+        for rollout, member_records in zip(group.rollouts, member_records_list):
+            if not member_records:
+                continue
+            for key, record in zip(rollout_request_keys(rollout), member_records):
+                request_ledger.setdefault(key, []).append(
+                    FinishedRequestRecord(
+                        policy_epoch=(
+                            None
+                            if record["policy_epoch"] is None
+                            else [tuple(b) for b in record["policy_epoch"]]
+                        ),
+                        kv_cache_epoch=(
+                            None
+                            if record["kv_cache_epoch"] is None
+                            else [tuple(b) for b in record["kv_cache_epoch"]]
+                        ),
+                        num_evictions=record["num_evictions"],
+                    )
+                )
+        del group.request_records
 
 
 def compute_group_stats(
@@ -2767,6 +2858,15 @@ def get_grpo_data_iterator(
         runtime_state.request_ledger = _merge_request_ledger(
             runtime_state.request_ledger, fresh_ledger, get_args().rl_partial_rollouts
         )
+        # Durable rollout bank: the drain merged above is the first moment the
+        # finished-request records of the groups banked since the last drain exist
+        # trainer-side, and prepare_data_for_update below is where consumption
+        # starts popping records. Persist the banked groups' records in between —
+        # copied, never popped, so the live flow still pops each record exactly
+        # once at consumption.
+        bank = get_rollout_bank()
+        if bank is not None:
+            bank.attach_pending_request_records(runtime_state.request_ledger)
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,

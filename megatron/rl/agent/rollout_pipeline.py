@@ -22,6 +22,7 @@ from ..rollout_granularity import (
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
 
 if TYPE_CHECKING:
+    from ..rollout_bank import RolloutBank
     from .api import GroupedRolloutGenerator
 
 
@@ -228,6 +229,7 @@ class RolloutPipeline:
         agent: "GroupedRolloutGenerator",
         request: GroupedRolloutRequest,
         parallel_generation_tasks: float,
+        durable_bank: "RolloutBank | None" = None,
     ) -> None:
         """Validate the request and size the gate, queues, and worker pool.
 
@@ -238,12 +240,18 @@ class RolloutPipeline:
                 batches; units_per_batch scales it to submission units. May be
                 fractional (e.g. an autotuned lag): the slot count is rounded
                 and clamped to at least one unit.
+            durable_bank: Optional durable rollout bank; groups delivered by
+                stage_filter are written through to it. Injected (never read
+                from a global) so the pipeline stays testable; when None (the
+                default), all durable-bank calls are skipped. Distinct from
+                ``self.bank``, the in-memory queue of complete batches.
         """
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
         self.agent = agent
         self.request = request
+        self.durable_bank = durable_bank
         self.gran_policy = _GranularityConfig.from_request(
             request, agent.rollout_group_layout(request.num_groups)
         )
@@ -505,6 +513,12 @@ class RolloutPipeline:
                         self._groups_in_flight -= 1
                         self._maybe_close_intake()
                     continue
+                if self.durable_bank is not None:
+                    # Write the delivered group through to the durable bank the
+                    # instant it clears the filter (dropped groups are never
+                    # banked). Its finished-request records follow at the next
+                    # engine drain (attach_pending_request_records).
+                    group.uid = self.durable_bank.append(group)
                 self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
                     time.monotonic()
                 )
