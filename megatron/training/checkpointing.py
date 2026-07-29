@@ -82,6 +82,23 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 # Track deletion processes to prevent zombies
 _deletion_processes = []
 
+
+def _maybe_compact_rollout_bank(iteration):
+    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
+    from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+    maybe_compact_rollout_bank(iteration)
+
+
+def _register_rollout_bank_compaction(async_save_request, iteration):
+    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
+
+    def rollout_bank_finalize_fn(iteration=iteration):
+        _maybe_compact_rollout_bank(iteration)
+
+    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
+
+
 def finalize_deletion_processes(blocking=False):
     """Clean up deletion processes to prevent zombie processes.
 
@@ -915,6 +932,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             wandb_finalize_fn()
 
+    # Durable rollout bank (rank 0 owns the single-writer bank): compact once this
+    # checkpoint is durable, so the bank's compacted-through T tracks it.
+    if (
+        args.async_save
+        and getattr(args, "rl_durable_rollout_bank", False)
+        and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+    ):
+        assert async_save_request is not None
+        _register_rollout_bank_compaction(async_save_request, iteration)
+
     if args.async_save:
         # Schedule logits flush AFTER the checkpoint request so the persistent
         # worker processes checkpoint preload first (unblocking the main
@@ -947,6 +974,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         # before returning from this function.
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # Durable rollout bank: compact at the checkpoint boundary so the bank's
+        # compacted-through T tracks this (now durable) checkpoint. Only on sync
+        # saves; async saves compact in their durability finalize callback above.
+        # Rank-0 no-op otherwise.
+        if getattr(args, "rl_durable_rollout_bank", False):
+            _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 

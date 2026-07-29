@@ -1,0 +1,53 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+from pydantic import BaseModel
+
+
+class AgentBaseModel(BaseModel, extra='allow'):
+    """Base model for agent data types."""
+
+
+class Rollout(AgentBaseModel):
+    """Data for language-based Rollout."""
+
+    trajectory: list[str]
+    prompt_length: list[int] | None = None
+    reward: float | None = None
+    env_id: str = ''
+    problem_id: str | None = None
+
+
+class TokenRollout(AgentBaseModel):
+    """Tokenized representation of a language-based Rollout."""
+
+    trajectory: list[list[int]]
+    reward: list[float] | float
+    generation_mask: list[list[bool]] | None = None
+    logprobs: list[list[float]] | None = None
+    env_id: str = ''
+    problem_id: str | None = None
+
+
+Rollouts = list[TokenRollout | Rollout]
+
+
+class RolloutGroup(AgentBaseModel):
+    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
+
+    rollouts: Rollouts
+    batch_id: int = 0
+    index_in_batch: int = 0
+    # Stable identity in the durable rollout bank; None until (unless) banked.
+    uid: str | None = None
+
+    def __iter__(self):
+        return iter(self.rollouts)
+
+    def __len__(self):
+        return len(self.rollouts)
+
+    def __getitem__(self, idx):
+        return self.rollouts[idx]
+
+
+GroupedRollouts = list[RolloutGroup]

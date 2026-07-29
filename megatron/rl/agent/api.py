@@ -3,8 +3,6 @@
 from abc import ABC, abstractmethod
 from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
-from pydantic import BaseModel
-
 from ..__init__ import Request, TypeLookupable
 from ..inference import (
     InferenceInterface,
@@ -13,12 +11,11 @@ from ..inference import (
     LLMChatMessage,
 )
 from ..rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+from ..types import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout
 
 
-class AgentBaseModel(BaseModel, extra='allow'):
-    pass
-
-
+# TODO: Move these models to ``megatron.rl.types`` after moving ``Request``,
+# ``InferenceInterface``, and their dependencies there to avoid circular imports.
 class RolloutRequest(Request):
     """Request to agent to generate Rollouts."""
 
@@ -37,50 +34,6 @@ class GroupedRolloutRequest(Request):
     filter_groups_with_same_reward: bool = False
     submission_granularity: SubmissionGranularity = "B"
     consumption_granularity: ConsumptionGranularity = "B"
-
-
-class Rollout(AgentBaseModel):
-    """Data for language-based Rollout."""
-
-    trajectory: list[str]
-    prompt_length: list[int] | None = None
-    reward: float = None
-    env_id: str = ''
-    problem_id: str | None = None
-
-
-class TokenRollout(AgentBaseModel):
-    """Tokenized representation of a language-based Rollout."""
-
-    trajectory: list[list[int]]
-    reward: list[float] | float
-    generation_mask: list[list[bool]] | None = None
-    logprobs: list[list[float]] | None = None
-    env_id: str = ''
-    problem_id: str | None = None
-
-
-Rollouts = list[TokenRollout | Rollout]
-
-
-class RolloutGroup(AgentBaseModel):
-    """A group of rollouts (e.g. multiple completions for one prompt) with batch metadata."""
-
-    rollouts: Rollouts
-    batch_id: int = 0
-    index_in_batch: int = 0
-
-    def __iter__(self):
-        return iter(self.rollouts)
-
-    def __len__(self):
-        return len(self.rollouts)
-
-    def __getitem__(self, idx):
-        return self.rollouts[idx]
-
-
-GroupedRollouts = list[RolloutGroup]
 
 
 class EpisodeResult(NamedTuple):

@@ -91,6 +91,7 @@ from megatron.rl.inflight_tracker import (
 )
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_bank import RolloutBank
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -633,6 +634,49 @@ def get_inference_interface(args, loop, model):
 
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_PIPELINE = None
+_ROLLOUT_BANK = None
+
+
+def maybe_get_rollout_bank(args):
+    """Return the durable rollout bank singleton, creating it on first use.
+
+    Rank-0 only (only rank 0 runs the rollout pipeline, so the bank is a single
+    writer with no distributed coordination). Returns None when the feature is
+    disabled or on non-zero ranks.
+    """
+    global _ROLLOUT_BANK
+    if not getattr(args, "rl_durable_rollout_bank", False):
+        logger.debug("Durable rollout bank is disabled; proceeding without it.")
+        return None
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        logger.warning(
+            "Durable rollout bank cannot be activated on non-zero ranks; proceeding without it."
+        )
+        return None
+    if _ROLLOUT_BANK is None:
+        bank_dir = args.rl_rollout_bank_dir or os.path.join(args.save or ".", "rollout_bank")
+        _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=args.rl_rollout_bank_max_bytes)
+        log_single_rank(
+            logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}"
+        )
+    return _ROLLOUT_BANK
+
+
+def get_rollout_bank():
+    """Return the rollout bank singleton, or None if disabled / not yet created."""
+    return _ROLLOUT_BANK
+
+
+def maybe_compact_rollout_bank(iteration):
+    """Compact the bank at a durable-checkpoint boundary (rank-0 no-op otherwise).
+
+    Called from save_checkpoint so the bank's compacted-through T tracks the model
+    checkpoint: groups consumed at marker <= iteration are reclaimed, survivors
+    carry forward.
+    """
+    bank = get_rollout_bank()
+    if bank is not None:
+        bank.checkpoint(iteration)
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
