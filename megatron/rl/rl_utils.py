@@ -34,6 +34,10 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.inference.inference_step_trace import (
+    get_inference_step_tracer,
+    init_inference_step_tracer,
+)
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -80,6 +84,11 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
+from megatron.rl.inflight_tracker import (
+    inflight_snapshot,
+    remove_inflight,
+    reset_inflight,
+)
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.sequence_packing_utils import (
@@ -640,6 +649,10 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
     """
     global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
     if _ROLLOUT_GENERATOR is None:
+        # Fresh pipeline: clear the in-flight counter. The pipeline persists
+        # across iterations (and so does its in-flight count), so this only
+        # fires on creation.
+        reset_inflight()
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             rollouts_per_group=samples_per_group,
@@ -809,6 +822,11 @@ def colocated_inference(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # These groups are now consumed into the training batch: they
+                    # leave the in-flight set (decrement here, where consumption is final,
+                    # so buffered groups awaiting their batch peers stay counted).
+                    for group in rollouts:
+                        remove_inflight(len(group))
                     if not args.rl_partial_rollouts:
                         assert_no_inflight_rollouts(_ROLLOUT_PIPELINE)
                 else:
@@ -863,6 +881,10 @@ def get_environment_rollouts(
         rollouts = [
             loop.run_until_complete(anext(_ROLLOUT_GENERATOR)) for _ in range(n_prompts)
         ]
+        # Banked groups are consumed into the training batch here: they leave
+        # the in-flight set exactly like freshly-collected ones.
+        for group in rollouts:
+            remove_inflight(len(group))
         # No engine drain on the banked path: these groups' records were drained
         # (and merged into the persistent ledger) by the collection that generated them.
         request_ledger = {}
@@ -1249,7 +1271,7 @@ def rollout_epoch_summary(
 
 
 def get_rl_logging_dir(args) -> str:
-    """Base directory for RL logging artifacts (staleness dumps, plots).
+    """Base directory for RL logging artifacts (staleness dumps, inference traces, plots).
 
     Uses --rl-logging-dir when set, else $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.
     """
@@ -1259,6 +1281,30 @@ def get_rl_logging_dir(args) -> str:
     if env_dir:
         return os.path.join(env_dir, "rl_logging")
     return os.path.join(".", "rl_logging")
+
+
+def _maybe_init_inference_step_tracer(args) -> None:
+    """Initialize the per-step inference batch tracer (opt-in), once per process.
+
+    Each rank's engine writes its own trace file. The rank-0 in-flight rollout
+    sampler is registered so the total in-flight count is captured on the same
+    inference-step axis as the engine batch sizes.
+    """
+    if not args.rl_log_inference_batch_trace:
+        return
+    if get_inference_step_tracer() is not None:
+        return
+    is_dist = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if is_dist else 0
+    tracer = init_inference_step_tracer(
+        output_dir=str(Path(get_rl_logging_dir(args)) / "inference"),
+        rank=rank,
+        dp_rank=mpu.get_data_parallel_rank(),
+        stride=args.rl_inference_batch_trace_stride,
+        run_id=os.environ.get("LANGRL_RUN_ID"),
+    )
+    if rank == 0:
+        tracer.register_callback(inflight_snapshot)
 
 
 def _turn_prompt_length(rollout, turn_idx: int) -> Optional[int]:
@@ -2967,6 +3013,7 @@ def megatron_rl_inference_mode(
 
         inference_interface = get_inference_interface(args, loop, model)
         inference_interface.set_generation_epoch(get_args().curr_iteration)
+        _maybe_init_inference_step_tracer(args)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -2974,6 +3021,9 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
+            _tracer = get_inference_step_tracer()
+            if _tracer is not None:
+                _tracer.flush()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')

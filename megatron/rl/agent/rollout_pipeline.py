@@ -13,6 +13,7 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
+from ..inflight_tracker import add_inflight, remove_inflight
 from ..rollout_granularity import (
     GRANULARITY_RANK,
     ConsumptionGranularity,
@@ -333,6 +334,9 @@ class RolloutPipeline:
             self.request, env_index=env_index
         )
         self.prepared_groups_per_env[env_index] += 1
+        # Mark this group's rollouts in flight for the duration of generation
+        # (regenerated replacements re-enter flight exactly like fresh groups).
+        add_inflight(self.request.rollouts_per_group)
 
         for rollout_idx in range(self.request.rollouts_per_group):
             await self.gate.acquire_for("R")
@@ -477,6 +481,8 @@ class RolloutPipeline:
                 group = assembled.group
                 if self._should_drop(group):
                     self.filtered_count += 1
+                    # Balance add_inflight: a dropped group is never consumed.
+                    remove_inflight(self.request.rollouts_per_group)
                     # G/E/B gate slots free on consumption, which a dropped group
                     # never reaches: like its in-flight count, its slot carries
                     # over to the replacement (no release here, no fresh coarse
