@@ -16,6 +16,7 @@ AGENT_REGISTRY: dict[str, str] = {
     "GSM8KAgent": "examples.rl.environments.math.gsm8k_agent:GSM8KAgent",
     "AIMEAgent": "examples.rl.environments.math.aime_agent:AIMEAgent",
     "NemoGymAgent": "nemogym2mrl.nemo_gym_agent:NemoGymAgent",
+    "BlendDispatchAgent": "nemogym2mrl.blend_dispatch:BlendDispatchAgent",
     "AceMathAgent": "environments.acemath_agent:AceMathAgent",
 }
 
