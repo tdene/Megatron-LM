@@ -312,7 +312,7 @@ class TestRLUtils:
                 yield group
 
         rollout_generator = gen()
-        colocated = MagicMock(return_value=list(fake_groups))
+        colocated = MagicMock(return_value=(list(fake_groups), {}))
         pipeline = (
             None
             if ready_batches is None
@@ -337,7 +337,7 @@ class TestRLUtils:
             ):
                 skip = rl_utils.can_skip_inference(partial_rollouts)
                 assert skip == expected_skip
-                rollouts = rl_utils.get_environment_rollouts(
+                rollouts, fresh_ledger = rl_utils.get_environment_rollouts(
                     [MagicMock()],
                     inference_model=None,
                     optimizer=MagicMock(),
@@ -346,6 +346,9 @@ class TestRLUtils:
                     run_inference=not skip,
                 )
             assert rollouts == fake_groups
+            # The banked path drains no engine ledger.
+            if skip:
+                assert fresh_ledger == {}
             assert colocated.called != expected_skip
         finally:
             loop.run_until_complete(rollout_generator.aclose())
@@ -906,6 +909,11 @@ class TestRLUtils:
 
         if scenario == "single_turn_only":
             group = [single([1, 2, 3, eod], 1.0), single([1, 2, eod], 0.0)]
+            # All-False masks: the whole turn keys as prompt with an empty generation.
+            ledger = {
+                _token_stream_key([1, 2, 3, eod], []): [_ledger_record(0)],
+                _token_stream_key([1, 2, eod], []): [_ledger_record(0)],
+            }
         else:
             # Cumulative per-turn lengths 4 then 7 -> turn 1 adds 3 tokens; trajectory length is
             # the full conversation (7), not 4 + 7 = 11.
@@ -916,8 +924,13 @@ class TestRLUtils:
                 problem_id="m",
             )
             group = [multi, single([1, 2, 3, eod], 0.0)]
+            ledger = {
+                _token_stream_key([1, 2], [3, eod]): [_ledger_record(0)],
+                _token_stream_key([1, 2, 3, eod, 9], [8, eod]): [_ledger_record(0)],
+                _token_stream_key([1, 2, 3, eod], []): [_ledger_record(0)],
+            }
 
-        stats = rl_utils.compute_group_stats([group], tokenizer, seq_len=8)
+        stats = rl_utils.compute_group_stats([group], tokenizer, seq_len=8, request_ledger=ledger)
         assert stats.turn_lens == expected_turn_lens
         assert stats.traj_lens == expected_traj_lens
         assert stats.num_turns == expected_num_turns
@@ -1594,6 +1607,7 @@ class TestRLUtils:
         twin_a = token_rollout([[8, 9, eod]], [[False, True, True]])
         twin_b = twin_a.model_copy(deep=True)
         other = token_rollout([[4, 4, eod]], [[False, True, True]])
+        extra = token_rollout([[5, 5, eod]], [[False, True, True]])
         # Text rollouts carry no token ids: they join nothing and need no records.
         text = Rollout(trajectory=["hello"], reward=1.0, env_id='MEGAENV')
 
@@ -1603,27 +1617,29 @@ class TestRLUtils:
             key([1, 2, 3, eod, 4], [5, eod]): [_ledger_record(8)],
             key([8], [9, eod]): [_ledger_record(5), _ledger_record(6)],
             key([4], [4, eod]): [_ledger_record(9)],
+            key([5], [5, eod]): [_ledger_record(4)],
         }
         rollouts = [
-            RolloutGroup(rollouts=[multi_turn, twin_a]),
-            RolloutGroup(rollouts=[twin_b, other, text]),
+            RolloutGroup(rollouts=[multi_turn, twin_a, text]),
+            RolloutGroup(rollouts=[twin_b, other, extra]),
         ]
         stats = rl_utils.compute_group_stats(rollouts, MockTokenizer(), 8, ledger)
 
-        assert stats.policy_first_epoch == [[7, 5], [6, 9, None]]
-        assert stats.policy_last_epoch == [[8, 5], [6, 9, None]]
+        assert stats.policy_first_epoch == [[7, 5, None], [6, 9, 4]]
+        assert stats.policy_last_epoch == [[8, 5, None], [6, 9, 4]]
         # multi_turn's avg is token-weighted over its 4- and 3-token turns.
         assert np.isclose(stats.policy_avg_epoch[0][0], (7 * 4 + 8 * 3) / 7)
         assert stats.policy_avg_epoch[0][1] == 5
-        assert stats.policy_avg_epoch[1] == [6, 9, None]
-        assert stats.kv_first_epoch == [[7, 5], [6, 9, None]]
-        assert stats.kv_last_epoch == [[8, 5], [6, 9, None]]
-        assert stats.completed_epochs == [[7, 8, 5], [6, 9]]
-        assert stats.num_evictions == [[1, 0], [0, 0, 0]]
+        assert stats.policy_avg_epoch[0][2] is None
+        assert stats.policy_avg_epoch[1] == [6, 9, 4]
+        assert stats.kv_first_epoch == [[7, 5, None], [6, 9, 4]]
+        assert stats.kv_last_epoch == [[8, 5, None], [6, 9, 4]]
+        assert stats.completed_epochs == [[7, 8, 5], [6, 9, 4]]
+        assert stats.num_evictions == [[1, 0, 0], [0, 0, 0]]
         # Raw boundaries + per-turn evictions ride along for the offline dump.
         assert stats.policy_epoch_boundaries[0][0] == [[(0, 7)], [(0, 8)]]
-        assert stats.policy_epoch_boundaries[1][2] is None
-        assert stats.per_turn_evictions == [[[1, 0], [0]], [[0], [0], None]]
+        assert stats.policy_epoch_boundaries[0][2] is None
+        assert stats.per_turn_evictions == [[[1, 0], [0], None], [[0], [0], [0]]]
         assert all(not bucket for bucket in ledger.values())  # all records consumed
 
         # Bad inputs are hard errors with distinct messages: a well-formed turn
@@ -1631,9 +1647,9 @@ class TestRLUtils:
         # trajectory/mask row-count mismatch, and an interleaved mask that cannot
         # recover the engine's key.
         for turns, masks, match in (
-            ([[6, 6, 7]], [[False, True, True]], "no finished-request record"),
+            ([[6, 6, eod]], [[False, True, True]], "no finished-request record"),
             ([[1, 2, 3], [1, 2, 3, 4, 5]], [[False, True, True]], "mask rows"),
-            ([[1, 2, 3, 4]], [[False, True, False, True]], "False-prefix"),
+            ([[1, 2, 3, eod]], [[False, True, False, True]], "False-prefix"),
         ):
             with pytest.raises(AssertionError, match=match):
                 rl_utils.compute_group_stats(
