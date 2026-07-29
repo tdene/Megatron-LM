@@ -411,118 +411,89 @@ class TestRLUtils:
         else:
             assert logprobs.shape == (BATCH, SEQ, VOCAB)
 
-    def test_grpo_loss_calculation_all_pi_eq(self):
-        # All policies are equal: clamping is inactive, ratios are ones.
-        current_logprobs = torch.ones(BATCH, SEQ)
-        old_logprobs = torch.ones(BATCH, SEQ)
-        ref_logprobs = torch.ones(BATCH, SEQ)
-        advantages = torch.zeros(BATCH)
-        loss, kl_term, ratios, entropy_term, _, _ = rl_utils.calculate_grpo_loss(
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            clamp_eps_lower=0.1,
-            clamp_eps_upper=0.1,
-            kl_beta=0.1,
-            entropy_weight=0.0,
-        )
-        torch.testing.assert_close(loss, torch.zeros_like(loss))
-        torch.testing.assert_close(kl_term, torch.zeros_like(kl_term))
-        torch.testing.assert_close(ratios, torch.ones_like(ratios))
-        torch.testing.assert_close(entropy_term, -torch.ones_like(ratios) * torch.e)
-
-    def test_grpo_loss_calculation_2x_ratios(self):
-        # All policies are equal: clamping is inactive, ratios are ones.
-        current_logprobs = torch.ones(BATCH, SEQ)
-        old_logprobs = torch.ones(BATCH, SEQ) - torch.log(torch.tensor([2.0]))
-        ref_logprobs = torch.ones(BATCH, SEQ)
-        advantages = torch.ones(BATCH)
-        loss, kl_term, ratios, _, _, _ = rl_utils.calculate_grpo_loss(
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            clamp_eps_lower=2.1,
-            clamp_eps_upper=2.1,
-            kl_beta=0.0,
-            entropy_weight=0.0,
-        )
-        # Clamping does not affect us, as 2.1 [eps] > 2 [ratio].
-        # kl_beta = 0 -> we only have the non-kl term of the loss active.
-        torch.testing.assert_close(loss, -torch.ones_like(loss) * 2)
-        # pi and pi_{ref} are the same here.
-        torch.testing.assert_close(kl_term, torch.zeros_like(kl_term))
-        # Current probs are 2x more probable than old pi.
-        torch.testing.assert_close(ratios, torch.ones_like(ratios) * 2)
-
-    def test_entropy_calculation(self):
-        # All policies are equal: clamping is inactive, ratios are ones.
-        current_logprobs = torch.ones(BATCH, SEQ)
-        old_logprobs = torch.ones(BATCH, SEQ)
-        ref_logprobs = torch.ones(BATCH, SEQ)
-        advantages = torch.zeros(BATCH)
-        loss, _, ratios, entropy_term, _, _ = rl_utils.calculate_grpo_loss(
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=ref_logprobs,
-            advantages=advantages,
-            clamp_eps_lower=0.1,
-            clamp_eps_upper=0.1,
-            kl_beta=0.0,
-            entropy_weight=1.0,
-        )
-        torch.testing.assert_close(loss, torch.ones_like(ratios) * torch.e)
-        torch.testing.assert_close(entropy_term, -torch.ones_like(ratios) * torch.e)
-
-    def test_grpo_loss_truncation(self):
-        # All ratios are 2
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
+    @pytest.mark.parametrize(
+        "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
+        [
+            # All policies equal: clamping inactive, unit ratios, zero loss and kl.
+            pytest.param(
+                1.0,
+                0.0,
+                0.1,
+                0.1,
+                0.0,
+                dict(loss=0.0, kl_term=0.0, ratios=1.0, entropy_term=-torch.e),
+                id="all_pi_eq",
+            ),
+            # Current probs 2x old; eps 2.1 > ratio keeps clamping inactive; kl_beta 0 leaves
+            # only the policy term, and pi == pi_ref keeps the kl term zero anyway.
+            pytest.param(
+                2.0, 1.0, 2.1, 0.0, 0.0, dict(loss=-2.0, kl_term=0.0, ratios=2.0), id="2x_ratios"
+            ),
+            # kl_beta 0, entropy_weight 1: the loss is exactly the negated entropy term.
+            pytest.param(
+                1.0, 0.0, 0.1, 0.0, 1.0, dict(loss=torch.e, entropy_term=-torch.e), id="entropy"
+            ),
+        ],
+    )
+    def test_grpo_loss_calculation(
+        self, ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected
+    ):
+        outputs = rl_utils.calculate_grpo_loss(
             current_logprobs=torch.ones(BATCH, SEQ),
-            old_logprobs=0.5 * torch.ones(BATCH, SEQ),
+            old_logprobs=torch.ones(BATCH, SEQ) - torch.log(torch.tensor(ratio)),
             ref_logprobs=torch.ones(BATCH, SEQ),
-            advantages=torch.zeros(BATCH),
-            clamp_eps_lower=0.1,
-            clamp_eps_upper=0.1,
-            kl_beta=0.1,
-            entropy_weight=0.0,
+            advantages=torch.full((BATCH,), advantage),
+            clamp_eps_lower=clamp_eps,
+            clamp_eps_upper=clamp_eps,
+            kl_beta=kl_beta,
+            entropy_weight=entropy_weight,
         )
-        assert truncated_from_above.float().mean() == 1
-        assert truncated_from_below.float().sum() == 0
+        outputs = dict(zip(("loss", "kl_term", "ratios", "entropy_term"), outputs))
+        for name, want in expected.items():
+            torch.testing.assert_close(outputs[name], torch.full_like(outputs[name], want))
 
-        # All ratios are 0.01
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
-            current_logprobs=0.01 * torch.ones(BATCH, SEQ),
-            old_logprobs=torch.ones(BATCH, SEQ),
-            ref_logprobs=torch.ones(BATCH, SEQ),
-            advantages=torch.zeros(BATCH),
+    @pytest.mark.parametrize(
+        "current, old, expected_above, expected_below",
+        [
+            # Ratios uniformly above the clamp window: everything truncates from above.
+            pytest.param(
+                torch.ones(BATCH, SEQ),
+                0.5 * torch.ones(BATCH, SEQ),
+                torch.full((BATCH, SEQ), True),
+                torch.full((BATCH, SEQ), False),
+                id="all_above",
+            ),
+            # Ratios uniformly below the clamp window: everything truncates from below.
+            pytest.param(
+                0.01 * torch.ones(BATCH, SEQ),
+                torch.ones(BATCH, SEQ),
+                torch.full((BATCH, SEQ), False),
+                torch.full((BATCH, SEQ), True),
+                id="all_below",
+            ),
+            # Mixed: above, below, above, and a unit ratio truncates neither way.
+            pytest.param(
+                torch.ones(2, 2),
+                torch.tensor([[0.5, 2.0], [0.05, 1.0]]),
+                torch.tensor([[True, False], [True, False]]),
+                torch.tensor([[False, True], [False, False]]),
+                id="mixed",
+            ),
+        ],
+    )
+    def test_grpo_loss_truncation(self, current, old, expected_above, expected_below):
+        *_, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
+            current_logprobs=current,
+            old_logprobs=old,
+            ref_logprobs=old,
+            advantages=torch.zeros(current.shape[0]),
             clamp_eps_lower=0.1,
             clamp_eps_upper=0.1,
             kl_beta=0.1,
             entropy_weight=0.0,
         )
-        assert truncated_from_above.float().sum() == 0
-        assert truncated_from_below.float().mean() == 1
-
-        # Mixed ratios: [[2., 0.5], [20., 1.]]
-        current_logprobs = torch.tensor([[1.0, 1.0], [1.0, 1.0]])
-        old_logprobs = torch.tensor([[0.5, 2.0], [0.05, 1.0]])
-        _, _, _, _, truncated_from_above, truncated_from_below = rl_utils.calculate_grpo_loss(
-            current_logprobs=current_logprobs,
-            old_logprobs=old_logprobs,
-            ref_logprobs=old_logprobs,
-            advantages=torch.zeros(BATCH),
-            clamp_eps_lower=0.1,
-            clamp_eps_upper=0.1,
-            kl_beta=0.1,
-            entropy_weight=0.0,
-        )
-        torch.testing.assert_close(
-            truncated_from_above, torch.tensor([[True, False], [True, False]])
-        )
-        torch.testing.assert_close(
-            truncated_from_below, torch.tensor([[False, True], [False, False]])
-        )
+        torch.testing.assert_close(truncated_from_above, expected_above)
+        torch.testing.assert_close(truncated_from_below, expected_below)
 
     @pytest.mark.parametrize(
         "initialize_model_parallel",
