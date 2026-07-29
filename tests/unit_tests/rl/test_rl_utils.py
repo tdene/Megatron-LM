@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import itertools
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -251,10 +252,11 @@ class TestRLUtils:
         agent = MagicMock()
 
         class FakePipeline:
-            def __init__(self, agent, request, parallel_generation_tasks):
+            def __init__(self, agent, request, parallel_generation_tasks, durable_bank=None):
                 captured["agent"] = agent
                 captured["request"] = request
                 captured["parallel_generation_tasks"] = parallel_generation_tasks
+                captured["durable_bank"] = durable_bank
 
             def run(self):
                 return rollout_generator
@@ -288,6 +290,204 @@ class TestRLUtils:
         # independent of submission granularity.
         assert captured["parallel_generation_tasks"] == args.rl_generation_lag + 1
         assert captured["request"].submission_granularity == submission_granularity
+        # Without --rl-durable-rollout-bank the pipeline gets no durable bank,
+        # making every durable-bank hook a no-op.
+        assert captured["durable_bank"] is None
+
+    def test_rl_durable_rollout_bank_defaults_off(self):
+        """The durable rollout bank must be a no-op unless explicitly enabled."""
+        args = self.create_test_args()
+        assert args.rl_durable_rollout_bank is False
+        assert args.rl_rollout_bank_dir is None
+        assert args.rl_rollout_bank_max_bytes == 0
+        assert rl_utils.maybe_get_rollout_bank(args) is None
+        assert rl_utils.get_rollout_bank() is None
+        # Compaction is likewise a no-op without a bank.
+        rl_utils.maybe_compact_rollout_bank(3)
+
+    def test_maybe_get_rollout_bank_creates_rank0_singleton(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", None)
+        args = SimpleNamespace(
+            rl_durable_rollout_bank=True,
+            rl_rollout_bank_dir=str(tmp_path / "bank"),
+            rl_rollout_bank_max_bytes=0,
+            save=None,
+        )
+        bank = rl_utils.maybe_get_rollout_bank(args)
+        assert bank is not None
+        assert bank.bank_dir == str(tmp_path / "bank")
+        assert rl_utils.maybe_get_rollout_bank(args) is bank  # singleton
+        assert rl_utils.get_rollout_bank() is bank
+
+    @pytest.mark.parametrize(
+        "rl_partial_rollouts, restored_count, expected_injected, expected_fresh_pulls",
+        [
+            pytest.param(True, 3, 3, 5, id="streaming_mixes_restored_and_fresh"),
+            pytest.param(True, 8, 8, 0, id="fully_restored_streaming_pulls_nothing"),
+            pytest.param(True, 11, 8, 0, id="streaming_injects_at_most_one_batch"),
+            pytest.param(False, 3, 0, 8, id="non_streaming_defers_partial_batches"),
+            pytest.param(False, 8, 8, 0, id="non_streaming_injects_full_batches"),
+        ],
+    )
+    def test_restored_groups_inject_by_streaming_lifecycle(
+        self,
+        monkeypatch,
+        rl_partial_rollouts,
+        restored_count,
+        expected_injected,
+        expected_fresh_pulls,
+    ):
+        """Restart injection: the persistent pipeline always keeps the trainer batch
+        size; only this collection's fresh pulls shrink. Streaming injects any
+        share (the pipeline buffers across iterations); non-streaming injects in
+        full batches only, so its whole-batch boundary invariant holds."""
+        n_prompts = 8
+        restored = [
+            RolloutGroup(rollouts=[], uid=f"restored-{i}") for i in range(restored_count)
+        ]
+        generated = [RolloutGroup(rollouts=[], uid=f"fresh-{i}") for i in range(n_prompts)]
+        runtime_state = SimpleNamespace(bank_restored=False, restored_groups=deque())
+
+        class RecordingBank:
+            def __init__(self):
+                self.set_collections = []
+                self.restore_calls = []
+                self.consumed = []
+
+            def set_collection(self, iteration):
+                self.set_collections.append(iteration)
+
+            def restore(self, iteration):
+                self.restore_calls.append(iteration)
+                return list(restored)
+
+            def mark_consumed(self, uid, iteration):
+                self.consumed.append((uid, iteration))
+
+        bank = RecordingBank()
+        pulled = []
+
+        async def generator():
+            for group in generated:
+                pulled.append(group)
+                yield group
+
+        captured = {}
+
+        def get_rollout_generator(_args, _interface, request_num_groups, samples_per_group):
+            captured["request_num_groups"] = request_num_groups
+            captured["samples_per_group"] = samples_per_group
+            return generator()
+
+        args = SimpleNamespace(
+            rl_offload_optimizer_during_inference=False,
+            cuda_graph_impl=None,
+            curr_iteration=11,
+            iteration=10,
+            rl_partial_rollouts=rl_partial_rollouts,
+        )
+        pg_collection = SimpleNamespace(ep=object(), tp=object())
+        loop = asyncio.new_event_loop()
+
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_attr_wrapped_model", lambda *args, **kwargs: pg_collection
+        )
+        monkeypatch.setattr(rl_utils, "get_pg_size", lambda _group: 1)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils,
+            "megatron_rl_inference_mode",
+            lambda *args, **kwargs: nullcontext(
+                SimpleNamespace(take_request_ledger=lambda: {})
+            ),
+        )
+        monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: runtime_state)
+        monkeypatch.setattr(rl_utils, "maybe_get_rollout_bank", lambda _args: bank)
+        monkeypatch.setattr(rl_utils, "get_rollout_generator", get_rollout_generator)
+        monkeypatch.setattr(rl_utils, "remove_inflight", lambda _count: None)
+        monkeypatch.setattr(rl_utils, "assert_no_inflight_rollouts", lambda _pipeline: None)
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+
+        try:
+            with (
+                patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.broadcast_object_list"),
+                patch("torch.are_deterministic_algorithms_enabled", return_value=False),
+            ):
+                rollouts, request_ledger = rl_utils.get_environment_rollouts(
+                    model=[object()],
+                    inference_model=None,
+                    optimizer=object(),
+                    n_prompts=n_prompts,
+                    samples_per_group=4,
+                )
+        finally:
+            loop.close()
+
+        assert rollouts == restored[:expected_injected] + generated[:expected_fresh_pulls]
+        assert request_ledger == {}
+        assert len(pulled) == expected_fresh_pulls
+        # The persistent pipeline request always keeps the trainer batch size.
+        assert captured == {"request_num_groups": n_prompts, "samples_per_group": 4}
+        # The bank latched restore once (at the resume iteration) and pointed
+        # appends at this collection.
+        assert bank.restore_calls == [args.iteration]
+        assert runtime_state.bank_restored is True
+        assert bank.set_collections == [args.curr_iteration]
+        # Everything handed to the trainer is marked consumed at this iteration;
+        # uninjected restored groups stay queued for later collections.
+        assert bank.consumed == [(group.uid, args.curr_iteration) for group in rollouts]
+        assert len(runtime_state.restored_groups) == restored_count - expected_injected
+
+    def test_banked_path_marks_consumption(self, monkeypatch):
+        """Groups consumed without inference (can_skip_inference) still get their
+        durable-bank consumption markers."""
+        n_prompts = 2
+        groups = [RolloutGroup(rollouts=[], uid=f"banked-{i}") for i in range(n_prompts)]
+        loop = asyncio.new_event_loop()
+
+        async def gen():
+            for group in groups:
+                yield group
+
+        rollout_generator = gen()
+        consumed = []
+        bank = SimpleNamespace(
+            mark_consumed=lambda uid, iteration: consumed.append((uid, iteration))
+        )
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", rollout_generator)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace(curr_iteration=9))
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext()
+        )
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        try:
+            with (
+                patch("torch.distributed.get_rank", return_value=0),
+                patch("torch.distributed.broadcast_object_list"),
+                patch("torch.are_deterministic_algorithms_enabled", return_value=False),
+            ):
+                rollouts, request_ledger = rl_utils.get_environment_rollouts(
+                    [MagicMock()],
+                    inference_model=None,
+                    optimizer=MagicMock(),
+                    n_prompts=n_prompts,
+                    samples_per_group=1,
+                    run_inference=False,
+                )
+        finally:
+            loop.run_until_complete(rollout_generator.aclose())
+            loop.close()
+
+        assert rollouts == groups
+        assert request_ledger == {}
+        assert consumed == [(group.uid, 9) for group in groups]
 
     @pytest.mark.parametrize(
         "ready_batches, partial_rollouts, expected_skip",

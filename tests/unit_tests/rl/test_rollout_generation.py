@@ -16,6 +16,7 @@ from megatron.rl.agent.api import (
     GroupRolloutParams,
     Rollout,
     RolloutGenerator,
+    RolloutGroup,
     RolloutRequest,
     TokenRollout,
 )
@@ -251,6 +252,23 @@ class TestRewardRollouts:
         assert sorted(r.trajectory[0] for r in rollouts) == ["t0", "t1", "t2", "t3"]
         assert all(r.reward == 1.0 for r in rollouts)
         assert all(r.env_id == "reward-test" for r in rollouts)
+
+
+def test_rollout_group_defines_optional_uid():
+    # The durable rollout bank stamps its stable identity here; None until banked.
+    assert RolloutGroup.model_fields["uid"].default is None
+
+
+def test_rollout_pipeline_defaults_to_no_durable_bank():
+    # No injected bank (the --rl-durable-rollout-bank default): every
+    # durable-bank hook in the pipeline is a no-op.
+    request = GroupedRolloutRequest(
+        num_groups=1,
+        rollouts_per_group=1,
+        inference_interface=MockInferenceInterface(),
+    )
+    pipeline = RolloutPipeline(MockGenerator(), request, parallel_generation_tasks=1)
+    assert pipeline.durable_bank is None
 
 
 class TestGroupedRollouts:
