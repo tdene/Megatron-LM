@@ -1368,7 +1368,10 @@ class TestRLUtils:
         [pytest.param((1, 1), id="tp1-pp1")],
         indirect=["initialize_model_parallel"],
     )
-    def test_prep_wandb_metrics(self, initialize_model_parallel):
+    @pytest.mark.parametrize(
+        "inject_placeholders", [False, True], ids=["clean", "with_placeholders"]
+    )
+    def test_prep_wandb_metrics(self, initialize_model_parallel, inject_placeholders):
         # This tests the computation and makes us fail noisily if
         # inputs assumptions are changed, e.g. we expect rewards to come in groups (list[list[int]]).
         traj_lens = [[3, 3], [1, 2]]
@@ -1390,8 +1393,29 @@ class TestRLUtils:
         env_ids = [["gsm8k", "gsm8k"], ["math", "math"]]
         problem_ids = [["q0", "q0"], ["q1", "q1"]]
         current_iteration = 6
+        if inject_placeholders:
+            for lst, sentinel in (
+                (traj_lens, 0),
+                (rewards, 0.0),
+                (num_turns, 0),
+                (num_evictions, 0),
+            ):
+                for group in lst:
+                    group.append(sentinel)
+                lst.append([sentinel, sentinel])  # the fully failed extra group
+            for lst in (policy_epoch, kv_cache_epoch):
+                for group in lst:
+                    group.append([0])  # sentinel epoch stamp of a placeholder
+                lst.append([[0], [0]])
+            # Placeholders contribute no turns, and compute_group_stats already
+            # excludes them from completed_epochs; the failed group adds empty
+            # inner lists, which the group-level stats must skip, not crash on.
+            turn_lens.append([])
+            completed_epochs.append([])
+            # advantages stay [0, 1]: zero-turn rollouts emit no advantage entries.
+        writer = MagicMock()
         metrics = rl_utils.prep_wandb_metrics(
-            MagicMock(),
+            writer,
             traj_lens,
             turn_lens,
             rewards,
@@ -1409,8 +1433,21 @@ class TestRLUtils:
             problem_ids=problem_ids,
             current_iteration=current_iteration,
         )
-        assert metrics["mean_reward"] == 0.75
+        assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
+        assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
+        # Reward aggregates keep the placeholder zeros by design: group means
+        # become [2/3, 1/3, 0] instead of [1, 0.5].
+        assert np.isclose(metrics["mean_reward"], 1 / 3 if inject_placeholders else 0.75)
         assert metrics["mean_advantage"] == 0.5
+        # The rollout table lists real rollouts only, in either case.
+        rollout_table_calls = [
+            c
+            for c in writer.Table.call_args_list
+            if c.kwargs.get("columns", [None])[:2] == ["reward", "traj_length"]
+        ]
+        assert len(rollout_table_calls) == 1
+        rows = rollout_table_calls[0].kwargs["data"]
+        assert [r[3] for r in rows] == [2, 4, 1, 6]  # policy_staleness column
         assert metrics["nonzero_groups_ratio"] == 0.5
         assert metrics["max_traj_length"] == 3
         assert metrics["min_traj_length"] == 1
@@ -1513,7 +1550,7 @@ class TestRLUtils:
             problem_ids=[],
             current_iteration=6,
         )
-        assert metrics == {}
+        assert metrics == {'failed_rollouts/count': 0, 'failed_rollouts/ratio': 0.0}
         writer.Table.assert_not_called()
 
     def test_prep_wandb_metrics_skips_unjoined_rollouts(self):
@@ -1689,3 +1726,110 @@ def _ledger_record(epoch, num_evictions=0):
     return FinishedRequestRecord(
         policy_epoch=[(0, epoch)], kv_cache_epoch=[(0, epoch)], num_evictions=num_evictions
     )
+
+    def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
+        eod = MockTokenizer().eod
+
+        def real_rollout(tokens, problem_id):
+            return TokenRollout(
+                trajectory=[tokens],
+                generation_mask=[[True] * len(tokens)],
+                reward=1.0,
+                logprobs=[[0.0] * len(tokens)],
+                env_id="swe",
+                problem_id=problem_id,
+            )
+
+        def placeholder():
+            return TokenRollout(
+                trajectory=[],
+                generation_mask=[],
+                reward=0.0,
+                logprobs=[],
+                env_id="swe",
+                problem_id="placeholder",
+            )
+
+        rollouts = [
+            [
+                real_rollout([1, 2, eod], problem_id="p0"),
+                real_rollout([1, 2, 3, eod], problem_id="p0"),
+                placeholder(),
+            ],
+            [placeholder(), placeholder(), placeholder()],
+        ]
+        # All-generated masks: the whole turn keys as generation with an empty prompt.
+        # Placeholders have no turns, so they need (and consume) no records.
+        ledger = {
+            _token_stream_key([], [1, 2, eod]): [_ledger_record(5)],
+            _token_stream_key([], [1, 2, 3, eod]): [_ledger_record(6)],
+        }
+        stats = rl_utils.compute_group_stats(
+            rollouts, MockTokenizer(), seq_len=16, request_ledger=ledger
+        )
+
+        # Per-rollout lists keep the placeholder entries (as None summaries):
+        # alignment with rewards and num_turns is what lets prep_wandb_metrics
+        # mask them downstream.
+        assert stats.num_turns == [[1, 1, 0], [0, 0, 0]]
+        assert stats.policy_first_epoch == [[5, 6, None], [None, None, None]]
+        assert stats.policy_last_epoch == [[5, 6, None], [None, None, None]]
+        assert stats.traj_lens == [[3, 4, 0], [0, 0, 0]]
+        # Per-turn lists exclude placeholders entirely: no sentinel epoch stamp
+        # in completed_epochs, no fake 0-length turn for all-placeholder groups.
+        assert stats.completed_epochs == [[5, 6], []]
+        assert stats.turn_lens == [[3, 4], []]
+        # Rewards keep the placeholder zeros (they shape the GRPO baseline).
+        assert stats.rewards == [[1.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
+
+        # End to end: placeholders never reach the staleness metrics.
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            stats.traj_lens,
+            stats.turn_lens,
+            stats.rewards,
+            stats.num_turns,
+            stats.advantages,
+            policy_first_epoch=stats.policy_first_epoch,
+            policy_avg_epoch=stats.policy_avg_epoch,
+            policy_last_epoch=stats.policy_last_epoch,
+            kv_first_epoch=stats.kv_first_epoch,
+            kv_avg_epoch=stats.kv_avg_epoch,
+            kv_last_epoch=stats.kv_last_epoch,
+            completed_epochs=stats.completed_epochs,
+            num_evictions=stats.num_evictions,
+            env_ids=stats.rollout_env_ids,
+            problem_ids=stats.problem_ids,
+            current_iteration=7,
+        )
+        assert metrics["staleness/policy/first/max"] == 2  # 7 - 5, no sentinel rows
+        assert metrics["min_traj_length"] == 3
+        assert metrics["min_num_turns"] == 1
+        assert metrics["mean_completion_gap"] == np.mean([2, 1])
+        assert metrics["failed_rollouts/count"] == 4
+        assert np.isclose(metrics["failed_rollouts/ratio"], 4 / 6)
+
+    def test_prep_wandb_metrics_all_placeholder_wave_keeps_failure_counters(self):
+        # Rewards exist (the zero placeholders shape the GRPO baseline) but every
+        # rollout is a zero-turn placeholder: the wave skips the aggregates and
+        # still reports its failure counters.
+        metrics = rl_utils.prep_wandb_metrics(
+            MagicMock(),
+            traj_lens=[[0, 0]],
+            turn_lens=[[]],
+            rewards=[[0.0, 0.0]],
+            num_turns=[[0, 0]],
+            advantages=[0.0, 0.0],
+            policy_first_epoch=[[None, None]],
+            policy_avg_epoch=[[None, None]],
+            policy_last_epoch=[[None, None]],
+            kv_first_epoch=[[None, None]],
+            kv_avg_epoch=[[None, None]],
+            kv_last_epoch=[[None, None]],
+            completed_epochs=[[]],
+            num_evictions=[[0, 0]],
+            env_ids=[["swe", "swe"]],
+            problem_ids=[["a", "b"]],
+            current_iteration=7,
+        )
+        assert metrics == {'failed_rollouts/count': 2, 'failed_rollouts/ratio': 1.0}
