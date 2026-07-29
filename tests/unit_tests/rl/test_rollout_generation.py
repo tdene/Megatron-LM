@@ -738,12 +738,15 @@ class TestMultiTurnEpisode:
             groups = []
 
             async def _drain():
-                async for group in agent.get_grouped_rollouts(
-                    GroupedRolloutRequest(
-                        num_groups=1, rollouts_per_group=1, inference_interface=iface
-                    )
-                ):
-                    groups.append(group)
+                request = GroupedRolloutRequest(
+                    num_groups=1, rollouts_per_group=1, inference_interface=iface
+                )
+                async with aclosing(
+                    RolloutPipeline(agent, request, parallel_generation_tasks=1).run()
+                ) as iterator:
+                    async for group in iterator:
+                        groups.append(group)
+                        break
 
             # Bounded so a wedged pipeline fails fast instead of hanging.
             await asyncio.wait_for(_drain(), timeout=5.0)
