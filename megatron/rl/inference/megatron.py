@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 
 import httpx
 import torch.distributed as dist
@@ -28,7 +29,7 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks, resolve_rl_generation_lag
+from ..rollout_granularity import resolve_rl_generation_lag
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
@@ -143,14 +144,17 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             args.rl_kv_cache_management_mode
         )
 
-        # One connection per concurrent inference request: each in-flight generation
-        # task holds one submission unit's worth of rollouts.
-        rollouts_per_task = {
-            "B": args.grpo_prompts_per_step * args.grpo_group_size,
-            "G": args.grpo_group_size,
-            "R": 1,
-        }[args.rl_submission_granularity]
-        concurrency_limit = get_rl_parallel_generation_tasks(args) * rollouts_per_task
+        # One connection per concurrent inference request: the run-ahead window is
+        # (lag + 1) trainer batches of rollouts, whatever the submission granularity.
+        # The lag may be fractional (e.g. autotuned), so round up and keep at least one.
+        concurrency_limit = max(
+            1,
+            math.ceil(
+                args.grpo_prompts_per_step
+                * args.grpo_group_size
+                * (args.rl_generation_lag + 1)
+            ),
+        )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
             max_keepalive_connections=concurrency_limit,

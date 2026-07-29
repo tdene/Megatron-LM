@@ -4,29 +4,21 @@
 
 from typing import Literal
 
-SubmissionGranularity = Literal["R", "G", "B"]
-ConsumptionGranularity = Literal["G", "B"]
+SubmissionGranularity = Literal["R", "G", "E", "B"]
+ConsumptionGranularity = Literal["G", "E", "B"]
 
-
-def get_rl_parallel_generation_tasks(args) -> int:
-    """Return the number of generation slots implied by RL lag and submission granularity.
-
-    The lag may be fractional or negative (>= -1); the slot count is rounded and clamped
-    to at least one.
-    """
-    parallel_generation_tasks = args.rl_generation_lag + 1
-    if args.rl_submission_granularity != "B":
-        parallel_generation_tasks *= args.grpo_prompts_per_step
-    if args.rl_submission_granularity == "R":
-        parallel_generation_tasks *= args.grpo_group_size
-    return max(1, round(parallel_generation_tasks))
+# Coarseness order of the granularity ladder (rollout < group < env < batch).
+# Consumption must be no finer than submission.
+GRANULARITY_RANK: dict[str, int] = {"R": 0, "G": 1, "E": 2, "B": 3}
 
 
 def resolve_rl_generation_lag(args, dp_size: int, max_requests: int) -> None:
     """Resolve args.rl_generation_lag against the inference engine's request capacity.
 
     Autotunes the lag to fill the engine when unset; otherwise reports how the requested
-    lag compares to the maximum effective lag the engine can serve.
+    lag compares to the maximum effective lag the engine can serve. The lag may be
+    fractional or negative (>= -1); the RolloutPipeline gate rounds the implied slot
+    count and clamps it to at least one submission unit.
     """
     # Import here to avoid circular imports.
     from megatron.training.utils import print_rank_0
@@ -39,18 +31,15 @@ def resolve_rl_generation_lag(args, dp_size: int, max_requests: int) -> None:
         args.rl_generation_lag = max_effective_lag
         print_rank_0(
             f"Autotuned rl-generation-lag={max_effective_lag:.2f} "
-            f"({get_rl_parallel_generation_tasks(args)} parallel generation tasks at "
+            f"({max_effective_groups} groups in flight at "
             f"submission granularity {args.rl_submission_granularity}; "
             f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
     else:
-        tasks = get_rl_parallel_generation_tasks(args)
-        rollouts_per_task = {"B": P * G, "G": G, "R": 1}[args.rl_submission_granularity]
-        groups_in_flight = tasks * rollouts_per_task / G
-        actual_lag = groups_in_flight / P - 1
+        groups_in_flight = (args.rl_generation_lag + 1) * P
         print_rank_0(
             f"Using rl-generation-lag={args.rl_generation_lag} "
-            f"(actual={actual_lag:.2f}, {tasks} parallel "
-            f"generation tasks at submission granularity {args.rl_submission_granularity}; "
+            f"(~{groups_in_flight:.1f} groups in flight at "
+            f"submission granularity {args.rl_submission_granularity}; "
             f"max effective lag={max_effective_lag:.2f}; "
             f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
         if groups_in_flight > max_effective_groups:
