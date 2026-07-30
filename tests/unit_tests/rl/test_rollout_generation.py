@@ -241,6 +241,78 @@ class TestConsumptionRelease:
             await it.aclose()
 
 
+class TestStageFailurePropagation:
+    """A dead stage must fail run() loudly, never read as a clean end-of-stream.
+
+    A stage that dies runs the queue-shutdown cascade, which reaches
+    stage_consume exactly like a clean end-of-stream; before run() reaped the
+    stage tasks, the caller saw StopAsyncIteration and waited forever for
+    rollouts nobody would ever generate (observed live 2026-07-30: a TypeError
+    in the first prepare_group_rollout idled a training job to its time limit).
+    """
+
+    @pytest.mark.asyncio
+    async def test_prepare_failure_raises_out_of_run(self):
+        class BrokenPrepareGenerator(MockGenerator):
+            async def prepare_group_rollout(self, request, env_index: int = 0):
+                raise TypeError("agent/pipeline interface mismatch")
+
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="R",
+            consumption_granularity="G",
+        )
+        pipeline = RolloutPipeline(
+            BrokenPrepareGenerator(), request, parallel_generation_tasks=1
+        )
+        async with aclosing(pipeline.run()) as it:
+            with pytest.raises(RuntimeError, match="stage died") as excinfo:
+                # wait_for turns the pre-fix failure mode (an eternal hang once
+                # the cascade is mistaken for end-of-stream) into a test failure.
+                await asyncio.wait_for(anext(it), timeout=10)
+        assert isinstance(excinfo.value.__cause__, TypeError)
+
+    @pytest.mark.asyncio
+    async def test_midstream_stage_failure_raises_after_delivered_groups(self):
+        class BrokenBuildGenerator(MockGenerator):
+            """First group builds normally; every later group's build_rollout raises."""
+
+            async def prepare_group_rollout(self, request, env_index: int = 0):
+                idx = self._call_count
+                params = await super().prepare_group_rollout(request, env_index=env_index)
+                if idx < 1:
+                    return params
+
+                async def broken_build(episode):
+                    raise ValueError("reward model exploded")
+
+                return GroupRolloutParams(
+                    run_episode=params.run_episode, build_rollout=broken_build
+                )
+
+        request = GroupedRolloutRequest(
+            num_groups=1,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="G",
+            consumption_granularity="G",
+        )
+        pipeline = RolloutPipeline(
+            BrokenBuildGenerator(), request, parallel_generation_tasks=1
+        )
+        async with aclosing(pipeline.run()) as it:
+            # Group 0 is healthy and must still be delivered.
+            group = await asyncio.wait_for(anext(it), timeout=10)
+            assert len(group.rollouts) == 2
+            # Group 1's build_rollout kills stage_assemble; the next pull must
+            # surface that failure instead of hanging on the drained stream.
+            with pytest.raises(RuntimeError, match="stage died") as excinfo:
+                await asyncio.wait_for(anext(it), timeout=10)
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+
 class TestRewardRollouts:
     @pytest.mark.asyncio
     async def test_get_reward_rollouts_matches_per_rollout_composition(self):
