@@ -311,6 +311,16 @@ class RolloutPipeline:
     async def run(self) -> AsyncIterator[RolloutGroup]:
         """Run the pipeline stages; cancels them when the iterator is closed.
 
+        Raises:
+            RuntimeError: If the output stream ends on its own. stage_prepare
+                submits batches forever, so a natural end only happens when a
+                dying stage ran the queue-shutdown cascade — which is otherwise
+                indistinguishable from a clean end-of-stream. The dead stage's
+                exception (stored on the task, never awaited) is chained as the
+                cause. Without this, an agent-side exception in the first group
+                read as "no more data" and the trainer idled to its time limit
+                (observed 2026-07-30, TypeError in stage_prepare).
+
         Yields:
             RolloutGroup: Groups in consumption-granularity order.
         """
@@ -324,6 +334,27 @@ class RolloutPipeline:
         try:
             async for group in self.stage_consume():
                 yield group
+            # Natural end of stream: some stage died and its shutdown cascade
+            # drained through to stage_consume. Reap every stage (upstream
+            # stages of the dead one are still running and must be cancelled;
+            # cancelling an already-failed task is a no-op that preserves its
+            # exception) and surface the original failure.
+            for task in tasks:
+                task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failure = next(
+                (
+                    result
+                    for result in results
+                    if isinstance(result, BaseException)
+                    and not isinstance(result, asyncio.CancelledError)
+                ),
+                None,
+            )
+            raise RuntimeError(
+                "RolloutPipeline output stream ended: a pipeline stage died"
+                + ("" if failure is not None else " (no stage exception was recovered)")
+            ) from failure
         finally:
             for task in tasks:
                 task.cancel()
