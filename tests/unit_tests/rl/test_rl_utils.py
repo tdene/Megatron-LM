@@ -188,6 +188,32 @@ class TestRLUtils:
         set_global_variables(args, False)
         return args
 
+    @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
+    def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
+        """Under bf16 training old_logprobs arrives bf16 while wire inference
+        logprobs are float32; the scatter must not index_put across dtypes
+        (RuntimeError, observed live 2026-07-30) and the aligned result rides
+        in float32 like pack_inference_logprobs' packed twin."""
+        old_logprobs = torch.full((2, 6), -1.0, dtype=template_dtype)
+        # Two generated tokens at positions 3,4: the logprob of the token at
+        # position p lives at index p-1, so targets are 2,3.
+        gen_masks = torch.zeros((2, 7), dtype=torch.bool)
+        gen_masks[:, 3:5] = True
+        inference_logprobs = [
+            torch.tensor([-0.5, -0.25], dtype=torch.float32) for _ in range(2)
+        ]
+        aligned = rl_utils.align_unpacked_inference_logprobs(
+            inference_logprobs=inference_logprobs,
+            old_logprobs_for_data=old_logprobs,
+            generation_masks=gen_masks,
+            group_stats=SimpleNamespace(),
+        )
+        assert aligned.dtype == torch.float32
+        assert aligned[0, 2].item() == pytest.approx(-0.5)
+        assert aligned[0, 3].item() == pytest.approx(-0.25)
+        # Slots without inference logprobs keep the template's values.
+        assert aligned[0, 0].item() == pytest.approx(-1.0)
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
 
