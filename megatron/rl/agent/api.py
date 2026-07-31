@@ -58,6 +58,12 @@ class TokenRollout(AgentBaseModel):
     logprobs: list[list[float]] | None = None
     env_id: str = ''
     problem_id: str | None = None
+    # Per-turn output-token cap the agent stamped on generation (e.g.
+    # NemoGym's max_output_tokens_per_step riding every /run body); None =
+    # uncapped/unknown. Lets data-integrity checks verify arithmetically that
+    # a non-eod turn under seq_length stopped exactly at its cap rather than
+    # being silently truncated in transit (see single_turn_termination_ok).
+    generation_cap: int | None = None
 
 
 Rollouts = list[TokenRollout | Rollout]

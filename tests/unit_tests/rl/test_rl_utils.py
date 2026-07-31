@@ -187,6 +187,34 @@ class TestRLUtils:
         set_global_variables(args, False)
         return args
 
+    @pytest.mark.parametrize(
+        "traj_len, last_token, cap, generated, ok",
+        [
+            pytest.param(8, 99, None, 8, True, id="ends_in_eod"),
+            pytest.param(16, 7, None, 8, True, id="truncated_at_seq_len"),
+            pytest.param(8, 7, 5, 5, True, id="stopped_exactly_at_cap"),
+            pytest.param(8, 7, 5, 4, False, id="under_cap_is_corruption"),
+            pytest.param(8, 7, None, 8, False, id="uncapped_stays_strict"),
+            pytest.param(0, None, 5, 0, False, id="empty_turn_rejected"),
+        ],
+    )
+    def test_single_turn_termination_ok(self, traj_len, last_token, cap, generated, ok):
+        """The eod tripwire admits exactly-at-cap stops (verified from the
+        generation mask, not a label) and stays strict everywhere else — the
+        2026-07-30 workplace_assistant rollout (prompt + exactly
+        max_output_tokens_per_step generated, no eod) is the admit case."""
+        eod, seq_len = 99, 16
+        traj = [1] * (traj_len - 1) + [last_token] if traj_len else []
+        mask = [False] * (traj_len - generated) + [True] * generated
+        rollout = TokenRollout(
+            trajectory=[traj],
+            generation_mask=[mask],
+            reward=0.0,
+            env_id="cap-test",
+            generation_cap=cap,
+        )
+        assert rl_utils.single_turn_termination_ok(rollout, traj, seq_len, eod) is ok
+
     @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
     def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
         """Under bf16 training old_logprobs arrives bf16 while wire inference
