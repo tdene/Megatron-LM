@@ -916,3 +916,23 @@ class TestMultiTurnEpisode:
         assert agent.observation_turns == expected["observation_turns"]
         # get_trajectory_reward sees the full dialogue, ending on the final reply exactly once.
         assert [(m.role, m.content) for m in agent.reward_conversation] == expected["reward_conv"]
+
+
+def test_weighted_multi_task_excludes_zero_weight_envs():
+    """Weight-0 entries boot their servers but must never claim batch slots.
+
+    Regression: the layout's min-one-group bump used to resurrect weight-0 envs
+    into every batch (multi-env blend configs carry dozens of weight-0
+    boot-only entries, documented as "weight 0 = never sampled").
+    """
+    mt = WeightedMultiTask(
+        [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "boot"}, weight=0.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+    )
+    assert mt._rollout_env_ids == ["a", "b"]
+    assert mt.rollout_group_layout(4) == [3, 1]
+    # Per-config distribution stays aligned with agent_configs: weight-0 slot pinned to 0.
+    assert mt._distribute_counts(4) == [3, 0, 1]
