@@ -33,13 +33,13 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.inference_step_trace import (
     get_inference_step_tracer,
     init_inference_step_tracer,
 )
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
-from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
     prefetch_managed_module_parameters,
@@ -83,11 +83,7 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
-from megatron.rl.inflight_tracker import (
-    inflight_snapshot,
-    remove_inflight,
-    reset_inflight,
-)
+from megatron.rl.inflight_tracker import inflight_snapshot, remove_inflight, reset_inflight
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.rollout_bank import RolloutBank, rollout_request_keys
@@ -107,6 +103,7 @@ from megatron.rl.sequence_packing_utils import (
     update_microbatch_calculator,
 )
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
+from megatron.rl.types import EnvId, GroupQueuesPerEnv, GroupsPerEnv
 from megatron.training.global_vars import (
     get_args,
     get_tensorboard_writer,
@@ -337,8 +334,11 @@ class RLRuntimeState:
         # Persistent ledger of per-request metadata (e.g. staleness stats).
         self.request_ledger = {}
         # Durable rollout bank runtime state: groups restored from disk awaiting
-        # injection into a collection, and the once-per-process restore latch.
-        self.restored_groups = deque()
+        # injection, bucketed by env_id; streaming groups pulled over-quota while
+        # the restore backlog drains (buffered here, still counted in-flight);
+        # and the once-per-process restore latch.
+        self.restored_groups: GroupQueuesPerEnv = {}
+        self.fresh_overflow: GroupQueuesPerEnv = {}
         self.bank_restored = False
         self.sequences_this_iteration_on_rank = 0
         self.latest_batch_num_sequences = 0
@@ -644,6 +644,7 @@ def get_inference_interface(args, loop, model):
 _ROLLOUT_GENERATOR = None
 _ROLLOUT_PIPELINE = None
 _ROLLOUT_BANK = None
+_ROLLOUT_AGENT = None
 
 
 def maybe_get_rollout_bank(args):
@@ -688,6 +689,19 @@ def maybe_compact_rollout_bank(iteration):
         bank.checkpoint(iteration)
 
 
+def _get_or_create_rollout_agent(args):
+    """Return the cached rollout agent, building it on first use.
+
+    Owns the ``_ROLLOUT_AGENT`` global so the per-env restore target
+    (``colocated_inference``) is computed from the same agent instance the
+    pipeline generates with — the target and the actual layout can never drift.
+    """
+    global _ROLLOUT_AGENT
+    if _ROLLOUT_AGENT is None:
+        _ROLLOUT_AGENT = get_agent(args)
+    return _ROLLOUT_AGENT
+
+
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
     """Return the rollout group iterator for this step.
 
@@ -723,7 +737,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         # Keep the pipeline handle so metric logging can read its queues, gate
         # state, and per-env counters (see _collect_rollout_pipeline_metrics).
         _ROLLOUT_PIPELINE = RolloutPipeline(
-            agent=get_agent(args),
+            agent=_get_or_create_rollout_agent(args),
             request=request,
             parallel_generation_tasks=args.rl_generation_lag + 1,
             # None (all durable-bank calls skipped) unless --rl-durable-rollout-bank
@@ -790,6 +804,111 @@ def _merge_request_ledger(
     for key, records in fresh.items():
         merged.setdefault(key, []).extend(records)
     return merged
+
+
+def _env_targets(agent, n_prompts: int) -> GroupsPerEnv:
+    """Per-env group target for a full collection of ``n_prompts`` groups.
+
+    Keyed by env_id so it can be matched against restored rollout-bank groups.
+    For a ``WeightedMultiTask`` the computation lives on the agent
+    (``env_group_targets``), which reuses the pipeline's actual layout so the
+    target and the generator's split stay identical. Legacy single-env agents
+    fall back to a one-key dict.
+    """
+    if isinstance(agent, WeightedMultiTask):
+        return agent.env_group_targets(n_prompts)
+    # Legacy single-env agent: env_id is the bucket key that must match this
+    # agent's rollout env_id, so require it rather than guessing a positional name.
+    env_id = getattr(agent, "env_id", None)
+    if not env_id:
+        raise ValueError(
+            f"Rollout agent {type(agent).__name__} has no env_id; it is required to "
+            f"weight-balance restored rollout-bank groups. Set env_id on the agent."
+        )
+    return {env_id: n_prompts}
+
+
+def _bucket_restored_groups(
+    groups: GroupedRollouts, known_env_ids: set[EnvId]
+) -> GroupQueuesPerEnv:
+    """Bucket restored bank groups by env_id, asserting env-config stability."""
+    buckets: GroupQueuesPerEnv = {}
+    for g in groups:
+        if not g:
+            continue
+        env = g[0].env_id
+        assert env in known_env_ids, (
+            f"Restored rollout-bank group has env_id {env!r} which is not in the "
+            f"current --langrl-env-config (known: {sorted(known_env_ids)}). Changing "
+            f"the environment set across a crash-resume is unsupported; resume with a "
+            f"matching config or clear the rollout bank."
+        )
+        buckets.setdefault(env, deque()).append(g)
+    return buckets
+
+
+def _plan_restore_injection(
+    target: GroupsPerEnv, restored_by_env: GroupQueuesPerEnv
+) -> tuple[GroupsPerEnv, GroupsPerEnv]:
+    """Cap-and-defer plan for one collection step (pure; no I/O).
+
+    Injects at most ``target[env]`` restored groups per env this step (deferring the
+    surplus to later steps) and returns the per-env residual to generate fresh, so
+    ``inject + fresh == target`` per env — weight-balanced every step.
+
+    Returns ``(inject_by_env, residual_by_env)``, both keyed by every env in
+    ``target``.
+    """
+    inject_by_env: GroupsPerEnv = {}
+    residual_by_env: GroupsPerEnv = {}
+    for env, tgt in target.items():
+        available = len(restored_by_env.get(env, ()))
+        take = min(available, tgt)
+        inject_by_env[env] = take
+        residual_by_env[env] = tgt - take
+    return inject_by_env, residual_by_env
+
+
+def _pull_fresh_inorder(loop, generator, n_fresh: int) -> GroupedRollouts:
+    """Pull ``n_fresh`` fresh groups from the generator in completion order.
+
+    The plain drain: ``anext`` the generator a fixed number of times, with no
+    per-env routing. Correct whenever the generator's own mix is the batch mix —
+    which on this pipeline is every step without a restore backlog to drain.
+
+    Returns the consumed groups; the caller ``remove_inflight``s them.
+    """
+    return [loop.run_until_complete(anext(generator)) for _ in range(n_fresh)]
+
+
+def _pull_fresh_balanced(
+    loop, generator, residual_by_env: GroupsPerEnv, overflow: GroupQueuesPerEnv
+) -> GroupedRollouts:
+    """Balanced counterpart of ``_pull_fresh_inorder``: same ``anext`` drain of the
+    generator, but pulls *until each env's quota is met* (instead of a fixed
+    ``n_fresh`` count), so per-env balance is preserved while draining restored
+    rollout-bank groups. Over-quota groups are buffered in ``overflow`` (still
+    counted in-flight) and satisfy quotas first on later steps.
+
+    Returns the consumed groups; the caller ``remove_inflight``s them.
+    """
+    need = dict(residual_by_env)  # remaining quota per env
+    fresh: GroupedRollouts = []
+    # 1) Satisfy quotas from previously buffered overflow first (guarantees drain).
+    for env, dq in overflow.items():
+        while need.get(env, 0) > 0 and dq:
+            fresh.append(dq.popleft())
+            need[env] -= 1
+    # 2) Pull from the generator until every quota is met, buffering the rest.
+    while sum(need.values()) > 0:
+        group = loop.run_until_complete(anext(generator))
+        env = group[0].env_id if group else ""
+        if need.get(env, 0) > 0:
+            fresh.append(group)
+            need[env] -= 1
+        else:
+            overflow.setdefault(env, deque()).append(group)
+    return fresh
 
 
 def colocated_inference(
@@ -863,38 +982,69 @@ def colocated_inference(
             # Durable rollout bank: point appends at this collection and, once per
             # process, restore the completed groups banked before a restart. This
             # collection injects a share of them and reduces its fresh pulls so the
-            # trainer still sees exactly n_prompts groups. (Rank-0 only: the bank
-            # is None everywhere else, and on every rank when the feature is off.)
+            # trainer still sees exactly n_prompts groups — with injection capped
+            # per env at the batch layout's target, so restored groups cannot skew
+            # the batch's env mix while the backlog drains (port of the fork's
+            # d4a6a4d5cf reweighting fix). (Rank-0 only: the bank is None
+            # everywhere else, and on every rank when the feature is off.)
             runtime_state = get_rl_runtime_state()
             bank = maybe_get_rollout_bank(args)
             inject = []
+            residual_per_env = None  # None => no balanced routing this step
             if bank is not None:
                 bank.set_collection(args.curr_iteration)
+                target = _env_targets(_get_or_create_rollout_agent(args), n_prompts)
                 if not runtime_state.bank_restored:
-                    runtime_state.restored_groups = deque(bank.restore(args.iteration))
+                    runtime_state.restored_groups = _bucket_restored_groups(
+                        bank.restore(args.iteration), set(target)
+                    )
                     runtime_state.bank_restored = True
-                    if runtime_state.restored_groups:
+                    total_restored = sum(
+                        len(dq) for dq in runtime_state.restored_groups.values()
+                    )
+                    if total_restored:
                         log_single_rank(
                             logger,
                             logging.INFO,
-                            f"RolloutBank restored {len(runtime_state.restored_groups)} completed "
-                            f"groups from disk at resume iteration {args.iteration}",
+                            f"RolloutBank restored {total_restored} completed groups "
+                            f"from disk at resume iteration {args.iteration}",
                         )
                 if args.rl_partial_rollouts:
-                    # The streaming pipeline buffers across iterations, so a
-                    # partially injected collection just leaves the balance of its
-                    # batch buffered for the next one.
-                    take = min(len(runtime_state.restored_groups), n_prompts)
+                    # Streaming: inject up to each env's share of this batch and
+                    # quota-route the fresh pulls to the per-env residual
+                    # (_pull_fresh_balanced below), so every trained batch keeps
+                    # the layout's env mix while the backlog drains. The pipeline
+                    # buffers across iterations, so the surplus stays queued; the
+                    # balanced path stays engaged until the restored buckets AND
+                    # the overflow buffer are both empty, after which the steady
+                    # state is byte-for-byte the pre-bank behavior.
+                    if any(runtime_state.restored_groups.values()) or any(
+                        runtime_state.fresh_overflow.values()
+                    ):
+                        inject_by_env, residual_per_env = _plan_restore_injection(
+                            target, runtime_state.restored_groups
+                        )
+                        for env, count in inject_by_env.items():
+                            dq = runtime_state.restored_groups.get(env)
+                            for _ in range(count):
+                                inject.append(dq.popleft())
                 else:
                     # The non-streaming pipeline is a persistent singleton that
                     # generates and consumes whole trainer batches (enforced by
                     # assert_no_inflight_rollouts); a partial injection would leave
                     # its current batch partially consumed at the iteration
-                    # boundary forever after. Inject in full batches only; a
-                    # smaller remainder stays banked (and queued in
-                    # restored_groups) rather than being trained.
-                    take = n_prompts if len(runtime_state.restored_groups) >= n_prompts else 0
-                inject = [runtime_state.restored_groups.popleft() for _ in range(take)]
+                    # boundary forever after. Inject whole batches only — and only
+                    # when the restored buckets can fill every env's layout target,
+                    # so an injected batch carries the same env mix as a generated
+                    # one. Anything less stays banked for a later resume.
+                    if all(
+                        len(runtime_state.restored_groups.get(env, ())) >= tgt
+                        for env, tgt in target.items()
+                    ):
+                        for env, tgt in target.items():
+                            dq = runtime_state.restored_groups.get(env)
+                            for _ in range(tgt):
+                                inject.append(dq.popleft())
             n_fresh = n_prompts - len(inject)
 
             with nvtx_range("rl/inference-setup", time=True):
@@ -914,13 +1064,23 @@ def colocated_inference(
                         logging.INFO,
                         f"Collecting rollouts, Iteration {args.curr_iteration}...",
                     )
-                    fresh = [
-                        loop.run_until_complete(anext(rollout_generator)) for _ in range(n_fresh)
-                    ]
+                    # Streaming with a restore backlog: quota-route the stream to
+                    # the per-env residual, buffering over-quota groups (still
+                    # in-flight) for a later step. Otherwise pull n_fresh groups
+                    # in completion order.
+                    if args.rl_partial_rollouts and residual_per_env is not None:
+                        fresh = _pull_fresh_balanced(
+                            loop, rollout_generator, residual_per_env,
+                            runtime_state.fresh_overflow,
+                        )
+                    else:
+                        fresh = _pull_fresh_inorder(loop, rollout_generator, n_fresh)
                     # These groups are now consumed into the training batch: they
                     # leave the in-flight set (decrement here, where consumption is final,
                     # so buffered groups awaiting their batch peers stay counted).
-                    # Injected groups were never in this process's in-flight set.
+                    # Injected groups were never in this process's in-flight set;
+                    # overflow groups drained above were add_inflight'd on their
+                    # original pull and are decremented here when finally consumed.
                     for group in fresh:
                         remove_inflight(len(group))
                     if not args.rl_partial_rollouts:

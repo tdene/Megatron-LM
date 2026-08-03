@@ -1,6 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import deque
+from typing import TypeAlias
+
 from pydantic import BaseModel
+
+#: An environment identifier, as reported by an agent's ``env_id`` attribute
+#: (see ``WeightedMultiTask._rollout_env_ids``).
+EnvId: TypeAlias = str
+
+#: Maps each ``EnvId`` to a number of rollout groups for that env (e.g. the
+#: per-batch generation target used to weight-balance restored bank groups).
+GroupsPerEnv: TypeAlias = dict[EnvId, int]
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -57,3 +68,8 @@ class RolloutGroup(AgentBaseModel):
 
 
 GroupedRollouts = list[RolloutGroup]
+
+#: Maps each ``EnvId`` to a FIFO queue of completed ``RolloutGroup``s for that env.
+#: Used by the durable rollout bank to bucket restored groups (and buffer streaming
+#: overflow) per env so injection can respect per-env weight targets.
+GroupQueuesPerEnv: TypeAlias = dict[EnvId, deque[RolloutGroup]]

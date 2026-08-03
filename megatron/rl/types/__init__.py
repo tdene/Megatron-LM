@@ -1,10 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from .rollout import AgentBaseModel, GroupedRollouts, Rollout, RolloutGroup, Rollouts, TokenRollout
+from .rollout import (
+    AgentBaseModel,
+    EnvId,
+    GroupedRollouts,
+    GroupQueuesPerEnv,
+    GroupsPerEnv,
+    Rollout,
+    RolloutGroup,
+    Rollouts,
+    TokenRollout,
+)
 
 __all__ = [
     "AgentBaseModel",
+    "EnvId",
     "GroupedRollouts",
+    "GroupQueuesPerEnv",
+    "GroupsPerEnv",
     "Rollout",
     "RolloutGroup",
     "Rollouts",

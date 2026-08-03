@@ -317,6 +317,7 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
         monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", None)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", None)
         monkeypatch.setattr(rl_utils, "get_agent", lambda _args: agent)
         monkeypatch.setattr(rl_utils, "RolloutPipeline", FakePipeline)
 
@@ -392,15 +393,23 @@ class TestRLUtils:
         expected_fresh_pulls,
     ):
         """Restart injection: the persistent pipeline always keeps the trainer batch
-        size; only this collection's fresh pulls shrink. Streaming injects any
-        share (the pipeline buffers across iterations); non-streaming injects in
+        size; only this collection's fresh pulls shrink. Streaming injects up to
+        each env's layout share and quota-routes the fresh pulls to the residual
+        (single env here, so the cap degenerates to the batch size; multi-env
+        balancing is covered by TestRestoreBalancing); non-streaming injects in
         full batches only, so its whole-batch boundary invariant holds."""
         n_prompts = 8
-        restored = [
-            RolloutGroup(rollouts=[], uid=f"restored-{i}") for i in range(restored_count)
-        ]
-        generated = [RolloutGroup(rollouts=[], uid=f"fresh-{i}") for i in range(n_prompts)]
-        runtime_state = SimpleNamespace(bank_restored=False, restored_groups=deque())
+
+        def group(uid):
+            return RolloutGroup(
+                rollouts=[Rollout(trajectory=["x"], reward=0.0, env_id="test")], uid=uid
+            )
+
+        restored = [group(f"restored-{i}") for i in range(restored_count)]
+        generated = [group(f"fresh-{i}") for i in range(n_prompts)]
+        runtime_state = SimpleNamespace(
+            bank_restored=False, restored_groups={}, fresh_overflow={}
+        )
 
         class RecordingBank:
             def __init__(self):
@@ -461,6 +470,8 @@ class TestRLUtils:
         )
         monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: runtime_state)
         monkeypatch.setattr(rl_utils, "maybe_get_rollout_bank", lambda _args: bank)
+        # Single-env agent: the per-env target degenerates to {"test": n_prompts}.
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", SimpleNamespace(env_id="test"))
         monkeypatch.setattr(rl_utils, "get_rollout_generator", get_rollout_generator)
         monkeypatch.setattr(rl_utils, "remove_inflight", lambda _count: None)
         monkeypatch.setattr(rl_utils, "assert_no_inflight_rollouts", lambda _pipeline: None)
@@ -494,8 +505,13 @@ class TestRLUtils:
         assert bank.set_collections == [args.curr_iteration]
         # Everything handed to the trainer is marked consumed at this iteration;
         # uninjected restored groups stay queued for later collections.
-        assert bank.consumed == [(group.uid, args.curr_iteration) for group in rollouts]
-        assert len(runtime_state.restored_groups) == restored_count - expected_injected
+        assert bank.consumed == [(g.uid, args.curr_iteration) for g in rollouts]
+        assert (
+            sum(len(dq) for dq in runtime_state.restored_groups.values())
+            == restored_count - expected_injected
+        )
+        # Single env, so quota routing never buffers anything.
+        assert not any(runtime_state.fresh_overflow.values())
 
     def test_banked_path_marks_consumption(self, monkeypatch):
         """Groups consumed without inference (can_skip_inference) still get their

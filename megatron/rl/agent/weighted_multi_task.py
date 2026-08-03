@@ -4,7 +4,7 @@ import asyncio
 import logging
 from typing import Any, Optional, Type
 
-from .registry import get_agent_class
+from ..types import GroupsPerEnv
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -19,6 +19,7 @@ from .api import (
     RolloutGenerator,
     RolloutRequest,
 )
+from .registry import get_agent_class
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +140,12 @@ class WeightedMultiTask(
             for config in self.agent_configs
         ]
 
-    def rollout_group_layout(self, num_groups: int) -> list[int]:
-        """Constant per-batch groups for each weighted env, in env order.
+    def _layout_counts(self, num_groups: int) -> list[int]:
+        """Pure per-env layout computation (no logging, no metrics snapshot).
 
-        Weights that cannot be realized as an integer split of the batch are rounded with a warning.
+        The computation half of ``rollout_group_layout``, shared with
+        ``env_group_targets`` so per-iteration target computation cannot spam
+        the layout warning or clobber ``latest_distribution``.
         """
         num_envs = len(self._rollout_agents)
         if num_groups < num_envs:
@@ -165,6 +168,38 @@ class WeightedMultiTask(
             )
             counts[zero] += 1
             counts[donor] -= 1
+        return counts
+
+    def env_group_targets(self, total_count: int) -> GroupsPerEnv:
+        """Per-env group counts for a full batch of ``total_count`` groups, keyed by env_id.
+
+        Sums the actual generation layout (``_layout_counts``, including its
+        min-one-group bump for rounding zeros) by env_id, merging agents that
+        share an env_id, so the rollout-bank restore-injection target equals
+        exactly what the pipeline produces per batch. Requires a real ``env_id``
+        on every weighted agent: restored bank groups are bucketed by the env_id
+        stamped on their rollouts, which can never match a positional fallback
+        name, and a silent mismatch would starve or skew the injection quotas.
+        """
+        for idx, agent in enumerate(self._rollout_agents):
+            if not getattr(agent, "env_id", None):
+                raise ValueError(
+                    f"Weighted agent {idx} ({type(agent).__name__}) has no env_id; it is "
+                    f"required to weight-balance restored rollout-bank groups by env. Set "
+                    f"env_id on every weighted agent in the environment config."
+                )
+        target: GroupsPerEnv = {}
+        for eid, count in zip(self._rollout_env_ids, self._layout_counts(total_count)):
+            target[eid] = target.get(eid, 0) + count
+        return target
+
+    def rollout_group_layout(self, num_groups: int) -> list[int]:
+        """Constant per-batch groups for each weighted env, in env order.
+
+        Weights that cannot be realized as an integer split of the batch are rounded with a warning.
+        """
+        exact = [weight * num_groups for weight in self._rollout_weights]
+        counts = self._layout_counts(num_groups)
         if any(abs(count - target) > 1e-9 for count, target in zip(counts, exact)):
             logger.warning(
                 "WeightedMultiTask weights changed to fit num_groups=%d: %s",
