@@ -4,10 +4,13 @@ import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
+    ColumnParallelLinear,
     linear_with_frozen_weight,
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -200,3 +203,139 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     )
 
     Utils.destroy_model_parallel()
+
+
+def test_linear_out_buffer_writes_gemm_result_in_place():
+    """`out=` writes the GEMM result directly into the caller's buffer and returns it;
+    misuse (grad enabled, conflicting output_dtype, wrong shape) is rejected."""
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        with torch.inference_mode():
+            input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(4, 1, 32, device="cuda", dtype=torch.bfloat16)
+            output = linear_with_grad_accumulation_and_async_allreduce(
+                input_data, weight, None, False, False, False, tp_group=None, out=out
+            )
+            reference = torch.nn.functional.linear(input_data, weight)
+
+            assert output.data_ptr() == out.data_ptr()
+            assert output.dtype == torch.bfloat16
+            torch.testing.assert_close(output, reference)
+
+            with pytest.raises(ValueError, match="output_dtype"):
+                linear_with_grad_accumulation_and_async_allreduce(
+                    input_data,
+                    weight,
+                    None,
+                    False,
+                    False,
+                    False,
+                    tp_group=None,
+                    output_dtype=torch.float32,
+                    out=out,
+                )
+
+            with pytest.raises(ValueError, match="shape"):
+                linear_with_grad_accumulation_and_async_allreduce(
+                    input_data,
+                    weight,
+                    None,
+                    False,
+                    False,
+                    False,
+                    tp_group=None,
+                    out=torch.empty(4, 1, 33, device="cuda", dtype=torch.bfloat16),
+                )
+
+        grad_input = torch.randn(4, 1, 16, device="cuda", requires_grad=True)
+        grad_weight = torch.randn(32, 16, device="cuda", requires_grad=True)
+        with pytest.raises(RuntimeError, match="grad"):
+            linear_with_grad_accumulation_and_async_allreduce(
+                grad_input,
+                grad_weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                out=torch.empty(4, 1, 32, device="cuda"),
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+)
+def test_linear_out_buffer_fp32_output_matches_no_buffer_path():
+    Utils.initialize_model_parallel(1, 1)
+
+    try:
+        with torch.inference_mode():
+            input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+            weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(4, 1, 32, device="cuda", dtype=torch.float32)
+            buffered = linear_with_grad_accumulation_and_async_allreduce(
+                input_data, weight, None, False, False, False, tp_group=None, out=out
+            )
+            unbuffered = linear_with_grad_accumulation_and_async_allreduce(
+                input_data,
+                weight,
+                None,
+                False,
+                False,
+                False,
+                tp_group=None,
+                output_dtype=torch.float32,
+            )
+
+        # Same TE kernel with and without a preallocated destination: bitwise identical.
+        assert buffered.data_ptr() == out.data_ptr()
+        assert buffered.dtype == torch.float32
+        assert torch.equal(
+            buffered.contiguous().view(torch.int32), unbuffered.contiguous().view(torch.int32)
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_linear_out_buffer_writes_vocab_parallel_shard():
+    """At TP>1 with no output gather, `out=` receives this rank's output shard — the
+    contract vocab-parallel (never-gather) consumers rely on. Combining `out=` with an
+    output gather is rejected, since the GEMM result is not the layer's final output."""
+    Utils.initialize_model_parallel(8, 1)
+
+    try:
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=4, params_dtype=torch.bfloat16
+        )
+        layer = ColumnParallelLinear(
+            input_size=16,
+            output_size=64,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            config=config,
+            skip_bias_add=False,
+        )
+        shard_width = layer.weight.shape[0]
+        assert layer.tp_group.size() > 1
+        assert shard_width * layer.tp_group.size() == 64
+
+        with torch.inference_mode():
+            input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+            out = torch.empty(4, 1, shard_width, device="cuda", dtype=torch.bfloat16)
+            output, _ = layer(input_data, out=out)
+            reference, _ = layer(input_data)
+
+            assert output.data_ptr() == out.data_ptr()
+            assert output.shape[-1] == shard_width
+            torch.testing.assert_close(output, reference)
+
+            with pytest.raises(ValueError, match="gather"):
+                layer(input_data, runtime_gather_output=True, out=out)
+    finally:
+        Utils.destroy_model_parallel()
