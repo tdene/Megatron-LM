@@ -6,6 +6,7 @@ import gc
 
 # Keep this to make the env registered.
 import itertools
+import hashlib
 import json
 import logging
 import math
@@ -1968,6 +1969,30 @@ def compute_group_stats(
 
 
 
+def _bounded_artifact_key(key, limit=100):
+    """Bound a fully-qualified metric key to wandb's artifact-name limit.
+
+    wandb backs any Table/plot value with an artifact named
+    `run-<run_id>-<sanitized key>_table` and hard-raises above 128 characters.
+    The `run-<run_id>-` prefix and `_table` suffix cost ~19 characters that the
+    caller never sees, so the key itself must stay well under 128; 100 leaves
+    margin. Sanitization only strips characters (`:`, `/`), so bounding the raw
+    key is always conservative.
+
+    Apply this to the FINAL key, after every prefix is attached. Bounding an
+    inner key before a long `env_id` is prepended does nothing -- that mistake
+    let a 128-char ValueError kill f0d3 on all three links (fork, 2026-07-26).
+
+    Truncate deterministically and append a short hash so distinct metrics keep
+    distinct keys. Short keys are returned unchanged.
+    (port of fork 5ef736978cef3a3a5a82ddb3e2d33aebe2607f09, wandb hunks only)
+    """
+    if len(key) <= limit:
+        return key
+    digest = hashlib.md5(key.encode()).hexdigest()[:8]
+    return f'{key[: limit - 9]}_{digest}'
+
+
 def prep_wandb_metrics(
         wandb_writer: wandb_run.Run,
         traj_lens: List[List[int]],
@@ -2075,7 +2100,7 @@ def prep_wandb_metrics(
             f'{prefix}/p50': float(np.percentile(arr, 50)),
             f'{prefix}/p90': float(np.percentile(arr, 90)),
             f'{prefix}/p99': float(np.percentile(arr, 99)),
-            f'{prefix}_hist': wandb_writer.plot.histogram(
+            _bounded_artifact_key(f'{prefix}_hist'): wandb_writer.plot.histogram(
                 wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
                 'value', title,
             ),
@@ -2408,7 +2433,20 @@ def maybe_log_training_metrics(
             tokenizer=tokenizer,
         )
         for k, v in env_metrics.items():
-            metrics[f"{env_id}_{k}"] = v
+            # Bound the key AFTER the env prefix, not before: inner helpers only
+            # ever see the short local key (e.g. 'staleness/kv_cache/first_hist');
+            # the long env_id prepended right here is what actually blows wandb's
+            # 128-char artifact-name limit. On the fork, bounding early never
+            # fired and f0d3 rank 63 raised the artifact ValueError at log time
+            # on all three links — one rank exit(1)s, KillOnBadExit tears down
+            # the other 63, and their crash files all read as cudaErrorContained
+            # (a fake NVLink fault). Only Table/plot-backed values become
+            # artifacts; plain scalars have no length limit, so those keys stay
+            # fully readable.
+            full_key = f"{env_id}_{k}"
+            if not isinstance(v, (int, float, bool)):
+                full_key = _bounded_artifact_key(full_key)
+            metrics[full_key] = v
 
     # Per-pipeline instrumentation (queue sizes, gate state, per-stage
     # timings) and the multi-task work distribution, collected on rank 0

@@ -163,6 +163,32 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
+def test_bounded_artifact_key_bounds_final_keys():
+    """Port of fork 5ef736978 (wandb hunks): keys at or under the limit pass
+    through untouched; longer keys bound to <= limit with a deterministic
+    hash suffix so distinct metrics keep distinct keys. The bound must be
+    applied to the FINAL env-prefixed key — the pre-prefix variant never
+    fired and the 128-char artifact ValueError killed fork f0d3 on all
+    three links."""
+    from megatron.rl.rl_utils import _bounded_artifact_key
+
+    short = "nemo_gym:mcqa_reward_hist"
+    assert _bounded_artifact_key(short) == short
+
+    long_a = (
+        "nemo_gym:toolcall_schema_single_step_tool_use_with_argument_"
+        "comparison_agent_staleness/kv_cache/first_hist"
+    )
+    long_b = long_a + "_second"
+    assert len(long_a) > 100
+    bound_a = _bounded_artifact_key(long_a)
+    bound_b = _bounded_artifact_key(long_b)
+    assert len(bound_a) <= 100 and len(bound_b) <= 100
+    assert bound_a != bound_b
+    assert bound_a == _bounded_artifact_key(long_a)
+    assert bound_a.startswith(long_a[:80])
+
+
 class TestRLUtils:
     """Test class for RL utilities."""
 
