@@ -125,6 +125,38 @@ class FilteringMockGenerator(MockGenerator):
         return GroupRolloutParams(run_episode=params.run_episode, build_rollout=build_rollout)
 
 
+class PlaceholderMockGenerator(MockGenerator):
+    """First `num_placeholder` prepared groups contain empty-trajectory members.
+
+    placeholder_members bounds how many members of each affected group come
+    back empty (None => every member). Mirrors mrl-side placeholder emission:
+    failed episodes keep the group rectangular with empty trajectories.
+    """
+
+    def __init__(self, num_placeholder=0, placeholder_members=None, **kwargs):
+        super().__init__(**kwargs)
+        self.num_placeholder = num_placeholder
+        self.placeholder_members = placeholder_members
+
+    async def prepare_group_rollout(self, request, env_index: int = 0):
+        idx = self._call_count
+        params = await super().prepare_group_rollout(request, env_index=env_index)
+        make_placeholder = idx < self.num_placeholder
+        member_counter = itertools.count()
+        base_build = params.build_rollout
+
+        async def build_rollout(episode):
+            rollout = await base_build(episode)
+            member = next(member_counter)
+            if make_placeholder and (
+                self.placeholder_members is None or member < self.placeholder_members
+            ):
+                rollout.trajectory = []
+            return rollout
+
+        return GroupRolloutParams(run_episode=params.run_episode, build_rollout=build_rollout)
+
+
 class CountingRewardAgent(RewardOnlyAgent):
     """Minimal RewardOnlyAgent: prompts t0, t1, ... and reward = echoed index."""
 
@@ -524,6 +556,101 @@ class TestGroupedRollouts:
             # All degenerate prepares were dropped (and replaced) by now: the
             # collected batches could not have completed otherwise.
             assert pipeline.filtered_count == num_degenerate
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "submission_granularity, consumption_granularity, num_placeholder, placeholder_members",
+        [
+            pytest.param("B", "B", 3, None, id="batch_all_placeholder"),
+            pytest.param("G", "G", 3, None, id="group_all_placeholder"),
+            pytest.param("B", "B", 3, 1, id="batch_single_placeholder_member"),
+            pytest.param("B", "B", 9, None, id="cascading_refill"),
+        ],
+    )
+    async def test_placeholder_groups_are_refilled(
+        self,
+        submission_granularity,
+        consumption_granularity,
+        num_placeholder,
+        placeholder_members,
+    ):
+        """Groups containing ANY empty-trajectory placeholder are dropped and
+        regenerated in place (port of the fork's 1a68ffcb9c refill): the
+        trainer only ever consumes fully-real groups, batch-order consumption
+        sees complete ordered batches, and the refill counter matches the
+        placeholder prepares exactly. Unconditional — no filter flag set."""
+        num_groups = 4
+        gen = PlaceholderMockGenerator(
+            num_placeholder=num_placeholder, placeholder_members=placeholder_members
+        )
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity=submission_granularity,
+            consumption_granularity=consumption_granularity,
+        )
+        expected_count = 2 * num_groups
+        groups = []
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1)
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if len(groups) >= expected_count:
+                    break
+
+            assert len(groups) == expected_count
+            for group in groups:
+                for rollout in group:
+                    assert rollout.trajectory, "placeholder reached the consumer"
+            if consumption_granularity == "B":
+                assert [g.batch_id for g in groups] == sorted(g.batch_id for g in groups)
+                for batch_start in range(0, expected_count, num_groups):
+                    batch = groups[batch_start : batch_start + num_groups]
+                    assert sorted(g.index_in_batch for g in batch) == list(range(num_groups))
+            assert pipeline.refilled_placeholder_groups == num_placeholder
+            assert pipeline.filtered_count == 0
+
+    @pytest.mark.asyncio
+    async def test_placeholder_groups_are_never_banked(self):
+        """The durable bank must not record dropped placeholder groups: a banked
+        placeholder would be restored after a walltime kill and crash the
+        successor exactly like the live crash it replaces."""
+
+        class RecordingBank:
+            def __init__(self):
+                self.appended = []
+
+            def set_collection(self, iteration):
+                pass
+
+            def append(self, group):
+                self.appended.append(group)
+                return len(self.appended)
+
+        bank = RecordingBank()
+        gen = PlaceholderMockGenerator(num_placeholder=2)
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        groups = []
+        pipeline = RolloutPipeline(
+            gen, request, parallel_generation_tasks=1, durable_bank=bank
+        )
+        async with aclosing(pipeline.run()) as iterator:
+            async for group in iterator:
+                groups.append(group)
+                if len(groups) >= 4:
+                    break
+        assert pipeline.refilled_placeholder_groups == 2
+        assert len(bank.appended) >= 4
+        for banked in bank.appended:
+            for rollout in banked.rollouts:
+                assert rollout.trajectory, "placeholder group reached the bank"
 
     @pytest.mark.asyncio
     async def test_rollout_submission_granularity_limits_inference_concurrency(self):

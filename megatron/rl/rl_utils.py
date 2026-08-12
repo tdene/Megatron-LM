@@ -2238,6 +2238,9 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_inferred_count": pipeline.inferred_count,
         "rollout_pipeline_assembled_count": pipeline.assembled_count,
         "rollout_pipeline_filtered_count": pipeline.filtered_count,
+        "rollout_pipeline_refilled_placeholder_groups": (
+            pipeline.refilled_placeholder_groups
+        ),
         "rollout_pipeline_yielded_count": pipeline.yielded_count,
     })
     for name, samples in (
@@ -2276,6 +2279,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
     pipeline.filtered_count = 0
+    pipeline.refilled_placeholder_groups = 0
     pipeline.yielded_count = 0
     num_envs = len(pipeline.gran_policy.num_groups_per_env)
     pipeline.prepared_groups_per_env = [0] * num_envs

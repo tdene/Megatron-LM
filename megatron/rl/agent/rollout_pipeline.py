@@ -3,6 +3,7 @@
 """Caller-owned orchestration of grouped rollout generation over an agent."""
 
 import asyncio
+import logging
 import time
 from collections import deque
 from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
@@ -20,6 +21,8 @@ from ..rollout_granularity import (
     SubmissionGranularity,
 )
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..rollout_bank import RolloutBank
@@ -303,6 +306,7 @@ class RolloutPipeline:
         self.inferred_count = 0
         self.assembled_count = 0
         self.filtered_count = 0
+        self.refilled_placeholder_groups = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
@@ -518,8 +522,27 @@ class RolloutPipeline:
                 if assembled.assembled_at:
                     self.filter_queue_dwell.append(dequeued_at - assembled.assembled_at)
                 group = assembled.group
-                if self._should_drop(group):
-                    self.filtered_count += 1
+                _placeholder = self._is_placeholder_group(group)
+                if _placeholder or self._should_drop(group):
+                    if _placeholder:
+                        self.refilled_placeholder_groups += 1
+                        if (
+                            self.refilled_placeholder_groups == 1
+                            or self.refilled_placeholder_groups % 32 == 0
+                        ):
+                            logger.warning(
+                                "RolloutPipeline: refilling placeholder group "
+                                "(batch %s slot %s, env %s) — %d refilled so far. "
+                                "Failed episodes are being regenerated instead of "
+                                "crashing the trainer; a climbing count means the "
+                                "gym/episodes are failing upstream.",
+                                group.batch_id,
+                                group.index_in_batch,
+                                self.gran_policy.env_of_index(group.index_in_batch),
+                                self.refilled_placeholder_groups,
+                            )
+                    else:
+                        self.filtered_count += 1
                     # Balance add_inflight: a dropped group is never consumed.
                     remove_inflight(self.request.rollouts_per_group)
                     # G/E/B gate slots free on consumption, which a dropped group
@@ -558,6 +581,22 @@ class RolloutPipeline:
                 self._maybe_close_intake()
         finally:
             self.output_queue.shutdown()
+
+    def _is_placeholder_group(self, group: RolloutGroup) -> bool:
+        """True when ANY member is an empty-trajectory infrastructure placeholder.
+
+        Failed episodes come back as rectangular placeholders so group shapes
+        stay intact; a single one poisons the whole group: GRPO's group stats
+        need a complete real cohort, and trajectory prep hard-fails on an
+        empty trajectory (rl_utils prepare_trajectories, rollout.trajectory[-1]
+        — the kicker4b 2026-08-11 16-node crash, 65 ranks at once). Port of
+        the fork's 1a68ffcb9c refill with a deliberate deviation: the fork
+        dropped only ALL-placeholder groups/batches because its batch path
+        could not backfill holes; this pipeline regenerates in place
+        (batch_id/index_in_batch inherited), so any-placeholder is the safer
+        predicate at every consumption granularity.
+        """
+        return any(not getattr(rollout, "trajectory", None) for rollout in group.rollouts)
 
     def _should_drop(self, group: RolloutGroup) -> bool:
         """A group with zero reward variance carries no learning signal."""
