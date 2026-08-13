@@ -12,6 +12,7 @@ tuned parameters (before CUDA-graph capture).
 
 import bisect
 import gc
+import json
 import logging
 import math
 import statistics
@@ -27,6 +28,46 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.utils import get_pg_size
+
+
+def _emit_data(enabled: bool, record: str, **fields) -> None:
+    """Emit one machine-readable ``AUTOTUNE_DATA`` record.
+
+    GPU-validation graphs are built by grepping ``AUTOTUNE_DATA `` out of the
+    run log and json-parsing the remainder, so keep records flat, one line
+    each, and unit-suffixed (``_bytes``, ``_count``). ``enabled`` carries the
+    caller's rank-0 / verbose gate.
+    """
+    if enabled:
+        logging.info("AUTOTUNE_DATA %s", json.dumps({"record": record, **fields}))
+
+
+def _emit_context_record(enabled: bool, phase: str, context) -> None:
+    """Emit the per-context memory census as an ``AUTOTUNE_DATA`` record."""
+    if not enabled:
+        return
+    cats = context.owned_cuda_tensor_bytes()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    _emit_data(
+        True,
+        "context",
+        phase=phase,
+        max_requests=context.max_requests,
+        max_tokens=context.max_tokens,
+        max_sequence_length=context.max_sequence_length,
+        pool_size_blocks=context.kv_block_allocator.pool_size,
+        paused_limit_blocks=context.kv_block_allocator.paused_limit,
+        kv_cache_bytes=cats["kv_cache"],
+        mamba_bytes=cats["mamba"],
+        per_request_meta_bytes=cats["per_request"],
+        per_token_meta_bytes=cats["per_token"],
+        other_bytes=cats["other"],
+        nvls_buffer_bytes=context._nvls_buffer_bytes,
+        device_total_bytes=total_bytes,
+        device_free_bytes=free_bytes,
+        torch_allocated_bytes=torch.cuda.memory_allocated(),
+        torch_reserved_bytes=torch.cuda.memory_reserved(),
+    )
 
 
 @dataclass
@@ -561,6 +602,38 @@ class AutotuneProfile:
                 blocks_per_request, extra_blocks, derived_paused,
                 pinned=pinned_max_requests is not None,
             )
+        _emit_data(
+            verbose,
+            "solve",
+            blocks_per_request=blocks_per_request,
+            pinned=pinned_max_requests is not None,
+            runtime_overhead_per_request_bytes=self.runtime_overhead_per_request,
+            memory_after_model_load_bytes=self.memory_after_model_load_bytes,
+            **self.last_solve_breakdown,
+        )
+        if verbose:
+            # Budget landscape for the validation graphs: every cost term at
+            # candidate max_requests values, from the alignment floor up to
+            # ~1.5x the chosen value so the infeasible region is visible.
+            curve_points = sorted({
+                max(alignment, (max_requests * i // 20 // alignment) * alignment)
+                for i in range(1, 31)
+            })
+            for r in curve_points:
+                bd = self._cost_breakdown(
+                    prefill_table, decode_table, r, blocks_per_request,
+                    paused_block_estimate, spec_factor, tr, tp_size,
+                )
+                total = sum(bd[term] for term in self._COST_TERMS)
+                _emit_data(
+                    True,
+                    "cost_curve",
+                    candidate_max_requests=r,
+                    total_bytes=total,
+                    gpu_free_bytes=gpu_free,
+                    feasible=total <= gpu_free,
+                    **bd,
+                )
 
         return max_requests, max_tokens, buffer_size_gb
 
@@ -687,6 +760,25 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             "=======================================================================",
         ]
         logging.info("\n".join(lines))
+        _emit_data(
+            True,
+            "validation",
+            predicted=prediction,
+            actual_pool_reserved_bytes=int(pool_reserved),
+            actual_pool_allocated_bytes=int(stats.get("pool_allocated_bytes", 0)),
+            capture_time_s=stats.get("time", 0),
+            actual_kv_cache_bytes=cats["kv_cache"],
+            actual_mamba_bytes=cats["mamba"],
+            actual_request_metadata_bytes=per_req_meta * context.max_requests,
+            actual_token_metadata_bytes=per_tok_meta * context.max_tokens,
+            actual_nvls_buffer_bytes=context._nvls_buffer_bytes,
+            actual_sampling_bytes=int(sampling_bytes),
+            actual_other_bytes=cats["other"],
+            device_total_bytes=total_bytes,
+            device_free_bytes=free_bytes,
+            tuned_max_requests=context.max_requests,
+            tuned_max_tokens=context.max_tokens,
+        )
 
     # ---- autotune sub-steps ------------------------------------------------
 
@@ -821,15 +913,44 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         input_ids, position_ids, _ = controller._dynamic_step_context_init()
         with torch.inference_mode():
             controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+        # Second (workspace-warm) pass, measured: a floor sample at the
+        # bootstrap context's max_tokens. Together with the sweep's smallest
+        # sample on the profiling context — which is pinned to a different
+        # max_tokens — this gives two per-forward-floor measurements at two
+        # max_tokens values in every run.
+        self.context.reset()
+        self.context.add_dummy_requests_parallel(dummy)
+        input_ids, position_ids, _ = controller._dynamic_step_context_init()
+        baseline_bytes = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        with torch.inference_mode():
+            controller._dynamic_step_forward_logits(input_ids, position_ids)
+        torch.cuda.synchronize()
+        warmup_activation = torch.cuda.max_memory_allocated() - baseline_bytes
         self.context.reset()
 
         if rank == 0:
             free, _ = torch.cuda.mem_get_info()
             logging.info(
-                "Autotune: workspace warmup done. Free memory: %.1f GB",
+                "Autotune: workspace warmup done. Free memory: %.1f GB "
+                "(floor sample: %.1f MB at max_tokens=%d)",
                 free / (1024 ** 3),
+                warmup_activation / (1024 ** 2),
+                self.context.max_tokens,
             )
             logging.info("Autotune: bootstrap context:\n%s", self.context.memory_report())
+        _emit_data(
+            rank == 0,
+            "sample",
+            phase="bootstrap",
+            step_type="prefill",
+            token_count=warmup_tokens,
+            num_requests=1,
+            activation_bytes=int(warmup_activation),
+            context_max_tokens=self.context.max_tokens,
+        )
+        _emit_context_record(rank == 0, "bootstrap", self.context)
 
     def _build_profiling_context_and_profile(
         self, model_config, old_config, controller,
@@ -877,11 +998,17 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             0.1, (profiling_max_requests * per_req_bytes * 1.05) / (1024 ** 3),
         )
 
+        # Pin the profiling max_tokens to the sweep's needs instead of the
+        # 16384 default: sized tight for the sweep, and — because the
+        # bootstrap runs at the default — every run measures the per-forward
+        # floor at two different max_tokens values (the floor hypothesis:
+        # fixed per-step buffers scale with the context's max_tokens).
+        profiling_max_tokens = DynamicInferenceContext.round_up_tokens(profiling_max_requests)
         profiling_config = replace(
             old_config,
             buffer_size_gb=profiling_buffer_gb,
             max_requests=profiling_max_requests,
-            max_tokens=None,
+            max_tokens=profiling_max_tokens,
             autotune=False,
             static_kv_memory_pointers=False,
             mamba_memory_ratio=None,
@@ -905,6 +1032,7 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 context.max_requests, profiling_buffer_gb, free_after_ctx / (1024 ** 3),
             )
             logging.info("Autotune: profiling context:\n%s", context.memory_report())
+        _emit_context_record(rank == 0, "profiling", context)
 
         # Measure per-request / per-token metadata empirically.
         per_request_metadata, per_token_metadata = context.measure_metadata_bytes()
@@ -921,6 +1049,20 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             get_pg_size(context.expert_model_parallel_group)
             if context._nvls_dispatcher
             else 0
+        )
+        _emit_data(
+            rank == 0,
+            "constants",
+            block_size_bytes=context.block_size_bytes,
+            block_size_tokens=old_config.block_size_tokens,
+            mamba_per_request_bytes=context.mamba_states_memory_per_request,
+            per_request_metadata_bytes=per_request_metadata,
+            per_token_metadata_bytes=per_token_metadata,
+            max_sequence_length=old_config.max_sequence_length,
+            tp_size=tp_size,
+            ep_size=get_pg_size(context.expert_model_parallel_group),
+            nvls_active=bool(nvls_ep_size),
+            gpu_total_bytes=gpu_total,
         )
         profile = AutotuneProfile(
             gpu_total_bytes=gpu_total,
@@ -1002,14 +1144,11 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         )
         prefill_tcs = _geometric_sweep(sweep_upper)
 
-        # A few representative batch sizes suffice for decode (runtime
-        # overhead measurement only — activations come from prefill).
-        if len(prefill_tcs) <= 5:
-            decode_tcs = prefill_tcs
-        else:
-            step = (len(prefill_tcs) - 1) / 4
-            indices = sorted({int(round(i * step)) for i in range(5)})
-            decode_tcs = [prefill_tcs[i] for i in indices]
+        # Decode runs the full ladder too: the decode table (and the
+        # activation-vs-requests data it yields) is per-request-linear with a
+        # knee, and a dense curve both tightens the solve's interpolation and
+        # feeds the validation graphs. Decode forwards are cheap.
+        decode_tcs = prefill_tcs
 
         if rank == 0:
             logging.info(
@@ -1078,6 +1217,16 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                     "Autotune: %s sample tc=%d: forward activation %.1f MB",
                     kind, tc, fwd_activation / (1024 ** 2),
                 )
+            _emit_data(
+                rank == 0,
+                "sample",
+                phase="profiling",
+                step_type=kind,
+                token_count=tc,
+                num_requests=1 if kind == "prefill" else tc,
+                activation_bytes=int(fwd_activation),
+                context_max_tokens=context.max_tokens,
+            )
 
             # Sampling overhead (decode only). Unguarded: if sampling cannot
             # run during profiling, the overhead measurement is broken, and a
@@ -1099,6 +1248,12 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                         sampling_peak / (1024 ** 2),
                         sampling_peak / tc / (1024 ** 2),
                     )
+                _emit_data(
+                    rank == 0,
+                    "sampling_overhead",
+                    num_requests=tc,
+                    overhead_bytes=int(sampling_peak),
+                )
 
             context.reset()
 
@@ -1196,6 +1351,26 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         self.reset()
 
         # CUDA graphs are built by the caller (create_cuda_graphs) after return.
+
+        # Cache scaling vs sequence length (arithmetic from measured
+        # constants): per-request KV grows in block quanta with the average
+        # sequence length, mamba state is flat — the "cache vs tokens" graph.
+        if rank == 0:
+            seq_step = max(block_size_tokens, old_config.max_sequence_length // 16)
+            for s in range(seq_step, old_config.max_sequence_length + 1, seq_step):
+                bpr_s = math.ceil(s / block_size_tokens)
+                _emit_data(
+                    True,
+                    "kv_curve",
+                    avg_seq_len=s,
+                    blocks_per_request=bpr_s,
+                    kv_bytes_per_request=bpr_s * profile.block_size_bytes,
+                    mamba_bytes_per_request=profile.mamba_memory_per_request,
+                    total_cache_bytes_per_request=(
+                        bpr_s * profile.block_size_bytes + profile.mamba_memory_per_request
+                    ),
+                )
+        _emit_context_record(rank == 0, "tuned", self.context)
 
         if rank == 0:
             logging.info("Autotune: tuned context:\n%s", self.context.memory_report())
