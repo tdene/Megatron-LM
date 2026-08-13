@@ -63,8 +63,9 @@ def _context_derive(profile, buffer_size_gb, paused_buffer_size_gb, max_requests
     """Independent mirror of DynamicInferenceContext's block-count derivation
     for a tuned config (max_requests set, mamba_memory_ratio=None).
 
-    Returns (block_count, paused_block_count) — the runtime allocator's
-    total_count and paused quota at unified_memory_level == 0.
+    Returns (block_count, paused_block_count) — at unified_memory_level == 0,
+    block_count is the allocator's pool_size (dummy block and paused retention
+    limit both inside it) and paused_block_count its paused_limit.
     """
     bs = profile.block_size_bytes
     buffer_bytes = int(buffer_size_gb * GB)
@@ -76,7 +77,7 @@ def _context_derive(profile, buffer_size_gb, paused_buffer_size_gb, max_requests
         ratio = mamba_needed / total
         buffer_bytes = int(buffer_bytes * (1.0 - ratio))
         paused_bytes = int(paused_bytes * (1.0 - ratio))
-    return buffer_bytes // bs, paused_bytes // bs
+    return max(2, buffer_bytes // bs), paused_bytes // bs
 
 
 def _actual_physical_bytes(

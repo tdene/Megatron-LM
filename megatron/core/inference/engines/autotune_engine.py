@@ -168,8 +168,10 @@ class AutotuneProfile:
         max_tokens = self._derive_max_tokens(max_requests, spec_factor, token_rounder)
         decode_tokens = max_requests * spec_factor
         cg_pool = self._cg_pool_cost(prefill_table, decode_table, decode_tokens, max_tokens)
-        # +1 block: the block allocator requires a free sentinel block at all
-        # times to satisfy allocation/free round-trips without fragmentation.
+        # +1 block: the allocator's pool includes a permanently-reserved dummy
+        # block (pool_avail = pool_size - 1), and the paused retention limit
+        # holds blocks inside the same pool — so full concurrency needs
+        # R x blocks_per_request usable blocks on top of both.
         min_blocks = max_requests * blocks_per_request + 1 + paused_block_estimate
 
         # EP>1 nvls MoE: symmetric staging buffers, sized by the context as
@@ -246,7 +248,11 @@ class AutotuneProfile:
         The tuned config always sets ``max_requests`` and clears
         ``mamba_memory_ratio``, so the context takes either the
         hybrid+max_requests branch (mamba carved proportionally from the
-        active and paused buffers) or the non-hybrid branch.
+        active and paused buffer inputs) or the non-hybrid branch; both floor
+        the result at 2 blocks (>= 1 usable + the dummy block). At
+        ``unified_memory_level == 0``, ``block_count`` becomes the allocator's
+        ``pool_size`` — the dummy block and the paused retention limit both
+        live inside it.
 
         Returns:
             (block_count, paused_block_count) as the context would derive.
@@ -259,10 +265,10 @@ class AutotuneProfile:
             mamba_ratio = mamba_memory_needed / total_memory
             scaled_buffer = int(buffer_bytes * (1.0 - mamba_ratio))
             scaled_paused = int(paused_buffer_bytes * (1.0 - mamba_ratio))
-            block_count = scaled_buffer // self.block_size_bytes
+            block_count = max(2, scaled_buffer // self.block_size_bytes)
             paused_block_count = scaled_paused // self.block_size_bytes
         else:
-            block_count = buffer_bytes // self.block_size_bytes
+            block_count = max(2, buffer_bytes // self.block_size_bytes)
             paused_block_count = paused_buffer_bytes // self.block_size_bytes
         return block_count, paused_block_count
 
@@ -648,8 +654,8 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             f"{mb(prediction['kv_blocks'] + prediction['extra_kv_bytes']):11.1f} MB "
             f"({prediction['block_count']} blocks, {prediction['paused_block_count']} paused) | "
             f"actual {mb(cats['kv_cache']):11.1f} MB "
-            f"({context.kv_block_allocator.total_count} blocks, "
-            f"{context.kv_block_allocator.paused_count} paused)",
+            f"({context.kv_block_allocator.pool_size} blocks, "
+            f"paused limit {context.kv_block_allocator.paused_limit})",
             f"  Request metadata: predicted {mb(prediction['request_metadata']):11.1f} MB | "
             f"actual {mb(per_req_meta * context.max_requests):11.1f} MB",
             f"  Token metadata:   predicted {mb(prediction['token_metadata']):11.1f} MB | "
