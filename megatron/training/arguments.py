@@ -1839,6 +1839,14 @@ def validate_args(args, defaults={}):
         assert args.transformer_impl == 'inference_optimized', (
             "--inference-dynamic-batching-autotune requires --transformer-impl=inference_optimized."
         )
+        if args.moe_pad_experts_for_cuda_graph_inference:
+            warn_rank_0(
+                'Disabling --moe-pad-experts-for-cuda-graph-inference '
+                '(incompatible with --transformer-impl=inference_optimized, which '
+                '--inference-dynamic-batching-autotune requires; the inference-optimized '
+                'stack masks CUDA-graph padding at the router instead).'
+            )
+            args.moe_pad_experts_for_cuda_graph_inference = False
 
         # Warn about arguments that will be overridden by the auto-tuner.
         if args.inference_dynamic_batching_max_tokens is not None:

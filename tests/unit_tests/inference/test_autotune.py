@@ -258,6 +258,21 @@ class TestAutotuneSolver:
         assert (r, t) == (128, _expected_max_tokens(128))
         assert r < r_solved
 
+    def test_solve_breakdown(self):
+        """compute_optimal_params records a per-term breakdown whose terms sum
+        to the committed minimum and whose totals respect the budget — the
+        engine logs it as the predicted side of the memory validation report."""
+        profile = _make_profile(nvls_ep_size=8, nvls_topk=8, nvls_hidden_size=2048)
+        r, t, b = profile.compute_optimal_params(blocks_per_request=16)
+        bd = profile.last_solve_breakdown
+        assert bd is not None
+        assert bd["max_requests"] == r and bd["max_tokens"] == t
+        assert sum(bd[term] for term in AutotuneProfile._COST_TERMS) == bd["committed_min"]
+        assert bd["committed_total"] == bd["committed_min"] + bd["extra_kv_bytes"]
+        assert bd["committed_total"] <= bd["gpu_free"]
+        assert bd["nvls_dispatcher"] > 0
+        assert int(b * GB) == bd["buffer_bytes"]
+
     def test_no_decode_samples_gives_zero_floor(self):
         """Without decode samples, the solver behaves as if decode cost is 0."""
         profile_a = _make_profile()  # no decode samples
@@ -308,7 +323,11 @@ class TestAutotuneRequirements:
         )
         if config_overrides:
             config = replace(config, **config_overrides)
-        model_fields = dict(inference_moe_token_dispatcher_type='nvls', cuda_graph_impl='local')
+        model_fields = dict(
+            inference_moe_token_dispatcher_type='nvls',
+            cuda_graph_impl='local',
+            moe_pad_experts_for_cuda_graph_inference=False,
+        )
         model_fields.update(model_overrides or {})
         model_config = SimpleNamespace(**model_fields)
         # The validator reads the derived non-decode-graphs flag off the
@@ -340,6 +359,8 @@ class TestAutotuneRequirements:
             ("no_all_prefills", dict(cuda_graph_all_prefills=False), {}, True,
              "cuda_graph_all_prefills"),
             ("wrong_graph_impl", {}, dict(cuda_graph_impl='none'), True, "cuda_graph_impl"),
+            ("moe_pad_experts", {}, dict(moe_pad_experts_for_cuda_graph_inference=True), True,
+             "moe_pad_experts_for_cuda_graph_inference"),
             ("graphs_disabled", dict(num_cuda_graphs=None), {}, True, "num_cuda_graphs"),
             ("zero_mixed_prefill_count", dict(cuda_graph_mixed_prefill_count=0), {}, True,
              "cuda_graph_mixed_prefill_count"),

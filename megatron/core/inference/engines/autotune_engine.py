@@ -75,6 +75,13 @@ class AutotuneProfile:
     nvls_topk: int = 0
     nvls_hidden_size: int = 0
 
+    # Per-term breakdown of the most recent compute_optimal_params solve
+    # (derived output, not profiling input): every cost component in bytes for
+    # the chosen max_requests, plus the budget and derived block counts. The
+    # engine logs it against post-capture measurements as the
+    # predicted-vs-actual memory validation report.
+    last_solve_breakdown: Optional[Dict[str, int]] = None
+
     def add_prefill_sample(self, token_count: int, peak_bytes: int):
         """Record one prefill profiling sample."""
         self.prefill_token_counts.append(token_count)
@@ -140,6 +147,59 @@ class AutotuneProfile:
         prefill_cost = max(0, self._interpolate(prefill_table, max_tokens))
         return max(decode_cost, prefill_cost)
 
+    def _cost_breakdown(
+        self,
+        prefill_table: Dict[int, int],
+        decode_table: Dict[int, int],
+        max_requests: int,
+        blocks_per_request: int,
+        paused_block_estimate: int,
+        spec_factor: int,
+        token_rounder: int,
+        tp_size: int,
+    ) -> Dict[str, int]:
+        """Per-term physical bytes committed by a candidate ``max_requests``.
+
+        Returns a dict of every cost component plus the derived
+        ``max_tokens``; ``_config_cost_bytes`` sums it for the solver's search
+        and `compute_optimal_params` stores it as `last_solve_breakdown` for
+        the chosen value.
+        """
+        max_tokens = self._derive_max_tokens(max_requests, spec_factor, token_rounder)
+        decode_tokens = max_requests * spec_factor
+        cg_pool = self._cg_pool_cost(prefill_table, decode_table, decode_tokens, max_tokens)
+        # +1 block: the block allocator requires a free sentinel block at all
+        # times to satisfy allocation/free round-trips without fragmentation.
+        min_blocks = max_requests * blocks_per_request + 1 + paused_block_estimate
+
+        # EP>1 nvls MoE: symmetric staging buffers, sized by the context as
+        # round_up_tokens(max_tokens) // tp — identical to max_tokens // tp
+        # here because the derived max_tokens is already token_rounder-aligned
+        # (and the rounder is a multiple of tp).
+        dispatcher_cost = 0
+        if self.nvls_ep_size > 0:
+            dispatcher_cost = NVLSAllGatherVDispatcher.required_buffer_bytes(
+                per_rank_worst_case_token_count=max_tokens // tp_size,
+                topk=self.nvls_topk,
+                hidden_size=self.nvls_hidden_size,
+                ep_size=self.nvls_ep_size,
+            )
+        return {
+            "max_tokens": max_tokens,
+            "cg_pool": cg_pool,
+            "token_metadata": max_tokens * self.per_token_metadata_bytes,
+            "request_metadata": max_requests * self.per_request_metadata_bytes,
+            "mamba_states": max_requests * self.mamba_memory_per_request,
+            "runtime_overhead": max_requests * self.runtime_overhead_per_request,
+            "kv_blocks": min_blocks * self.block_size_bytes,
+            "nvls_dispatcher": dispatcher_cost,
+        }
+
+    _COST_TERMS = (
+        "cg_pool", "token_metadata", "request_metadata", "mamba_states",
+        "runtime_overhead", "kv_blocks", "nvls_dispatcher",
+    )
+
     def _config_cost_bytes(
         self,
         prefill_table: Dict[int, int],
@@ -156,34 +216,11 @@ class AutotuneProfile:
         Returns:
             (cost_bytes, derived_max_tokens).
         """
-        max_tokens = self._derive_max_tokens(max_requests, spec_factor, token_rounder)
-        decode_tokens = max_requests * spec_factor
-        cg_pool = self._cg_pool_cost(prefill_table, decode_table, decode_tokens, max_tokens)
-        per_token_cost = max_tokens * self.per_token_metadata_bytes
-        per_request_cost = max_requests * (
-            self.per_request_metadata_bytes
-            + self.mamba_memory_per_request
-            + self.runtime_overhead_per_request
+        breakdown = self._cost_breakdown(
+            prefill_table, decode_table, max_requests, blocks_per_request,
+            paused_block_estimate, spec_factor, token_rounder, tp_size,
         )
-        # +1 block: the block allocator requires a free sentinel block at all
-        # times to satisfy allocation/free round-trips without fragmentation.
-        min_blocks = max_requests * blocks_per_request + 1 + paused_block_estimate
-        kv_cost = min_blocks * self.block_size_bytes
-
-        # EP>1 nvls MoE: symmetric staging buffers, sized by the context as
-        # round_up_tokens(max_tokens) // tp — identical to max_tokens // tp
-        # here because the derived max_tokens is already token_rounder-aligned
-        # (and the rounder is a multiple of tp).
-        dispatcher_cost = 0
-        if self.nvls_ep_size > 0:
-            dispatcher_cost = NVLSAllGatherVDispatcher.required_buffer_bytes(
-                per_rank_worst_case_token_count=max_tokens // tp_size,
-                topk=self.nvls_topk,
-                hidden_size=self.nvls_hidden_size,
-                ep_size=self.nvls_ep_size,
-            )
-        total = cg_pool + per_token_cost + per_request_cost + kv_cost + dispatcher_cost
-        return total, max_tokens
+        return sum(breakdown[term] for term in self._COST_TERMS), breakdown["max_tokens"]
 
     @staticmethod
     def _derive_max_tokens(max_requests: int, spec_factor: int, token_rounder: int) -> int:
@@ -412,6 +449,14 @@ class AutotuneProfile:
                 spec_factor,
                 paused_block_estimate,
             )
+            logging.info(
+                "Autotune: prefill activation table (tokens -> MB): %s",
+                {tc: round(b / (1024 ** 2), 1) for tc, b in prefill_table.items()},
+            )
+            logging.info(
+                "Autotune: decode activation table (tokens -> MB): %s",
+                {tc: round(b / (1024 ** 2), 1) for tc, b in decode_table.items()},
+            )
 
         if pinned_max_requests is not None:
             max_requests = max(alignment, (pinned_max_requests // alignment) * alignment)
@@ -485,6 +530,24 @@ class AutotuneProfile:
         )
         buffer_size_gb = buffer_bytes / (1024 ** 3)
 
+        # Per-term prediction for the chosen max_requests; the engine logs it
+        # against post-capture measurements (predicted-vs-actual validation).
+        self.last_solve_breakdown = {
+            **self._cost_breakdown(
+                prefill_table, decode_table, max_requests, blocks_per_request,
+                paused_block_estimate, spec_factor, tr, tp_size,
+            ),
+            "max_requests": max_requests,
+            "gpu_free": gpu_free,
+            "prefix_caching_mamba_bytes": prefix_caching_mamba_bytes,
+            "committed_min": cost_bytes,
+            "extra_kv_bytes": extra_blocks * self.block_size_bytes,
+            "committed_total": cost_bytes + extra_blocks * self.block_size_bytes,
+            "buffer_bytes": buffer_bytes,
+            "block_count": block_count,
+            "paused_block_count": derived_paused,
+        }
+
         if verbose:
             self._log_result(
                 gpu_free, cost_bytes + extra_blocks * self.block_size_bytes,
@@ -539,6 +602,85 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             profile, model_config, old_config, controller,
             gpu_total, rank, tp_size,
         )
+
+    def create_cuda_graphs(self, reset_context: bool = True):
+        """Capture CUDA graphs, then log the predicted-vs-actual memory report.
+
+        The base implementation captures on the tuned context; afterwards
+        every solver prediction is compared against a measurement of the same
+        consumer — the core artifact for validating the autotune budget on
+        real hardware.
+        """
+        super().create_cuda_graphs(reset_context=reset_context)
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        prediction = getattr(self, "_autotune_prediction", None)
+        if rank != 0 or prediction is None:
+            return
+
+        context = self.context
+        stats = self.capture_stats or {}
+        pool_reserved = stats.get("pool_reserved_bytes", 0)
+        per_req_meta, per_tok_meta = context.measure_metadata_bytes()
+        cats = context.owned_cuda_tensor_bytes()
+        sampling_bytes = sum(
+            t.untyped_storage().nbytes()
+            for t in (
+                getattr(self.controller, "_all_logits_cuda", None),
+                getattr(self.controller, "_sampled_tokens_cuda", None),
+                getattr(self.controller, "_async_sched_sample_values_cuda", None),
+            )
+            if isinstance(t, torch.Tensor) and t.is_cuda
+        )
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+
+        def mb(x):
+            return x / (1024 ** 2)
+
+        lines = [
+            "========== Autotune memory validation (predicted vs actual) ==========",
+            f"  tuned max_requests={context.max_requests}, max_tokens={context.max_tokens} "
+            f"(rank-0 solve: {prediction['max_requests']} / {prediction['max_tokens']})",
+            f"  CUDA-graph pool:  predicted {mb(prediction['cg_pool']):11.1f} MB | "
+            f"actual reserved {mb(pool_reserved):11.1f} MB"
+            + ("" if stats else " (graphs were not captured)"),
+            f"  KV cache:         predicted "
+            f"{mb(prediction['kv_blocks'] + prediction['extra_kv_bytes']):11.1f} MB "
+            f"({prediction['block_count']} blocks, {prediction['paused_block_count']} paused) | "
+            f"actual {mb(cats['kv_cache']):11.1f} MB "
+            f"({context.kv_block_allocator.total_count} blocks, "
+            f"{context.kv_block_allocator.paused_count} paused)",
+            f"  Request metadata: predicted {mb(prediction['request_metadata']):11.1f} MB | "
+            f"actual {mb(per_req_meta * context.max_requests):11.1f} MB",
+            f"  Token metadata:   predicted {mb(prediction['token_metadata']):11.1f} MB | "
+            f"actual {mb(per_tok_meta * context.max_tokens):11.1f} MB",
+            f"  Mamba states:     predicted {mb(prediction['mamba_states']):11.1f} MB | "
+            f"actual {mb(cats['mamba']):11.1f} MB (incl. spec buffers + prefix cache)",
+        ]
+        if prediction["prefix_caching_mamba_bytes"] > 0:
+            lines.append(
+                f"  Mamba prefix cache: reserved "
+                f"{mb(prediction['prefix_caching_mamba_bytes']):9.1f} MB off the budget"
+            )
+        if prediction["nvls_dispatcher"] > 0 or context._nvls_buffer_bytes > 0:
+            lines.append(
+                f"  NVLS buffers:     predicted {mb(prediction['nvls_dispatcher']):11.1f} MB | "
+                f"actual {mb(context._nvls_buffer_bytes):11.1f} MB"
+            )
+        lines += [
+            f"  Unbudgeted: other context tensors {mb(cats['other']):.1f} MB "
+            f"(gpu view, attn metadata, ...) "
+            f"+ controller sampling tensors {mb(sampling_bytes):.1f} MB",
+            f"  Runtime overhead: predicted {mb(prediction['runtime_overhead']):11.1f} MB "
+            f"(not preallocated — device free must stay above it)",
+            f"  Budget: committed {mb(prediction['committed_total']):.1f} MB "
+            f"of {mb(prediction['gpu_free']):.1f} MB usable",
+            f"  Device: total {total_bytes / (1024 ** 3):.1f} GB, "
+            f"used {(total_bytes - free_bytes) / (1024 ** 3):.1f} GB, "
+            f"free {free_bytes / (1024 ** 3):.1f} GB",
+            "=======================================================================",
+        ]
+        logging.info("\n".join(lines))
 
     # ---- autotune sub-steps ------------------------------------------------
 
@@ -599,6 +741,13 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             problems.append(
                 f"cuda_graph_impl must be 'local'; got {model_config.cuda_graph_impl!r}."
             )
+        if model_config.moe_pad_experts_for_cuda_graph_inference:
+            problems.append(
+                "moe_pad_experts_for_cuda_graph_inference must be disabled: the "
+                "inference-optimized stack (which autotune requires) masks CUDA-graph "
+                "padding at the router instead, and the controller rejects the "
+                "combination at the first dynamic step."
+            )
         if config.num_cuda_graphs is None:
             problems.append(
                 "num_cuda_graphs must be set (None disables CUDA-graph capture "
@@ -658,6 +807,7 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 "Autotune: workspace warmup done. Free memory: %.1f GB",
                 free / (1024 ** 3),
             )
+            logging.info("Autotune: bootstrap context:\n%s", self.context.memory_report())
 
     def _build_profiling_context_and_profile(
         self, model_config, old_config, controller,
@@ -732,9 +882,10 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 "Free memory: %.1f GB",
                 context.max_requests, profiling_buffer_gb, free_after_ctx / (1024 ** 3),
             )
+            logging.info("Autotune: profiling context:\n%s", context.memory_report())
 
         # Measure per-request / per-token metadata empirically.
-        per_request_metadata, per_token_metadata = self._measure_metadata_bytes(context)
+        per_request_metadata, per_token_metadata = context.measure_metadata_bytes()
         if rank == 0:
             logging.info(
                 "Autotune: measured metadata: %d bytes/request, %d bytes/token",
@@ -862,6 +1013,13 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 profile.add_prefill_sample(tc, fwd_activation)
             else:
                 profile.add_decode_sample(tc, fwd_activation)
+            if rank == 0:
+                logging.info(
+                    "Autotune: %s sample tc=%d: forward activation %.1f MB",
+                    "prefill" if is_prefill else "decode",
+                    tc,
+                    fwd_activation / (1024 ** 2),
+                )
 
             # Sampling overhead (decode only). Unguarded: if sampling cannot
             # run during profiling, the overhead measurement is broken, and a
@@ -873,8 +1031,16 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 with torch.inference_mode():
                     controller._dynamic_step_sample_logits()
                 torch.cuda.synchronize()
-                sampling_peak = torch.cuda.max_memory_allocated() - sampling_baseline
-                overhead_samples.append((tc, max(0, sampling_peak)))
+                sampling_peak = max(0, torch.cuda.max_memory_allocated() - sampling_baseline)
+                overhead_samples.append((tc, sampling_peak))
+                if rank == 0:
+                    logging.info(
+                        "Autotune: decode sample tc=%d: sampling overhead %.1f MB "
+                        "(%.2f MB/request)",
+                        tc,
+                        sampling_peak / (1024 ** 2),
+                        sampling_peak / tc / (1024 ** 2),
+                    )
 
             context.reset()
 
@@ -934,6 +1100,10 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             verbose=(rank == 0),
         )
 
+        # Kept for the post-capture predicted-vs-actual validation report;
+        # rank 0's own solve (the sync below can only lower the values).
+        self._autotune_prediction = dict(profile.last_solve_breakdown)
+
         new_max_requests, new_max_tokens, new_buffer_size_gb = (
             self._sync_tuned_params_across_ranks(
                 new_max_requests, new_max_tokens, new_buffer_size_gb,
@@ -970,6 +1140,7 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         # CUDA graphs are built by the caller (create_cuda_graphs) after return.
 
         if rank == 0:
+            logging.info("Autotune: tuned context:\n%s", self.context.memory_report())
             free_pre_cg, total_pre_cg = torch.cuda.mem_get_info()
             logging.info(
                 "Autotune: before CG build: GPU total %.1f GB, "
@@ -1001,59 +1172,6 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
             )
 
     # ---- helpers -------------------------------------------------------------
-
-    @staticmethod
-    def _measure_metadata_bytes(context) -> Tuple[int, int]:
-        """Empirically measure per-request and per-token GPU metadata bytes.
-
-        Walks all CUDA tensors owned by the context and its sub-objects,
-        categorising them by leading dimension: ``max_requests`` for
-        per-request tensors, ``max_tokens`` for per-token tensors.  This
-        automatically picks up any tensors added in the future without
-        needing to update hard-coded byte counts.
-
-        Returns:
-            (per_request_bytes, per_token_bytes) tuple.
-        """
-        per_request = 0
-        per_token = 0
-        max_r = context.max_requests
-        max_t = context.max_tokens
-        seen = set()
-
-        def _account(tensor, name=""):
-            nonlocal per_request, per_token
-            if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
-                return
-            if id(tensor) in seen:
-                return
-            seen.add(id(tensor))
-            elem_bytes = tensor.nelement() * tensor.element_size()
-            # Prefer name-based classification (robust when max_r == max_t).
-            if name.startswith('token_to_'):
-                per_token += elem_bytes // max(max_t, 1)
-            elif name.startswith(('request_', 'request_to_')):
-                per_request += elem_bytes // max(max_r, 1)
-            elif tensor.shape[0] == max_r:
-                per_request += elem_bytes // max(max_r, 1)
-            elif tensor.shape[0] == max_t:
-                per_token += elem_bytes // max(max_t, 1)
-
-        # Direct tensor attributes on context.
-        for name, val in vars(context).items():
-            if isinstance(val, torch.Tensor):
-                _account(val, name)
-            elif isinstance(val, dict):
-                for k, v in val.items():
-                    _account(v, str(k))
-
-        # mamba_metadata tensors (None on non-hybrid models).
-        if context.mamba_metadata is not None:
-            for name, val in vars(context.mamba_metadata).items():
-                if isinstance(val, torch.Tensor):
-                    _account(val, name)
-
-        return per_request, per_token
 
     def _release_context(self) -> None:
         """Actually free the current context's GPU memory.

@@ -827,16 +827,26 @@ class DynamicInferenceContext(BaseInferenceContext):
         # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
         # setup, which is harmless.
         InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        self._nvls_buffer_bytes = 0
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher.allocate_buffers()
         elif self._nvls_dispatcher:
             # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
             moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            per_rank_worst_case_token_count = self.round_up_tokens(self.max_tokens) // tp_size
             NVLSAllGatherVDispatcher.allocate_buffers(
-                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                per_rank_worst_case_token_count=per_rank_worst_case_token_count,
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+            )
+            # Recorded for memory_report(): the symmetric buffers are
+            # class-level and invisible to the torch allocator's stats.
+            self._nvls_buffer_bytes = NVLSAllGatherVDispatcher.required_buffer_bytes(
+                per_rank_worst_case_token_count=per_rank_worst_case_token_count,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_size=get_pg_size(self.expert_model_parallel_group),
             )
 
         # Deal with chunked prefill
@@ -875,6 +885,138 @@ class DynamicInferenceContext(BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
+        if inference_config._verbose and torch.distributed.get_rank() == 0:
+            logging.info(self.memory_report())
+
+    def measure_metadata_bytes(self) -> Tuple[int, int]:
+        """Empirically measure per-request and per-token GPU metadata bytes.
+
+        Walks all CUDA tensors owned by the context and its sub-objects,
+        categorising them by leading dimension: ``max_requests`` for
+        per-request tensors, ``max_tokens`` for per-token tensors.  This
+        automatically picks up any tensors added in the future without
+        needing to update hard-coded byte counts. Used by the autotune engine
+        to budget metadata per unit of concurrency, and by `memory_report`.
+
+        Returns:
+            (per_request_bytes, per_token_bytes) tuple.
+        """
+        per_request = 0
+        per_token = 0
+        max_r = self.max_requests
+        max_t = self.max_tokens
+        seen = set()
+
+        def _account(tensor, name=""):
+            nonlocal per_request, per_token
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                return
+            if id(tensor) in seen:
+                return
+            seen.add(id(tensor))
+            elem_bytes = tensor.nelement() * tensor.element_size()
+            # Prefer name-based classification (robust when max_r == max_t).
+            if name.startswith('token_to_'):
+                per_token += elem_bytes // max(max_t, 1)
+            elif name.startswith(('request_', 'request_to_')):
+                per_request += elem_bytes // max(max_r, 1)
+            elif tensor.shape[0] == max_r:
+                per_request += elem_bytes // max(max_r, 1)
+            elif tensor.shape[0] == max_t:
+                per_token += elem_bytes // max(max_t, 1)
+
+        # Direct tensor attributes on the context.
+        for name, val in vars(self).items():
+            if isinstance(val, torch.Tensor):
+                _account(val, name)
+            elif isinstance(val, dict):
+                for k, v in val.items():
+                    _account(v, str(k))
+
+        # mamba_metadata tensors (None on non-hybrid models).
+        if self.mamba_metadata is not None:
+            for name, val in vars(self.mamba_metadata).items():
+                if isinstance(val, torch.Tensor):
+                    _account(val, name)
+
+        return per_request, per_token
+
+    def owned_cuda_tensor_bytes(self) -> Dict[str, int]:
+        """Storage-deduplicated CUDA bytes reachable from the context, by category.
+
+        Categories: ``kv_cache`` (the block-pool buffer), ``mamba`` (states,
+        speculative buffers, prefix-cache slots), ``per_request`` /
+        ``per_token`` (bookkeeping tensors keyed by leading dimension — what
+        autotune budgets as metadata), and ``other`` (everything else: the GPU
+        bookkeeping view, attention metadata, input/position views, ...).
+        Aliased views (e.g. attention metadata bound onto the GPU view's
+        storage) are counted once via their untyped storage, so the total is
+        the context's real allocator footprint.
+        """
+        cats = {"kv_cache": 0, "mamba": 0, "per_request": 0, "per_token": 0, "other": 0}
+        seen = set()
+
+        def _visit(name, tensor, category=None):
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                return
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen:
+                return
+            seen.add(storage.data_ptr())
+            nbytes = storage.nbytes()
+            if category is not None:
+                cats[category] += nbytes
+            elif name == "memory_buffer":
+                cats["kv_cache"] += nbytes
+            elif name.startswith("mamba"):
+                cats["mamba"] += nbytes
+            elif tensor.ndim > 0 and tensor.shape[0] == self.max_requests:
+                cats["per_request"] += nbytes
+            elif tensor.ndim > 0 and tensor.shape[0] == self.max_tokens:
+                cats["per_token"] += nbytes
+            else:
+                cats["other"] += nbytes
+
+        def _walk(obj, category=None):
+            for name, val in vars(obj).items():
+                if isinstance(val, torch.Tensor):
+                    _visit(name, val, category)
+                elif isinstance(val, dict):
+                    for k, v in val.items():
+                        if isinstance(v, torch.Tensor):
+                            _visit(str(k), v, category)
+
+        _walk(self)
+        # Composite sub-objects holding their own GPU tensors. The slot
+        # allocator's tensors are Mamba prefix-cache state; the rest is
+        # bookkeeping ("other" unless request/token-shaped).
+        for attr, category in (
+            ("gpu_view", "other"),
+            ("mamba_metadata", None),
+            ("mamba_slot_allocator", "mamba"),
+            ("kv_block_allocator", "other"),
+            ("moe_routing_metadata", "other"),
+        ):
+            sub = getattr(self, attr, None)
+            if sub is not None and hasattr(sub, "__dict__"):
+                _walk(sub, category)
+        for meta_dict in (self.graph_attn_metadata, self.non_graph_attn_metadata):
+            for sub in meta_dict.values():
+                if hasattr(sub, "__dict__"):
+                    _walk(sub, "other")
+        return cats
+
+    def memory_report(self) -> str:
+        """Multi-line breakdown of every GPU-memory consumer this context owns.
+
+        Covers the KV cache block pool, Mamba states / speculative buffers /
+        prefix cache, measured per-request and per-token metadata, the full
+        storage-deduplicated tensor footprint, the NVLS dispatcher's symmetric
+        staging buffers (allocated outside the torch allocator), and a
+        device-level snapshot. Logged at construction when the config is
+        verbose; the autotune engine logs it for every context it builds.
+        """
+        config = self.config
         pool_size = self.kv_block_allocator.pool_size
         usable_blocks = pool_size - 1
         paused_limit = self.kv_block_allocator.paused_limit
@@ -929,9 +1071,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
                 ]
 
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            prefix_caching_mamba_gb = config.prefix_caching_mamba_gb
             if (
-                inference_config.enable_prefix_caching
+                config.enable_prefix_caching
                 and prefix_caching_mamba_gb is not None
                 and prefix_caching_mamba_gb > 0
             ):
@@ -956,8 +1098,38 @@ class DynamicInferenceContext(BaseInferenceContext):
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
-        if inference_config._verbose and torch.distributed.get_rank() == 0:
-            logging.info("\n".join(log_lines))
+        per_request_meta, per_token_meta = self.measure_metadata_bytes()
+        cats = self.owned_cuda_tensor_bytes()
+        log_lines += [
+            f"  Bookkeeping metadata (measured):",
+            f"    per_request:           {get_mem_size_str(per_request_meta)} "
+            f"(x{self.max_requests} = "
+            f"{get_mem_size_str(per_request_meta * self.max_requests)})",
+            f"    per_token:             {get_mem_size_str(per_token_meta)} "
+            f"(x{self.max_tokens} = {get_mem_size_str(per_token_meta * self.max_tokens)})",
+            f"  Context-owned CUDA tensors (storage-deduplicated):",
+            f"    kv_cache:              {get_mem_size_str(cats['kv_cache'])}",
+            f"    mamba:                 {get_mem_size_str(cats['mamba'])}",
+            f"    per_request:           {get_mem_size_str(cats['per_request'])}",
+            f"    per_token:             {get_mem_size_str(cats['per_token'])}",
+            f"    other (gpu view, attn metadata, ...): {get_mem_size_str(cats['other'])}",
+            f"    total:                 {get_mem_size_str(sum(cats.values()))}",
+        ]
+        if self._nvls_dispatcher:
+            log_lines += [
+                f"  NVLS dispatcher symmetric buffers (class-level, outside the "
+                f"torch allocator): {get_mem_size_str(self._nvls_buffer_bytes)}",
+            ]
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        log_lines += [
+            f"  GPU snapshot:",
+            f"    device total:          {get_mem_size_str(total_bytes)}",
+            f"    device used:           {get_mem_size_str(total_bytes - free_bytes)}",
+            f"    device free:           {get_mem_size_str(free_bytes)}",
+            f"    torch allocated:       {get_mem_size_str(torch.cuda.memory_allocated())}",
+            f"    torch reserved:        {get_mem_size_str(torch.cuda.memory_reserved())}",
+        ]
+        return "\n".join(log_lines)
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
