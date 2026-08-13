@@ -23,6 +23,13 @@ class Rollout(AgentBaseModel):
     prompt_length: list[int] | None = None
     reward: float | None = None
     env_id: str = ''
+    # Metrics-only label. env_id is the ROUTING identity (WeightedMultiTask
+    # registration, bank-restore bucketing, per-env quotas) — a blend
+    # dispatcher stamps its own env_id on every child so restores stay within
+    # known envs, which collapses per-env dashboards to one stream. When set,
+    # this label keys the wandb/per-env metric prefixes instead (e.g. the
+    # leaf agent ref), restoring per-env panels without touching routing.
+    metrics_env_id: str | None = None
     problem_id: str | None = None
     rollout_status: str = 'ok'
     failure_reason: str | None = None
@@ -41,6 +48,9 @@ class TokenRollout(AgentBaseModel):
     generation_mask: list[list[bool]] | None = None
     logprobs: list[list[float]] | None = None
     env_id: str = ''
+    # See Rollout.metrics_env_id: metrics-only label; env_id stays the
+    # routing/restore identity.
+    metrics_env_id: str | None = None
     problem_id: str | None = None
     completion_ids: list[str] = []
     generation_cap: int | None = None

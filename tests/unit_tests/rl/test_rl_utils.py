@@ -195,6 +195,53 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
+def test_metric_env_id_prefers_label_and_falls_back():
+    """Metrics group by the metrics-only label when stamped (blend dispatch
+    children: env_id = dispatcher for routing/restore, metrics_env_id = leaf
+    ref for dashboards); unlabeled rollouts keep env_id, and an empty label
+    falls back too."""
+    from megatron.rl.rl_utils import _metric_env_id
+    from megatron.rl.types import TokenRollout
+
+    labeled = TokenRollout(
+        trajectory=[[1]], reward=1.0, env_id="nemo_gym:d1_blend",
+        metrics_env_id="nemo_gym:genrm_simple_agent",
+    )
+    plain = TokenRollout(trajectory=[[1]], reward=1.0, env_id="nemo_gym:mcqa")
+    empty = TokenRollout(
+        trajectory=[[1]], reward=1.0, env_id="nemo_gym:d1_blend", metrics_env_id="",
+    )
+    assert _metric_env_id(labeled) == "nemo_gym:genrm_simple_agent"
+    assert _metric_env_id(plain) == "nemo_gym:mcqa"
+    assert _metric_env_id(empty) == "nemo_gym:d1_blend"
+
+
+def test_bounded_artifact_key_bounds_final_keys():
+    """Port of fork 5ef736978 (wandb hunks): keys at or under the limit pass
+    through untouched; longer keys bound to <= limit with a deterministic
+    hash suffix so distinct metrics keep distinct keys. The bound must be
+    applied to the FINAL env-prefixed key — the pre-prefix variant never
+    fired and the 128-char artifact ValueError killed fork f0d3 on all
+    three links."""
+    from megatron.rl.rl_utils import _bounded_artifact_key
+
+    short = "nemo_gym:mcqa_reward_hist"
+    assert _bounded_artifact_key(short) == short
+
+    long_a = (
+        "nemo_gym:toolcall_schema_single_step_tool_use_with_argument_"
+        "comparison_agent_staleness/kv_cache/first_hist"
+    )
+    long_b = long_a + "_second"
+    assert len(long_a) > 100
+    bound_a = _bounded_artifact_key(long_a)
+    bound_b = _bounded_artifact_key(long_b)
+    assert len(bound_a) <= 100 and len(bound_b) <= 100
+    assert bound_a != bound_b
+    assert bound_a == _bounded_artifact_key(long_a)
+    assert bound_a.startswith(long_a[:80])
+
+
 class TestRLUtils:
     """Test class for RL utilities."""
 
