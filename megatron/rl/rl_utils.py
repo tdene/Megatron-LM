@@ -1909,7 +1909,7 @@ def compute_group_stats(
             group_kv_last.append(kv_summary[2])
             group_completed_epochs.extend(record.policy_epoch[-1][1] for record in turn_records)
             group_num_evictions.append(sum(record.num_evictions for record in turn_records))
-            group_rollout_env_ids.append(rollout.env_id)
+            group_rollout_env_ids.append(_metric_env_id(rollout))
             group_problem_ids.append(rollout.problem_id)
         all_policy_boundaries.append(group_policy_boundaries)
         all_kv_boundaries.append(group_kv_boundaries)
@@ -1926,7 +1926,7 @@ def compute_group_stats(
         all_problem_ids.append(group_problem_ids)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
-        env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
+        env_ids.append(_metric_env_id(group[0])) # All rollouts in a group share the env id by design; metrics prefer the label (see _metric_env_id).
         rewards.append(group_rewards)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
         # Let's track this.
@@ -1967,6 +1967,14 @@ def compute_group_stats(
     )
     return stats
 
+
+
+def _metric_env_id(rollout):
+    """The env key METRICS group by: the metrics-only label when the agent
+    stamped one (blend dispatchers stamp the dispatcher env_id for routing
+    and the leaf ref as the label), else env_id. Routing/restore paths must
+    keep using env_id directly."""
+    return getattr(rollout, 'metrics_env_id', None) or rollout.env_id
 
 
 def _bounded_artifact_key(key, limit=100):
@@ -2596,7 +2604,7 @@ def prepare_trajectories(
         generation_masks.append(generation_mask)
         inference_logprobs.append(torch.Tensor(inf_logprobs) if inf_logprobs else None)
 
-        env_id_counts[rollout.env_id] += 1
+        env_id_counts[_metric_env_id(rollout)] += 1
 
     if torch.distributed.is_initialized():
         logger.info(f"[{dist.get_rank()}] Rollout counts:")

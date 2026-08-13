@@ -163,6 +163,27 @@ def cleanup_global_state():
     destroy_num_microbatches_calculator()
 
 
+def test_metric_env_id_prefers_label_and_falls_back():
+    """Metrics group by the metrics-only label when stamped (blend dispatch
+    children: env_id = dispatcher for routing/restore, metrics_env_id = leaf
+    ref for dashboards); unlabeled rollouts keep env_id, and an empty label
+    falls back too."""
+    from megatron.rl.rl_utils import _metric_env_id
+    from megatron.rl.types import TokenRollout
+
+    labeled = TokenRollout(
+        trajectory=[[1]], reward=1.0, env_id="nemo_gym:d1_blend",
+        metrics_env_id="nemo_gym:genrm_simple_agent",
+    )
+    plain = TokenRollout(trajectory=[[1]], reward=1.0, env_id="nemo_gym:mcqa")
+    empty = TokenRollout(
+        trajectory=[[1]], reward=1.0, env_id="nemo_gym:d1_blend", metrics_env_id="",
+    )
+    assert _metric_env_id(labeled) == "nemo_gym:genrm_simple_agent"
+    assert _metric_env_id(plain) == "nemo_gym:mcqa"
+    assert _metric_env_id(empty) == "nemo_gym:d1_blend"
+
+
 def test_bounded_artifact_key_bounds_final_keys():
     """Port of fork 5ef736978 (wandb hunks): keys at or under the limit pass
     through untouched; longer keys bound to <= limit with a deterministic
