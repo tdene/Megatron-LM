@@ -332,6 +332,16 @@ class InferenceSetupConfig:
         if max_batch_size is not None:
             max_sequence_length = max(max_sequence_length, max_batch_size)
 
+        # DEBUG (tde/static_autotune debugging branch only — remove before any PR):
+        # force a long-context sequence cap for the memory-scaling study. The RL
+        # path keeps resolving inference_max_seq_length to the checkpoint's 2560
+        # (likely restored by --use-checkpoint-args), which caps the KV-per-request
+        # axis. We deliberately pretend the deployment target is 130k: positions
+        # past the trained range may generate garbage tokens, which is acceptable
+        # because only memory behavior is under measurement.
+        if position_embedding_type != "learned_absolute":
+            max_sequence_length = max(max_sequence_length, 130000)
+
         mamba_inference_state_config = MambaInferenceStateConfig.from_model(
             model,
             conv_states_dtype=self.mamba_inference_conv_states_dtype,
