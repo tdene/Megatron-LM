@@ -720,6 +720,13 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                 "average prompt+generation sequence length); got "
                 f"{config.autotune_average_seq_len!r}."
             )
+        elif config.autotune_average_seq_len > config.max_sequence_length:
+            problems.append(
+                f"autotune_average_seq_len ({config.autotune_average_seq_len}) exceeds "
+                f"max_sequence_length ({config.max_sequence_length}): no request can "
+                "average more than the sequence cap, and the solver would charge every "
+                "request KV blocks it can never use."
+            )
         if model_config.inference_moe_token_dispatcher_type != 'nvls':
             problems.append(
                 "inference_moe_token_dispatcher_type must be 'nvls' regardless of expert "
@@ -964,6 +971,15 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         hit at solved scale, and its padding-request attribution is fragile
         (a padded single-token prefill crashes varlen attention's
         one-token fast path).
+
+        Prefill is profiled at two compositions per token count and the
+        activation table keeps the max: one long request (worst case for
+        attention) and fragmented single-token requests (worst case for the
+        Mamba chunk scan, whose state tensors scale with the number of
+        sequences — the prefill-only CUDA graph dims run up to
+        ``min(max_requests, token_count)`` prefill sequences, which a
+        one-request profile under-bounds by orders of magnitude on hybrid
+        models).
         """
         tr = context.round_up_tokens(1)
 
@@ -997,19 +1013,29 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
 
         if rank == 0:
             logging.info(
-                "Autotune: profiling %d decode + %d prefill samples (≤%d)",
+                "Autotune: profiling %d decode + 2x%d prefill samples (≤%d)",
                 len(decode_tcs), len(prefill_tcs), sweep_upper,
             )
 
-        sweep = [(tc, False) for tc in decode_tcs] + [(tc, True) for tc in prefill_tcs]
+        # kinds: "decode" = tc requests x 1 token (decode step);
+        # "prefill" = 1 request x tc tokens (longest-sequence attention worst
+        # case); "prefill_fragmented" = tc requests x 1 token counted as
+        # prefill (max-sequence-count Mamba chunk-scan worst case, matching
+        # the largest prefill-only CUDA graph dims). Every composition keeps
+        # padded == real: token and request counts are rounder multiples.
+        sweep = (
+            [(tc, "decode") for tc in decode_tcs]
+            + [(tc, "prefill") for tc in prefill_tcs]
+            + [(tc, "prefill_fragmented") for tc in prefill_tcs]
+        )
         overhead_samples: List[Tuple[int, int]] = []
         device = torch.cuda.current_device()
 
-        for tc, is_prefill in sweep:
+        for tc, kind in sweep:
             # Autotune is opt-in: a failure anywhere in the sweep crashes
             # startup rather than skipping the sample — a silently thinner
             # profile would mis-budget the solve.
-            if is_prefill:
+            if kind == "prefill":
                 dummy = [DynamicInferenceRequest(
                     request_id=0,
                     prompt_tokens=torch.ones(tc, dtype=torch.long, device=device),
@@ -1028,7 +1054,7 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
                     )
                     for i in range(tc)
                 ]
-            context.add_dummy_requests_parallel(dummy, count_as_prefill=is_prefill)
+            context.add_dummy_requests_parallel(dummy, count_as_prefill=(kind != "decode"))
 
             # Forward pass.  Inside NCCL collectives — NOT caught.
             baseline_bytes = torch.cuda.memory_allocated()
@@ -1040,22 +1066,23 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
 
             fwd_activation = torch.cuda.max_memory_allocated() - baseline_bytes
 
-            if is_prefill:
-                profile.add_prefill_sample(tc, fwd_activation)
-            else:
+            if kind == "decode":
                 profile.add_decode_sample(tc, fwd_activation)
+            else:
+                # Both prefill compositions land in one table; construction
+                # keeps the max per token count, so the solver's CG-pool term
+                # bounds the worst captured graph shape.
+                profile.add_prefill_sample(tc, fwd_activation)
             if rank == 0:
                 logging.info(
                     "Autotune: %s sample tc=%d: forward activation %.1f MB",
-                    "prefill" if is_prefill else "decode",
-                    tc,
-                    fwd_activation / (1024 ** 2),
+                    kind, tc, fwd_activation / (1024 ** 2),
                 )
 
             # Sampling overhead (decode only). Unguarded: if sampling cannot
             # run during profiling, the overhead measurement is broken, and a
             # silent zero would under-budget the solve.
-            if not is_prefill:
+            if kind == "decode":
                 torch.cuda.synchronize()
                 sampling_baseline = torch.cuda.memory_allocated()
                 torch.cuda.reset_peak_memory_stats()
