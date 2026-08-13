@@ -795,10 +795,19 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
         a failure here (or anywhere in the autotune flow) crashes startup.
         There is no graceful fallback — a silently degraded configuration
         would be worse than an honest crash.
+
+        The prompt is one full token-rounder chunk so padded == real token
+        count: every autotune forward stays in the exact-padding regime (a
+        1-token prompt pads its query buffer to the token rounder while
+        attention metadata pads requests, and the mismatch crashes varlen
+        attention's single-token fast path).
         """
+        warmup_tokens = self.context.round_up_tokens(1)
         dummy = [DynamicInferenceRequest(
             request_id=0,
-            prompt_tokens=torch.ones(1, dtype=torch.long, device=torch.cuda.current_device()),
+            prompt_tokens=torch.ones(
+                warmup_tokens, dtype=torch.long, device=torch.cuda.current_device()
+            ),
             sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
         )]
         self.context.add_dummy_requests_parallel(dummy)
@@ -946,19 +955,35 @@ class AutotuneDynamicInferenceEngine(DynamicInferenceEngine):
 
     def _run_profiling_sweep(self, profile, context, controller, rank):
         """Run decode and prefill forward passes at geometric token counts,
-        measuring activation memory and sampling overhead."""
+        measuring activation memory and sampling overhead.
+
+        Only token counts that are exact token-rounder multiples are swept, so
+        padded == real for every profiling forward: prefill pads its query
+        buffer to the token rounder and decode pads to the request rounder,
+        and rounder multiples satisfy both. The sub-rounder regime is never
+        hit at solved scale, and its padding-request attribution is fragile
+        (a padded single-token prefill crashes varlen attention's
+        one-token fast path).
+        """
+        tr = context.round_up_tokens(1)
 
         def _geometric_sweep(upper: int) -> List[int]:
-            counts = [1, 2, 4, 8, 16, 32, 64, 128, 256]
-            t = 512
+            counts = []
+            t = tr
             while t <= upper:
                 counts.append(t)
-                t += max(256, t // 4)
-            if upper not in counts:
-                counts.append(upper)
-            return sorted({c for c in counts if c <= upper})
+                t += max(tr, (t // 4) // tr * tr)
+            top = (upper // tr) * tr
+            if top >= tr and top not in counts:
+                counts.append(top)
+            return sorted(counts)
 
         sweep_upper = context.max_requests
+        assert sweep_upper >= tr, (
+            f"Autotune: profiling context max_requests ({sweep_upper}) is below "
+            f"the token rounder ({tr}); not enough free memory to profile at "
+            f"rounder granularity."
+        )
         prefill_tcs = _geometric_sweep(sweep_upper)
 
         # A few representative batch sizes suffice for decode (runtime
