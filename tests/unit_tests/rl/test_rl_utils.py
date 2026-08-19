@@ -2105,6 +2105,8 @@ class TestRLUtils:
             "policy_staleness_std": 0.5,
             "kv_staleness_std": 0.5,
             "rollout_status": 'ok',
+            "env_id": '',
+            "problem_id": None,
         }
 
         # A window where nothing joined emits no staleness/eviction metrics at all.
@@ -2203,6 +2205,8 @@ class TestRLUtils:
         (rollout_row,) = rollout_tbl["data"]
         row_by_col = dict(zip(rollout_tbl["columns"], rollout_row))
         assert row_by_col.pop("rollout_status") == 'ok'
+        assert row_by_col.pop("env_id") == ''
+        assert row_by_col.pop("problem_id") is None
         assert row_by_col == pytest.approx(
             {
                 "reward": 1.0,
