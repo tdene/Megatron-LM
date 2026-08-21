@@ -14,6 +14,7 @@ import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -45,6 +46,10 @@ from torch.utils.tensorboard import SummaryWriter
 from wandb import wandb_run
 
 from megatron.core import mpu
+from megatron.core.inference.inference_step_trace import (
+    get_inference_step_tracer,
+    init_inference_step_tracer,
+)
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.inference.inference_request import FinishedRequestRecord
@@ -96,6 +101,11 @@ from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.inference.megatron import MegatronLocal
+from megatron.rl.inflight_tracker import (
+    inflight_snapshot,
+    remove_inflight,
+    reset_inflight,
+)
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
 from megatron.rl.rollout_granularity import ConsumptionGranularity, SubmissionGranularity
@@ -349,10 +359,19 @@ class RolloutStats:
     mean_inf_prob: None | float
     policy_epoch_segments: GroupedEpochSegments
     kv_cache_epoch_segments: GroupedEpochSegments
+    # RLE (start_token_index, epoch) boundaries per turn per rollout, for the dump
+    # (dump_staleness_data wants exact per-turn positions; segments above are
+    # already flattened/compressed across turns for the wandb metrics).
+    policy_epoch_boundaries: list[list[list[tuple[int, int]]]]
+    kv_cache_epoch_boundaries: list[list[list[tuple[int, int]]]]
+    num_evictions_per_turn: list[list[list[int]]]
     completed_epochs: list[list[int]]
     num_evictions: list[list[int]]
     rollout_statuses: list[list[str]]
     failure_reasons: list[list[str | None]]
+    # Per-rollout identity (grouped like rewards), used to label the rollout table.
+    rollout_env_ids: list[list[str]]
+    problem_ids: list[list[str | None]]
 
 
 # Runtime state container for RL-specific data that shouldn't be checkpointed
@@ -733,6 +752,10 @@ def get_rollout_generator(
     """
     global _ROLLOUT_GENERATOR, _ROLLOUT_PIPELINE
     if _ROLLOUT_GENERATOR is None:
+        # Fresh generator: clear the in-flight counter. Generators persist across
+        # iterations (and so does their in-flight count), so this only fires on
+        # (re)creation, never on a reused generator.
+        reset_inflight()
         request = GroupedRolloutRequest(
             num_groups=n_prompts,
             rollouts_per_group=samples_per_group,
@@ -887,6 +910,11 @@ def colocated_inference(
                     rollouts = [
                         loop.run_until_complete(anext(rollout_generator)) for _ in range(n_prompts)
                     ]
+                    # These groups are now consumed into the training batch: they
+                    # leave the in-flight set (decrement here, where consumption is final,
+                    # so buffered groups awaiting their batch peers stay counted).
+                    for group in rollouts:
+                        remove_inflight(len(group))
                     if not args.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
                     # Record consumption for every group handed to the trainer. On a
@@ -1348,6 +1376,169 @@ def single_turn_termination_ok(
     return int(sum(rollout.generation_mask[-1])) == rollout.generation_cap
 
 
+def rollout_epoch_summary(
+    per_turn_boundaries: RolloutEpochBoundaries,
+    per_turn_token_count: list[int],
+) -> tuple[int, float, int] | None:
+    """First, token-weighted-average, and last *epoch* of a rollout across all turns.
+
+    Returns ``None`` if the rollout has no tokens. The token-weighted average is a
+    true per-token average (weighting each epoch by how many tokens it covers),
+    unlike a per-boundary mean. Lag is obtained later as ``current_iteration -
+    epoch``, so ``first`` -> oldest-token lag and ``last`` -> newest-token lag.
+    """
+    segments = expand_epoch_segments(per_turn_boundaries, per_turn_token_count)
+    if not segments:
+        return None
+    first_epoch = segments[0].epoch
+    last_epoch = segments[-1].epoch
+    total = sum(s.token_count for s in segments)
+    avg_epoch = sum(s.epoch * s.token_count for s in segments) / total
+    return first_epoch, avg_epoch, last_epoch
+
+
+def get_rl_logging_dir(args) -> str:
+    """Base directory for RL logging artifacts (staleness dumps, inference traces, plots).
+
+    Uses --rl-logging-dir when set, else $LANGRL_LOG_DIR/rl_logging, else ./rl_logging.
+    """
+    if args.rl_logging_dir:
+        return args.rl_logging_dir
+    env_dir = os.environ.get("LANGRL_LOG_DIR")
+    if env_dir:
+        return os.path.join(env_dir, "rl_logging")
+    return os.path.join(".", "rl_logging")
+
+
+def _maybe_init_inference_step_tracer(args) -> None:
+    """Initialize the per-step inference batch tracer (opt-in), once per process.
+
+    Each rank's engine writes its own trace file. The rank-0 in-flight rollout
+    sampler is registered so the total in-flight count is captured on the same
+    inference-step axis as the engine batch sizes.
+    """
+    if not args.rl_log_inference_batch_trace:
+        return
+    if get_inference_step_tracer() is not None:
+        return
+    is_dist = torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if is_dist else 0
+    tracer = init_inference_step_tracer(
+        output_dir=str(Path(get_rl_logging_dir(args)) / "inference"),
+        rank=rank,
+        dp_rank=mpu.get_data_parallel_rank(),
+        stride=args.rl_inference_batch_trace_stride,
+        run_id=os.environ.get("LANGRL_RUN_ID"),
+    )
+    if rank == 0:
+        tracer.register_callback(inflight_snapshot)
+
+
+def _turn_prompt_length(rollout, turn_idx: int) -> Optional[int]:
+    """Best-effort number of prompt tokens for a turn (so plots can mark prompt/gen)."""
+    if isinstance(rollout, TokenRollout):
+        gen_mask = rollout.generation_mask[turn_idx] if rollout.generation_mask else None
+        if gen_mask is None:
+            return None
+        for i, is_gen in enumerate(gen_mask):
+            if is_gen:
+                return i
+        return len(gen_mask)
+    if rollout.prompt_length is not None and turn_idx < len(rollout.prompt_length):
+        return rollout.prompt_length[turn_idx]
+    return None
+
+
+# Lazily-opened JSONL file handle for the per-run staleness dump (rank 0 only).
+_STALENESS_DUMP_FILE = None
+
+
+def dump_staleness_data(
+    rollouts: GroupedRollouts, group_stats: RolloutStats, current_iteration: int
+) -> None:
+    """Append a focused, labeled per-rollout staleness/length record (rank 0, opt-in).
+
+    One JSON object per rollout per line, tagged by iteration/batch_id/group/env so
+    rl_profiling can render per-batch/env/group/rollout views offline. Stores per-rollout
+    reward + GRPO advantage, the run-length-encoded epoch boundaries and per-turn token
+    counts, not token ids.
+    """
+    args = get_args()
+    if not args.rl_log_staleness_data:
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+
+    global _STALENESS_DUMP_FILE
+    if _STALENESS_DUMP_FILE is None:
+        out_dir = Path(get_rl_logging_dir(args)) / "staleness"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        run_id = os.environ.get("LANGRL_RUN_ID") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        _STALENESS_DUMP_FILE = open(out_dir / f"staleness_{run_id}.jsonl", "a")
+        logger.info(f"[rl-logging] Writing staleness data to {out_dir}")
+
+    # Per-rollout GRPO advantage (authoritative, from group_stats). `advantages` is a
+    # flat per-turn list in group-major order; a rollout's turns share one advantage,
+    # so take the first turn's value per rollout.
+    adv_flat = group_stats.advantages
+    per_group_adv = []
+    _t = 0
+    for group_num_turns in group_stats.num_turns:
+        adv_row = []
+        for nt in group_num_turns:
+            adv_row.append(float(adv_flat[_t]))
+            _t += nt
+        per_group_adv.append(adv_row)
+
+    for group_idx, group in enumerate(rollouts):
+        group_rewards = group_stats.rewards[group_idx]
+        group_reward_mean = float(np.mean(group_rewards))
+        group_reward_std = float(np.std(group_rewards))
+        # All-equal rewards => ~zero advantage => no gradient (the GRPO group-filter target).
+        group_degenerate = group_reward_std < 1e-6
+        for rollout_idx, rollout in enumerate(group):
+            policy_boundaries = group_stats.policy_epoch_boundaries[group_idx][rollout_idx]
+            kv_boundaries = group_stats.kv_cache_epoch_boundaries[group_idx][rollout_idx]
+            per_turn_evicts = group_stats.num_evictions_per_turn[group_idx][rollout_idx]
+            turns = []
+            for turn_idx, (pe, kve) in enumerate(zip(policy_boundaries, kv_boundaries)):
+                evicts = (
+                    int(per_turn_evicts[turn_idx]) if turn_idx < len(per_turn_evicts) else 0
+                )
+                turns.append({
+                    "token_count": len(rollout.trajectory[turn_idx]),
+                    "prompt_length": _turn_prompt_length(rollout, turn_idx),
+                    "policy_epoch": [[int(s), int(e)] for s, e in pe],
+                    "kv_cache_epoch": [[int(s), int(e)] for s, e in kve],
+                    "num_evictions": evicts,
+                })
+            reward = (
+                [float(x) for x in rollout.reward]
+                if isinstance(rollout.reward, list)
+                else float(rollout.reward)
+            )
+            record = {
+                "iteration": int(current_iteration),
+                "batch_id": int(group.batch_id),
+                "index_in_batch": int(group.index_in_batch),
+                "group_idx": int(group_idx),
+                "rollout_idx": int(rollout_idx),
+                "env_id": rollout.env_id,
+                "problem_id": rollout.problem_id,
+                "reward": reward,
+                "advantage": per_group_adv[group_idx][rollout_idx],
+                "group_reward_mean": group_reward_mean,
+                "group_reward_std": group_reward_std,
+                "group_degenerate": group_degenerate,
+                "traj_len": int(sum(len(t) for t in rollout.trajectory)),
+                "num_turns": len(rollout.trajectory),
+                "num_evictions": int(sum(per_turn_evicts)),
+                "turns": turns,
+            }
+            _STALENESS_DUMP_FILE.write(json.dumps(record) + "\n")
+    _STALENESS_DUMP_FILE.flush()
+
+
 def compute_group_stats(
     rollouts: GroupedRollouts,
     tokenizer: MegatronTokenizer,
@@ -1376,10 +1567,15 @@ def compute_group_stats(
     num_turns = [] # num_turns per traj
     all_policy_epoch_segments = []
     all_kv_cache_epoch_segments = []
+    all_policy_boundaries = []
+    all_kv_boundaries = []
+    all_evictions_per_turn = []
     all_completed_epochs = []
     all_num_evictions = []
     all_rollout_statuses = []
     all_failure_reasons = []
+    all_rollout_env_ids = []
+    all_problem_ids = []
     for group in rollouts:
         group_rewards = []
         group_traj_lengths = []
@@ -1387,10 +1583,15 @@ def compute_group_stats(
         group_num_turns = []
         group_policy_epoch_segments = []
         group_kv_epoch_segments = []
+        group_policy_boundaries = []
+        group_kv_boundaries = []
+        group_evictions_per_turn = []
         group_completed_epochs = []
         group_num_evictions = []
         group_rollout_statuses = []
         group_failure_reasons = []
+        group_rollout_env_ids = []
+        group_problem_ids = []
         for rollout in group:
             if isinstance(rollout, TokenRollout):
                 for turn_traj in rollout.trajectory:
@@ -1445,17 +1646,21 @@ def compute_group_stats(
             for record in turn_records:
                 assert record.policy_epoch, "Request record has no policy_epoch data"
                 assert record.kv_cache_epoch, "Request record has no kv_cache_epoch data"
+            # RLE (start_token_index, epoch) boundaries per turn, straight off the
+            # joined records; kept for the opt-in staleness dump (policy_epoch_segments
+            # below is the flattened/compressed form the wandb metrics use instead).
+            policy_boundaries = [record.policy_epoch for record in turn_records]
+            kv_boundaries = [record.kv_cache_epoch for record in turn_records]
+            group_policy_boundaries.append(policy_boundaries)
+            group_kv_boundaries.append(kv_boundaries)
+            group_evictions_per_turn.append([record.num_evictions for record in turn_records])
             if turn_records:
                 cumulative_turn_lens = [len(t) for t in rollout.trajectory]
                 group_policy_epoch_segments.append(
-                    expand_epoch_segments(
-                        [record.policy_epoch for record in turn_records], cumulative_turn_lens
-                    )
+                    expand_epoch_segments(policy_boundaries, cumulative_turn_lens)
                 )
                 group_kv_epoch_segments.append(
-                    expand_epoch_segments(
-                        [record.kv_cache_epoch for record in turn_records], cumulative_turn_lens
-                    )
+                    expand_epoch_segments(kv_boundaries, cumulative_turn_lens)
                 )
             else:
                 # Unjoined rollouts (placeholders, text rollouts) pop no records: empty rows.
@@ -1469,12 +1674,19 @@ def compute_group_stats(
                 rollout_status = 'placeholder'
             group_rollout_statuses.append(rollout_status)
             group_failure_reasons.append(rollout.failure_reason)
+            group_rollout_env_ids.append(rollout.env_id)
+            group_problem_ids.append(rollout.problem_id)
         all_policy_epoch_segments.append(group_policy_epoch_segments)
         all_kv_cache_epoch_segments.append(group_kv_epoch_segments)
+        all_policy_boundaries.append(group_policy_boundaries)
+        all_kv_boundaries.append(group_kv_boundaries)
+        all_evictions_per_turn.append(group_evictions_per_turn)
         all_completed_epochs.append(group_completed_epochs)
         all_num_evictions.append(group_num_evictions)
         all_rollout_statuses.append(group_rollout_statuses)
         all_failure_reasons.append(group_failure_reasons)
+        all_rollout_env_ids.append(group_rollout_env_ids)
+        all_problem_ids.append(group_problem_ids)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
         env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
@@ -1504,10 +1716,15 @@ def compute_group_stats(
         mean_inf_prob=None,
         policy_epoch_segments=all_policy_epoch_segments,
         kv_cache_epoch_segments=all_kv_cache_epoch_segments,
+        policy_epoch_boundaries=all_policy_boundaries,
+        kv_cache_epoch_boundaries=all_kv_boundaries,
+        num_evictions_per_turn=all_evictions_per_turn,
         completed_epochs=all_completed_epochs,
         num_evictions=all_num_evictions,
         rollout_statuses=all_rollout_statuses,
         failure_reasons=all_failure_reasons,
+        rollout_env_ids=all_rollout_env_ids,
+        problem_ids=all_problem_ids,
     )
     return stats
 
@@ -1549,6 +1766,8 @@ def prep_wandb_metrics(
         current_iteration: int,
         rollout_statuses: List[List[str]] | None = None,
         failure_reasons: List[List[str | None]] | None = None,
+        env_ids: List[List[str]] | None = None,
+        problem_ids: List[List[str | None]] | None = None,
         example_group: list[TokenRollout | Rollout] | None = None,
         tokenizer: MegatronTokenizer | None = None,
     ):
@@ -1557,6 +1776,12 @@ def prep_wandb_metrics(
 
     Zero-turn rollouts are empty-trajectory placeholders for failed episodes.
     Their rewards are excluded from GRPO group normalization; the stats reflect this.
+
+    Staleness (a.k.a. lag) is ``current_iteration - epoch`` and is reported both in the
+    established scalar keys and in a consistent
+    ``staleness/{policy|kv_cache}/{first|avg|last}/...`` scheme. The ``first``/``avg``/
+    ``last`` epochs are per-rollout summaries (the ``avg`` is token-weighted, computed
+    upstream in ``compute_group_stats``); unjoined rollouts carry None and are masked.
 
     Args:
         wandb_writer: Wandb run to log to.
@@ -1569,12 +1794,18 @@ def prep_wandb_metrics(
         kv_cache_epoch_segments: Grouped list of per-rollout (epoch, token_count) segments.
         completed_epochs: Grouped list of per-turn max policy epoch stamps.
         num_evictions: Grouped list of per-rollout number of evictions.
+        env_ids: Grouped per-rollout environment ids (labels the rollout table).
+        problem_ids: Grouped per-rollout problem/prompt ids (labels the rollout table).
         current_iteration: Current training iteration.
         rollout_statuses: Grouped adapter-stamped statuses; None means all 'ok'.
         failure_reasons: Grouped failure-cause labels; None means all None.
         example_group: A list of rollouts of one group to log examples of trajectories.
         tokenizer: Tokenizer to untokenize trajectories for logging.
     """
+    if env_ids is None:
+        env_ids = [[''] * len(g) for g in rewards]
+    if problem_ids is None:
+        problem_ids = [[None] * len(g) for g in rewards]
     # Zero-turn rollouts are failure placeholders.
     real_mask = [[nt > 0 for nt in g] for g in num_turns]
     total_rollouts = sum(len(g) for g in num_turns)
@@ -1641,6 +1872,29 @@ def prep_wandb_metrics(
     traj_lens_real = _real(traj_lens)
     num_turns_real = _real(num_turns)
 
+    def _dist(prefix, values, title, native_hist=True):
+        """Scalars + a Table-backed histogram chart for a 1-D list of values; also a
+        native wandb.Histogram (stacks into an over-time heatmap) when native_hist.
+        The Table is always kept, so the raw values stay queryable."""
+        if not values:
+            return {}
+        arr = np.asarray(values, dtype=float)
+        out = {
+            f'{prefix}/mean': float(arr.mean()),
+            f'{prefix}/min': float(arr.min()),
+            f'{prefix}/max': float(arr.max()),
+            f'{prefix}/p50': float(np.percentile(arr, 50)),
+            f'{prefix}/p90': float(np.percentile(arr, 90)),
+            f'{prefix}/p99': float(np.percentile(arr, 99)),
+            f'{prefix}_hist': wandb_writer.plot.histogram(
+                wandb_writer.Table(columns=['value'], data=[[v] for v in values]),
+                'value', title,
+            ),
+        }
+        if native_hist:
+            out[f'{prefix}/histogram'] = wandb_writer.Histogram(values)
+        return out
+
     # Mirror calculate_grpo_advantages: group means/stds over real rollouts only.
     group_table = wandb_writer.Table(
         columns=['group_means', 'group_stds'],
@@ -1651,6 +1905,8 @@ def prep_wandb_metrics(
     flat_traj_lens = [l for g in traj_lens for l in g]
     flat_num_evictions = [e for g in num_evictions for e in g]
     flat_statuses = [s for g in rollout_statuses for s in g]
+    flat_env_ids = [x for g in env_ids for x in g]
+    flat_problem_ids = [x for g in problem_ids for x in g]
     flat_policy_epochs = [r for g in policy_epoch_segments for r in g]
     flat_kv_epochs = [r for g in kv_cache_epoch_segments for r in g]
     joined = [i for i, row in enumerate(flat_policy_epochs) if row]
@@ -1762,7 +2018,7 @@ def prep_wandb_metrics(
                     'policy_last_token_staleness', 'kv_last_token_staleness',
                     'policy_avg_staleness', 'kv_avg_staleness',
                     'policy_staleness_std', 'kv_staleness_std',
-                    'rollout_status',
+                    'rollout_status', 'env_id', 'problem_id',
                 ],
                 data=list(zip(
                     joined_rewards,
@@ -1777,6 +2033,8 @@ def prep_wandb_metrics(
                     rollout_policy_staleness_std,
                     rollout_kv_staleness_std,
                     joined_statuses,
+                    [flat_env_ids[i] for i in joined],
+                    [flat_problem_ids[i] for i in joined],
                 )),
             ),
             # NOTE: rows are not individual tokens, but instead compressed data.
@@ -1813,6 +2071,22 @@ def prep_wandb_metrics(
                 'staleness', 'Per-Rollout Token-Weighted Avg KV Cache Staleness'
             ),
         }
+
+        # Consistent staleness/{policy|kv_cache}/{first|avg|last}/... distributions
+        # over the joined rollouts, reusing the lag lists already computed above.
+        metrics.update(_dist('staleness/policy/first', rollout_policy_staleness, 'Policy lag (first token)'))
+        metrics.update(_dist('staleness/policy/avg', rollout_policy_avg_staleness, 'Policy lag (avg token)'))
+        metrics.update(_dist('staleness/policy/last', rollout_policy_last_token_staleness, 'Policy lag (last token)'))
+        metrics.update(_dist('staleness/kv_cache/first', rollout_kv_staleness, 'KV-cache lag (first token)'))
+        metrics.update(_dist('staleness/kv_cache/avg', rollout_kv_avg_staleness, 'KV-cache lag (avg token)'))
+        metrics.update(_dist('staleness/kv_cache/last', rollout_kv_last_token_staleness, 'KV-cache lag (last token)'))
+        metrics.update(
+            _dist('evictions/per_rollout', joined_num_evictions, 'Evictions per rollout', native_hist=False)
+        )
+
+    # Rollout-length distributions over real (non-placeholder) rollouts.
+    metrics.update(_dist('length/traj', [l for g in traj_lens_real for l in g], 'Trajectory lengths'))
+    metrics.update(_dist('length/turn', [l for g in turn_lens for l in g], 'Turn lengths'))
 
 
 
@@ -1983,13 +2257,16 @@ def maybe_log_training_metrics(
     num_evictions = group_stats.num_evictions
     rollout_statuses = group_stats.rollout_statuses
     failure_reasons = group_stats.failure_reasons
+    rollout_env_ids = group_stats.rollout_env_ids
+    problem_ids = group_stats.problem_ids
 
     metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
         traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
         policy_epoch_segments=policy_epoch_segments,
         kv_cache_epoch_segments=kv_cache_epoch_segments, completed_epochs=completed_epochs,
         num_evictions=num_evictions, current_iteration=current_iteration,
-        rollout_statuses=rollout_statuses, failure_reasons=failure_reasons)
+        rollout_statuses=rollout_statuses, failure_reasons=failure_reasons,
+        env_ids=rollout_env_ids, problem_ids=problem_ids)
 
 
     env_stats = lambda cont, idx: [cont[i] for i in idx]
@@ -2015,6 +2292,8 @@ def maybe_log_training_metrics(
             kv_cache_epoch_segments=env_stats(kv_cache_epoch_segments, env_idx),
             completed_epochs=env_stats(completed_epochs, env_idx),
             num_evictions=env_stats(num_evictions, env_idx),
+            env_ids=env_stats(rollout_env_ids, env_idx),
+            problem_ids=env_stats(problem_ids, env_idx),
             current_iteration=current_iteration,
             rollout_statuses=env_stats(rollout_statuses, env_idx),
             failure_reasons=env_stats(failure_reasons, env_idx),
@@ -2362,6 +2641,10 @@ def prepare_data_for_update(
         for g in rollouts:
             if g[0].env_id not in example_groups:
                 example_groups[g[0].env_id] = g
+
+        # Dump labeled per-rollout staleness/length data (rank 0, opt-in) while the
+        # rollouts are still grouped (so batch_id / group index are available).
+        dump_staleness_data(rollouts, group_stats, args.curr_iteration)
 
         # Let's expand rollouts getting rid of the groups.
         # We need this to correctly split the rollouts across dp groups.
@@ -3019,6 +3302,7 @@ def megatron_rl_inference_mode(
 
         inference_interface = get_inference_interface(args, loop, model)
         inference_interface.set_generation_epoch(get_args().curr_iteration)
+        _maybe_init_inference_step_tracer(args)
         loop.run_until_complete(inference_interface.resume())
 
         logger.debug(f"[{dist.get_rank()}] Entered inference mode")
@@ -3026,6 +3310,9 @@ def megatron_rl_inference_mode(
 
         with nvtx_range("rl/suspend-engine", time=True):
             loop.run_until_complete(inference_interface.suspend())
+            _tracer = get_inference_step_tracer()
+            if _tracer is not None:
+                _tracer.flush()
 
         if cuda_graph_impl != "none" and not args.rl_training_cuda_graphs:
             toggle_cuda_graphs(lang_module, 'none')

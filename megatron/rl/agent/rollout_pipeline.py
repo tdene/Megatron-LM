@@ -13,6 +13,7 @@ from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
 from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw
+from ..inflight_tracker import add_inflight
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
 from .api import EpisodeResult, GroupedRolloutRequest, GroupRolloutParams, RolloutGroup
 
@@ -381,6 +382,8 @@ class RolloutPipeline:
                         await self.gate.acquire_for("E")
                         previous_env_index = env_index
                     await self.gate.acquire_for("G")
+                    # Mark this group's rollouts as in-flight for the duration of generation.
+                    add_inflight(self.request.rollouts_per_group)
                     self._groups_in_flight += 1
                     env_index = self.gran_policy.env_of_index(index_in_batch)
                     allocation = self.allocations[env_index]
