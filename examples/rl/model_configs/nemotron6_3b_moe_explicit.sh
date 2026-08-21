@@ -3,8 +3,12 @@ TP=${TP:-2}
 PP=${PP:-1}
 EP=${EP:-32}
 NODES_REQUIRED=${NODES_REQUIRED:-4}
-LLM="nemotron6_3b_moe"
+LLM="nemotron6_3b_moe_explicit"
 
+# Explicit-architecture variant of nemotron6_3b_moe.sh for warm starts from
+# checkpoints that do not embed megatron args (e.g. NeMo-RL / megatron-bridge
+# torch-dist checkpoints): replaces --use-checkpoint-args with the model's
+# explicit architecture flags.
 echo "Using Nemotron6 3B MOE model checkpoint"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 # Large-node recipe: default the shared inference KV buffer to 80 GB (overridable).
@@ -30,7 +34,7 @@ if [ "$(basename "$ENV_CONFIG")" = "dapo.yaml" ]; then
   CHKPT_SAVE_INTERVAL=${CHKPT_SAVE_INTERVAL:-20}
 else
   # Some default values if config is unsupported.
-  echo "Undected environment config, using default values"
+  echo "Undetected environment config, using default values"
   GRPO_CLAMP_EPS_LOWER=${GRPO_CLAMP_EPS_LOWER:-0.2}
   GRPO_CLAMP_EPS_UPPER=${GRPO_CLAMP_EPS_UPPER:-0.28}
   MAX_INFERENCE_BS=${MAX_INFERENCE_BS:-64}
@@ -61,8 +65,33 @@ MODEL_OPTIONS="\
   --rl-skip-bos-token \
   --no-rl-use-sequence-packing \
   --inference-dynamic-batching-num-cuda-graphs 32 \
+  --inference-moe-token-dispatcher-type nvls \
   --cuda-graph-impl local \
-  --use-checkpoint-args \
+  --num-layers 52 \
+  --hidden-size 2688 \
+  --ffn-hidden-size 1856 \
+  --num-attention-heads 32 \
+  --kv-channels 128 \
+  --group-query-attention \
+  --num-query-groups 2 \
+  --position-embedding-type none \
+  --squared-relu \
+  --normalization RMSNorm \
+  --untie-embeddings-and-output-weights \
+  --num-experts 128 \
+  --moe-ffn-hidden-size 1856 \
+  --moe-router-topk 6 \
+  --moe-shared-expert-intermediate-size 3712 \
+  --moe-grouped-gemm \
+  --mamba-state-dim 128 \
+  --mamba-head-dim 64 \
+  --mamba-num-groups 8 \
+  --mamba-num-heads 64 \
+  --hybrid-layer-pattern MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME \
+  --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+  --attention-dropout 0.0 \
+  --hidden-dropout 0.0 \
+  --make-vocab-size-divisible-by 128 \
   --enable-experimental \
   --cross-entropy-loss-fusion \
   --cross-entropy-fusion-impl native \
