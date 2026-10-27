@@ -1492,15 +1492,16 @@ try:
 
             if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion).
+                # (post vision/video expansion). The generation log probs travel with the ids as
+                # one bundle: clients such as NeMo Gym reject a message carrying only part of
+                # it, and a request that asked for no token data gets none. Per-token log probs
+                # for such a request are in the OpenAI `logprobs` block when it asks for them.
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            if not payload_offloaded:
-                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
-                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:

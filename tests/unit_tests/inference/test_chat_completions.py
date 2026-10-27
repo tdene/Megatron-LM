@@ -1919,11 +1919,10 @@ async def test_chat_response_format(
     }
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
-    assert choice_0["message"] == {
-        "role": "assistant",
-        "generation_log_probs": [-0.5, -0.25],
-        **expected_message,
-    }
+    token_bundle = (
+        {"generation_log_probs": [-0.5, -0.25]} if "prompt_token_ids" in expected_message else {}
+    )
+    assert choice_0["message"] == {"role": "assistant", **token_bundle, **expected_message}
     assert choice_0["finish_reason"] == expected_finish_reason
     assert choice_0["logprobs"] == expected_logprobs
     assert (choice_0["moe_topk_indices"], choice_0["prompt_moe_topk_indices"]) == (
@@ -1955,6 +1954,39 @@ async def test_chat_warns_when_generation_log_probs_are_missing(reply_fields, wa
 
     assert response.status_code == 200, await response.get_data(as_text=True)
     assert ("Generation log probs is None" in caplog.text) is warns
+
+
+_TOKEN_FIELDS = ("prompt_token_ids", "generation_token_ids", "generation_log_probs")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "app_config", "has_tokens"),
+    [
+        pytest.param({}, {}, False, id="eval-mode-default"),
+        pytest.param({"logprobs": True}, {}, False, id="logprobs-without-token-data"),
+        pytest.param({"return_tokenized_data": True}, {}, True, id="token-data-requested"),
+        pytest.param({}, {"eval_mode": False}, True, id="prevent-retokenization-default"),
+    ],
+)
+async def test_chat_token_metadata_is_all_or_nothing(body, app_config, has_tokens):
+    """Clients such as NeMo Gym reject a message that carries only part of the token metadata, so
+    the message holds all of prompt ids, generation ids and generation log probs, or none."""
+    client = ReplyingClient(
+        [completed_reply("chat-0", [10, 2], [30, 31], generated_log_probs=[-0.5, -0.25])]
+    )
+    app = build_app(CHAT_PATH, client, **app_config)
+
+    response = await app.test_client().post(CHAT_PATH, json={**CHAT_BODY, **body})
+
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    choice = (await response.get_json())["choices"][0]
+    message = choice["message"]
+    assert [field in message for field in _TOKEN_FIELDS] == [has_tokens] * len(_TOKEN_FIELDS)
+    if has_tokens:
+        assert message["generation_log_probs"] == [-0.5, -0.25]
+    # Requested per-token log probs still arrive in the OpenAI block.
+    assert (choice["logprobs"] is not None) is bool(body.get("logprobs"))
 
 
 # The registered parsers end to end: with the model's text fixed, the message is whatever the
@@ -2200,7 +2232,7 @@ async def test_chat_real_parsers_shape_the_message(
     if "tool_calls" in message:
         # Ids are minted per call; the function is what the parser decided.
         message["tool_calls"] = [call["function"] for call in message["tool_calls"]]
-    assert message == {"role": "assistant", "generation_log_probs": None, **expected_message}
+    assert message == {"role": "assistant", **expected_message}
     assert choice["finish_reason"] == expected_finish_reason
 
 
