@@ -1076,6 +1076,7 @@ def get_environment_rollouts(
         if rank == 0:
             # The ledger is exact: every record is popped by exactly one consumer.
             # Groups the pipeline dropped never reach the trainer; their records are drained here.
+            ledgered = set(runtime_state.request_ledger)
             dropped = _ROLLOUT_PIPELINE.take_dropped_completion_ids()
             for completion_id in dropped:
                 runtime_state.request_ledger.pop(completion_id)
@@ -1083,6 +1084,8 @@ def get_environment_rollouts(
             if bank is not None:
                 bank.retire_records(dropped)
             join_request_records(rollouts, runtime_state.request_ledger)
+            # Consumed calls belong to finished rollouts; no continuation needs their tokens.
+            _INFERENCE_INTERFACE.forget_held_prefixes(ledgered - set(runtime_state.request_ledger))
             if not cfg.rl.rl_partial_rollouts:
                 # Nothing is in flight at this boundary (asserted at collection), so every
                 # drained record must have found its consumer.
@@ -3085,6 +3088,7 @@ def evaluate_and_print_results_rl(
         bank = get_rollout_bank()
         if bank is not None:
             bank.retire_records(eval_completion_ids)
+        inference_interface.forget_held_prefixes(eval_completion_ids)
 
         dp_eval_results: list[None | list[EvaluationResponse]] = [
             None for _ in range(args.world_size)

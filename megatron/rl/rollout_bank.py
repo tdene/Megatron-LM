@@ -77,6 +77,8 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.rl.types import Rollout, RolloutGroup, TokenRollout
 
+from .gym_capture import NG_CAPTURE_FIELD, PrefixStoreClient, stage_admitted_call
+
 logger = logging.getLogger(__name__)
 
 # Bump whenever the manifest/ledger schema changes.
@@ -385,9 +387,15 @@ def load_finished_request_records(paths: Iterable[str]) -> dict[str, StagedReque
 class LedgerPayloadStager:
     """RequestPayloadStager for Megatron RL: keeps each finished request's record with its payload."""
 
-    def __init__(self, writer: FinishedRequestLedgerWriter | None = None) -> None:
+    def __init__(
+        self,
+        writer: FinishedRequestLedgerWriter | None = None,
+        prefix_store: PrefixStoreClient | None = None,
+    ) -> None:
         # Durable append-log of the staged requests (the rollout bank's restore source).
         self.writer = writer
+        # Where Gym-admitted calls publish their tokens for the next turn's exact prefix.
+        self.prefix_store = prefix_store
         # Requests staged since the last drain(), by uid; stage() runs on worker threads.
         self.records: dict[str, StagedRequest] = {}
         self._lock = threading.Lock()
@@ -400,15 +408,22 @@ class LedgerPayloadStager:
         finished_metadata: FinishedRequestRecord,
         offload_params: dict | None = None,
     ) -> RequestPayloadStageResult:
-        # MRL joins by uid, so offload_params (a Gym admission on the NeMo RL path) has no role.
         staged = StagedRequest(finished_metadata, payload)
         if self.writer is not None:
             self.writer.append(uid, staged)
         with self._lock:
             assert uid not in self.records, f"finished-request ledger: duplicate uid {uid!r}"
             self.records[uid] = staged
-        # Custody acknowledged: the reply is served without its per-token payload.
-        return RequestPayloadStageResult()
+        # Custody acknowledged: the reply is served without its per-token payload. A Gym
+        # worker-custody admission in offload_params gets its commit coordinates here.
+        admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
+        if admission is None:
+            return RequestPayloadStageResult()
+        if self.prefix_store is not None:
+            self.prefix_store.put(uid, payload.prompt_token_ids, payload.generated_token_ids)
+        return RequestPayloadStageResult(
+            response_metadata=stage_admitted_call(uid, payload, finished_metadata, admission)
+        )
 
     def drain(self) -> dict[str, StagedRequest]:
         """Take every request staged since the last drain."""
