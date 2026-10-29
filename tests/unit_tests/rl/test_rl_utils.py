@@ -2854,6 +2854,23 @@ class TestRLUtils:
             trajectory=None, reward=1.0, env_id='MEGAENV', completion_ids=_mint_cids(2)
         )
         assert not staged.is_placeholder
+        # Retired ids (a dead branch of the episode) are popped and reported, never trained on;
+        # a masked episode's placeholder drains all of its requests the same way.
+        dead_branch = _mint_cids(1)[0]
+        staged.retired_completion_ids = [dead_branch]
+        masked = TokenRollout.placeholder(
+            'MEGAENV',
+            failure_reason='env_masked',
+            rollout_status='masked',
+            retired_completion_ids=_mint_cids(1),
+        )
+        assert masked.is_placeholder
+        masked_ledger = {masked.retired_completion_ids[0]: _ledger_record(8)}
+        assert (
+            rl_utils.join_request_records([[masked]], masked_ledger)
+            == masked.retired_completion_ids
+        )
+        assert not masked_ledger and (masked.trajectory, masked.policy_epochs) == ([], [])
 
         ledger = {
             multi_turn.completion_ids[0]: _ledger_record(7, num_evictions=1),
@@ -2867,14 +2884,16 @@ class TestRLUtils:
             staged.completion_ids[1]: _ledger_record(
                 8, num_evictions=1, payload=_payload([1, 2, 3, eod, 4], [5, eod], [-0.3, -0.4])
             ),
+            dead_branch: _ledger_record(8, payload=_payload([1, 2], [9, eod], [-0.5, -0.6])),
         }
         rollouts = [
             RolloutGroup(rollouts=[multi_turn, twin_a, text]),
             RolloutGroup(rollouts=[twin_b, offloaded, staged]),
         ]
-        rl_utils.join_request_records(rollouts, ledger)
+        retired = rl_utils.join_request_records(rollouts, ledger)
 
         assert not ledger  # every record popped exactly once
+        assert retired == [dead_branch]
         assert multi_turn.policy_epochs == [[(0, 7)], [(0, 8)]]
         assert multi_turn.num_evictions == [1, 0]
         assert twin_a.logprobs == [[0.1, 0.1, 0.1]]  # inline log probs are kept

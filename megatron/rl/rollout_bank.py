@@ -734,6 +734,8 @@ class RolloutBank:
                 trajectory = member.pop("trajectory")  # None: staged, the records hold the turns
                 for field in _RECORD_DERIVED_FIELDS:
                     member.pop(field, None)
+                # Drained at the collection that banked the group; a restored group owns none.
+                member.pop("retired_completion_ids", None)
                 completion_ids = member.get("completion_ids") or []
                 if trajectory is not None and len(completion_ids) != len(trajectory):
                     raise ValueError(

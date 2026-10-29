@@ -43,6 +43,9 @@ class TokenRollout(AgentBaseModel):
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    # Requests of this episode that are not turns (retries, dead branches, the calls of a masked
+    # or failed episode): their records are drained at collection and never trained on.
+    retired_completion_ids: list[str] = []
     policy_epochs: list[list[tuple[int, int]]] | None = None
     kv_cache_epochs: list[list[tuple[int, int]]] | None = None
     num_evictions: list[int] | None = None
@@ -54,6 +57,28 @@ class TokenRollout(AgentBaseModel):
     def is_placeholder(self) -> bool:
         """An empty episode: no turns, and no requests to rebuild them from."""
         return not self.trajectory and not self.completion_ids
+
+    @classmethod
+    def placeholder(
+        cls,
+        env_id: str,
+        failure_reason: str = 'unknown',
+        rollout_status: str = 'placeholder',
+        problem_id: str | None = 'placeholder',
+        **fields,
+    ) -> 'TokenRollout':
+        """Empty-trajectory rollout padding a failed episode."""
+        return cls(
+            trajectory=[],
+            generation_mask=[],
+            reward=0.0,
+            logprobs=[],
+            env_id=env_id,
+            problem_id=problem_id,
+            rollout_status=rollout_status,
+            failure_reason=failure_reason,
+            **fields,
+        )
 
 
 Rollouts = list[TokenRollout | Rollout]

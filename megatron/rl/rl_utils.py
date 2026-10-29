@@ -804,12 +804,22 @@ def get_rollout_generator(
 
 def join_request_records(
     rollouts: GroupedRollouts, request_ledger: dict[str, StagedRequest]
-) -> None:
-    """Pop each turn's finished request onto its TokenRollout."""
+) -> list[str]:
+    """Pop each turn's finished request onto its TokenRollout.
+
+    Returns the retired completion ids: requests of these episodes that are not turns, whose
+    records are popped here and never trained on.
+    """
+    retired: list[str] = []
     for group in rollouts:
         for rollout in group:
             if not isinstance(rollout, TokenRollout) or rollout.policy_epochs is not None:
                 continue
+            for completion_id in rollout.retired_completion_ids:
+                assert request_ledger.pop(completion_id, None) is not None, (
+                    f"finished-request ledger: no record for retired {completion_id!r}."
+                )
+                retired.append(completion_id)
             if rollout.trajectory is not None:
                 assert len(rollout.completion_ids) == len(rollout.trajectory), (
                     f"finished-request ledger: {len(rollout.completion_ids)} completion ids for "
@@ -854,6 +864,7 @@ def join_request_records(
             rollout.policy_epochs = [staged.record.policy_epoch for staged in records]
             rollout.kv_cache_epochs = [staged.record.kv_cache_epoch for staged in records]
             rollout.num_evictions = [staged.record.num_evictions for staged in records]
+    return retired
 
 
 def can_skip_inference() -> bool:
@@ -1083,7 +1094,9 @@ def get_environment_rollouts(
             bank = get_rollout_bank()
             if bank is not None:
                 bank.retire_records(dropped)
-            join_request_records(rollouts, runtime_state.request_ledger)
+            retired = join_request_records(rollouts, runtime_state.request_ledger)
+            if bank is not None and retired:
+                bank.retire_records(retired)
             # Consumed calls belong to finished rollouts, so no continuation needs their tokens;
             # calls of rollouts that never reach the trainer stay held until the agent retires
             # them through Gym's control route.
