@@ -860,6 +860,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_cache_blocks_matched = 0
         self._prefill_tokens_computed = 0
         self._prefill_tokens_skipped = 0
+        # Tokens the engine has generated so far, for the periodic step log (exact server-side output accounting).
+        self._generated_tokens_total = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator mode and its long-lived runtime objects survive a drained
@@ -3248,6 +3250,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Ensure tokens is always a list for consistent handling
             if not isinstance(tokens, list):
                 tokens = [tokens]
+            self._generated_tokens_total += len(tokens)
 
             request: DynamicInferenceRequest = self.get_request(request_id)
 
@@ -4929,6 +4932,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
+            output_str += " ... generated (cumul): %d tokens" % self._generated_tokens_total
             total_proposed = sum(self._spec_tokens_proposed_per_pos)
             total_accepted = sum(self._spec_tokens_accepted_per_pos)
             if self.num_speculative_tokens > 0 and total_proposed > 0:
