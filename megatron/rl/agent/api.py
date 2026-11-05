@@ -42,10 +42,12 @@ class GroupRolloutParams(NamedTuple):
     One instance is created per group call and reused for all rollouts in that group.
     Every rollout is an episode: run_episode generates it (one or more turns), while
     build_rollout turns the completed episode into a Rollout.
+    `blueprint` is a description of the group that `restore_group_rollout` uses after restart.
     """
 
     run_episode: Callable[[], Awaitable[EpisodeResult]]
     build_rollout: Callable[[EpisodeResult], Awaitable[Rollout]]
+    blueprint: dict | None = None
 
 
 class ContrastiveRollout(AgentBaseModel):
@@ -162,6 +164,15 @@ class GroupedRolloutGenerator(Agent, ABC):
     def take_restored_group(self, env_id: str) -> RolloutGroup | None:
         """Return one recovered group for ``env_id``, if one is available."""
         return None
+
+    async def restore_group_rollout(
+        self, request: GroupedRolloutRequest, blueprint: dict
+    ) -> GroupRolloutParams:
+        """Rebuild a group's params from the `blueprint` an earlier run returned for it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} returns no group blueprint, so its partially generated groups "
+            "are regenerated after a restart rather than resumed"
+        )
 
 
 class EvaluationAgent(Agent, ABC):

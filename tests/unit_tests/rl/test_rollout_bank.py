@@ -26,18 +26,27 @@ from megatron.rl.rollout_bank import (
     _CONSUMED,
     _FORMAT_VERSION,
     _GENERATIONS,
+    _INFLIGHT,
     _LEDGER,
     _MANIFEST,
     _REQUEST_RECORDS,
     FinishedRequestLedgerWriter,
     LedgerPayloadStager,
+    LiveRequestIndex,
     RolloutBank,
     _segment_name,
     gather_view,
+    live_request_path,
+    live_request_paths,
     load_finished_request_records,
+    pack_live_request,
+    prune_live_request_dirs,
     request_record_backup_path,
     request_record_paths,
+    scan_live_requests,
+    write_live_requests,
 )
+from megatron.rl.rollout_resume import EPISODE_FIELD
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
 from megatron.rl.types import TokenRollout as SharedTokenRollout
@@ -92,6 +101,21 @@ def _empty_group():
 
 def _empty_token_group():
     return _token_group(empty=True)
+
+
+def _record(generated=(2,), *, prompt=(1,), log_probs=True, routing=None, **fields):
+    """One request's record with its payload; ``log_probs`` True scores every generated token,
+    None scores none; ``fields`` override the record's stamps."""
+    return FinishedRequestRecord(
+        **{"policy_epoch": [(0, 3)], "kv_cache_epoch": [(0, 3)], "num_evictions": 0, **fields},
+        payload=OffloadedRequestPayload(
+            prompt_token_ids=list(prompt),
+            generated_token_ids=list(generated),
+            generated_log_probs=[-0.5] * len(generated) if log_probs is True else log_probs,
+            prompt_log_probs=None,
+            routing_indices=routing,
+        ),
+    )
 
 
 def _staged_token_group():
@@ -311,20 +335,6 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
     group_b, records_b = _token_group(batch_id=1)
     all_records = {**records_a, **records_b}
 
-    def record():
-        return FinishedRequestRecord(
-            policy_epoch=[(0, 3)],
-            kv_cache_epoch=[(0, 3)],
-            num_evictions=0,
-            payload=OffloadedRequestPayload(
-                prompt_token_ids=[1],
-                generated_token_ids=[2],
-                generated_log_probs=[-0.5],
-                prompt_log_probs=None,
-                routing_indices=None,
-            ),
-        )
-
     def backup(window, records):
         """Back records up the way an engine does, into a closed (rotated) window file."""
         path = request_record_backup_path(str(tmp_path), rank=0, iteration=window, tag="deadbeef")
@@ -338,9 +348,9 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
         return set(load_finished_request_records(request_record_paths(str(tmp_path))))
 
     # Window 5 is closed: both groups' records, a turn of an in-flight group, a retired request.
-    backup(5, {**all_records, "chatcmpl-inflight": record(), "chatcmpl-retired": record()})
+    backup(5, {**all_records, "chatcmpl-inflight": _record(), "chatcmpl-retired": _record()})
     # Window 10 is the engines' open file (an evaluation created it); declared at each checkpoint.
-    current = backup(checkpoint_iteration, {"chatcmpl-eval": record()})
+    current = backup(checkpoint_iteration, {"chatcmpl-eval": _record()})
 
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(5)
@@ -388,7 +398,7 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
     # Two windows on: the current window has closed, the retired id's record arrived late, and
     # rank 0 retired the in-flight turn. Only the never-consumed group's records and the still
     # unretired evaluation record remain.
-    backup(checkpoint_iteration + 1, {"chatcmpl-later": record()})
+    backup(checkpoint_iteration + 1, {"chatcmpl-later": _record()})
     bank.retire_records(["chatcmpl-inflight"])
     bank.checkpoint(checkpoint_iteration + 2, open_window=checkpoint_iteration + 2)
     assert kept() == set(records_b) | {"chatcmpl-eval"}
@@ -408,27 +418,13 @@ def test_checkpoint_keeps_the_engines_open_backup_window(tmp_path):
     bank.set_collection(5)
     open_file = request_record_backup_path(str(tmp_path), rank=0, iteration=6, tag="deadbeef")
 
-    def record():
-        return FinishedRequestRecord(
-            policy_epoch=[(0, 3)],
-            kv_cache_epoch=[(0, 3)],
-            num_evictions=0,
-            payload=OffloadedRequestPayload(
-                prompt_token_ids=[1],
-                generated_token_ids=[2],
-                generated_log_probs=[-0.5],
-                prompt_log_probs=None,
-                routing_indices=None,
-            ),
-        )
-
     writer = FinishedRequestLedgerWriter(open_file)
-    writer.append("chatcmpl-eval", record())  # an evaluation during the window creates the file
+    writer.append("chatcmpl-eval", _record())  # an evaluation during the window creates the file
     writer.close()
     with open(open_file, "ab") as handle:  # the engine writer's handle stays open across saves
         bank.checkpoint(7, open_window=6)
         bank.checkpoint(8, open_window=6)
-        handle.write(rollout_bank.pack_finished_request_record("chatcmpl-next-window", record()))
+        handle.write(rollout_bank.pack_finished_request_record("chatcmpl-next-window", _record()))
     records = load_finished_request_records(request_record_paths(str(tmp_path)))
     assert {"chatcmpl-eval", "chatcmpl-next-window"} <= set(records)
 
@@ -492,26 +488,15 @@ def test_record_store_skips_records_that_fail_their_checks(tmp_path, caplog):
     own: the records around it still load, a fold copies the valid frames forward verbatim, and
     the stager's rotate and close reach the writer when there is one."""
 
-    def record(log_prob):
-        return FinishedRequestRecord(
-            policy_epoch=[(0, 3)],
-            kv_cache_epoch=[(0, 3)],
-            num_evictions=0,
-            payload=OffloadedRequestPayload(
-                prompt_token_ids=[1],
-                generated_token_ids=[2],
-                generated_log_probs=[log_prob],
-                prompt_log_probs=None,
-                routing_indices=None,
-            ),
-        )
-
     def tampered(uid, **changes):
-        frame = rollout_bank.pack_finished_request_record(uid, record(-0.5))
+        frame = rollout_bank.pack_finished_request_record(uid, _record(log_probs=[-0.5]))
         payload = {**msgpack.unpackb(frame, raw=False), **changes}
         return msgpack.packb(payload, use_bin_type=True)
 
-    good = {uid: rollout_bank.pack_finished_request_record(uid, record(-0.25)) for uid in "ad"}
+    good = {
+        uid: rollout_bank.pack_finished_request_record(uid, _record(log_probs=[-0.25]))
+        for uid in "ad"
+    }
     flipped = tampered("b", generated_log_probs=b"\xff" * 4)  # arrays no longer match the digest
     foreign = tampered("c", format_version=_FORMAT_VERSION + 1)
     path = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
@@ -529,9 +514,13 @@ def test_record_store_skips_records_that_fail_their_checks(tmp_path, caplog):
     LedgerPayloadStager().close()
     second = request_record_backup_path(str(tmp_path), rank=0, iteration=2, tag="deadbeef")
     stager = LedgerPayloadStager(FinishedRequestLedgerWriter(path))
-    stager.stage("e", record(-0.75).payload, finished_metadata=record(-0.75))
+    stager.stage(
+        "e", _record(log_probs=[-0.75]).payload, finished_metadata=_record(log_probs=[-0.75])
+    )
     stager.rotate(second)
-    stager.stage("f", record(-1.0).payload, finished_metadata=record(-1.0))
+    stager.stage(
+        "f", _record(log_probs=[-1.0]).payload, finished_metadata=_record(log_probs=[-1.0])
+    )
     stager.close()
     assert set(load_finished_request_records([path])) == {"a", "d", "e"}
     assert set(load_finished_request_records([second])) == {"f"}
@@ -544,30 +533,8 @@ def test_record_store_streams_a_file_past_the_unpacker_buffer_cap(tmp_path):
     rows = (101 << 20) // (32 * 8 * 8) + 1  # a routing array just over the cap on its own
     routing = np.arange(rows * 32 * 8, dtype=np.int64).reshape(rows, 32, 8)
     records = {
-        "big": FinishedRequestRecord(
-            policy_epoch=[(0, 3)],
-            kv_cache_epoch=[(0, 3)],
-            num_evictions=0,
-            payload=OffloadedRequestPayload(
-                prompt_token_ids=[1],
-                generated_token_ids=[2],
-                generated_log_probs=[-0.5],
-                prompt_log_probs=None,
-                routing_indices=routing,
-            ),
-        ),
-        "small": FinishedRequestRecord(
-            policy_epoch=[(0, 3)],
-            kv_cache_epoch=[(0, 3)],
-            num_evictions=0,
-            payload=OffloadedRequestPayload(
-                prompt_token_ids=[1, 2],
-                generated_token_ids=[3],
-                generated_log_probs=[-0.25],
-                prompt_log_probs=None,
-                routing_indices=None,
-            ),
-        ),
+        "big": _record([2], routing=routing),
+        "small": _record([3], prompt=(1, 2), log_probs=[-0.25]),
     }
     frames = {uid: rollout_bank.pack_finished_request_record(uid, r) for uid, r in records.items()}
     assert len(frames["big"]) > max(100 << 20, rollout_bank._RECORD_READ_SIZE)
@@ -580,6 +547,131 @@ def test_record_store_streams_a_file_past_the_unpacker_buffer_cap(tmp_path):
     assert np.array_equal(loaded["big"].payload.routing_indices, routing)
     assert loaded["small"].payload.generated_log_probs == [-0.25]
     assert rollout_bank._packed_records([path]) == frames
+
+
+def test_live_requests_are_indexed_scanned_and_pruned_per_run(tmp_path, caplog):
+    """Live-request files are written whole, one per engine rank and run: scanning summarizes
+    them without decoding arrays, the index decodes a request on demand, a later run's file
+    wins a repeated uid, finished-record frames are ignored, and pruning keeps the runs named."""
+    routing = np.arange(6, dtype=np.int64).reshape(2, 3, 1)
+    tag, gym = {EPISODE_FIELD: "g/0/0"}, {"ng_capture": {"mode": "root"}}
+    first, idle, later = (
+        live_request_path(str(tmp_path), *run) for run in (("aaaa", 0), ("aaaa", 1), ("bbbb", 0))
+    )
+
+    def frame(uid, generated, params, **fields):
+        return pack_live_request(uid, _record(generated, **fields), params)
+
+    done = rollout_bank.pack_finished_request_record("done-1", _record([5]))
+    frames = [frame("live-1", [10, 11], tag), frame("live-3", [7], gym, routing=routing), done]
+    write_live_requests(first, frames)
+    write_live_requests(idle, [])  # a coordinator with nothing live
+    write_live_requests(later, [frame("live-1", [10, 11, 12], tag), frame("live-2", [], None)])
+    assert live_request_paths(str(tmp_path)) == [first, idle, later]
+    assert request_record_paths(str(tmp_path)) == []  # record backups do not list them
+    scanned = scan_live_requests(str(tmp_path))
+    expected = {"live-1": (3, tag, later), "live-2": (0, None, later), "live-3": (1, gym, first)}
+    assert {u: (s.generated, s.offload_params, s.path) for u, s in scanned.items()} == expected
+    index = LiveRequestIndex(str(tmp_path))
+    live = index.get("live-1")
+    assert (len(index), live.uid, live.offload_params) == (3, "live-1", tag)
+    assert live.record == dataclasses.replace(_record([10, 11, 12]), payload=live.record.payload)
+    assert live.record.payload.generated_token_ids == [10, 11, 12]
+    routed = index.get("live-3").record.payload.routing_indices
+    assert np.array_equal(routed, routing) and routed.dtype == routing.dtype
+    assert index.get("done-1") is None and index.get("nope") is None
+    prune_live_request_dirs(str(tmp_path), keep=["bbbb"])
+    assert live_request_paths(str(tmp_path)) == [later]
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        assert index.get("live-3") is None
+    assert any("could not be read" in r.message for r in caplog.records)
+
+
+def test_inflight_manifest_round_trips_and_fails_closed(tmp_path):
+    """The in-flight manifest is replaced atomically and read back exactly; a checksum
+    mismatch or unreadable file yields nothing, a foreign format version is refused."""
+    bank = RolloutBank(str(tmp_path))
+    assert bank.load_inflight() == []
+    groups = [
+        {
+            "uid": "g",
+            "env_id": "e",
+            "blueprint": {"prompt": "q"},
+            "batch_id": 1,
+            "index_in_batch": 0,
+            "members": [[]],
+        }
+    ]
+    bank.save_inflight(groups, 7)
+    assert bank.load_inflight() == RolloutBank(str(tmp_path)).load_inflight() == groups
+    path = tmp_path / _INFLIGHT
+    record = json.loads(path.read_text())
+    assert record["collection_iter"] == 7
+    for damaged in (
+        json.dumps({**record, "groups": []}),
+        "{not json",
+    ):  # checksum mismatch, unreadable
+        path.write_text(damaged)
+        assert bank.load_inflight() == []
+    foreign = {"format_version": _FORMAT_VERSION + 1, "collection_iter": 7, "groups": []}
+    path.write_text(json.dumps({**foreign, "checksum": rollout_bank._checksum(foreign)}))
+    with pytest.raises(ValueError, match="format_version"):
+        bank.load_inflight()
+    bank.save_inflight([], 8)
+    assert bank.load_inflight() == []
+
+
+def test_recover_keeps_the_resumed_groups_records(tmp_path):
+    """The finished turns of a group the pipeline resumes are kept at recovery, so the next
+    checkpoint folds them until the group assembles; the dead run's other unreferenced records
+    still go, and a kept id without a record is ignored."""
+    group, records = _token_group(batch_id=0)
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    uid = bank.append(group)
+    bank.close()
+    writer = FinishedRequestLedgerWriter(
+        request_record_backup_path(str(tmp_path), 0, 5, "deadbeef")
+    )
+    for cid, rec in {
+        **records,
+        "chatcmpl-resumed": _record(),
+        "chatcmpl-orphan": _record(),
+    }.items():
+        writer.append(cid, rec)
+    writer.close()
+    resumed = RolloutBank(str(tmp_path))
+    on_disk = load_finished_request_records(request_record_paths(str(tmp_path)))
+    keep = ["chatcmpl-resumed", "chatcmpl-unwritten"]
+    assert [g.uid for g in resumed.recover(5, request_records=on_disk, keep_records=keep)] == [uid]
+    resumed.set_collection(5)
+    resumed.checkpoint(7, open_window=6)
+    kept = set(load_finished_request_records(request_record_paths(str(tmp_path))))
+    assert kept == set(records) | {"chatcmpl-resumed"}
+
+
+def test_append_after_a_checkpoint_reopens_the_collection_without_reusing_uids(tmp_path):
+    """A group that assembles between a checkpoint's compaction and the next collection (the
+    engine runs during an evaluation) lands in the same collection window of the new
+    generation, under a uid no compacted survivor holds, and restores beside them."""
+    groups, records = zip(*(_token_group(batch_id=batch) for batch in range(3)))
+    records = {cid: rec for group_records in records for cid, rec in group_records.items()}
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    first = bank.append(groups[0])
+    bank.checkpoint(7, open_window=6)
+    second = bank.append(groups[1])
+    assert (first, second) == (f"{_segment_name(5)}/0", f"{_segment_name(5)}/1")
+    manifest = json.loads((tmp_path / _MANIFEST).read_text())
+    assert manifest["segments"] == [_segment_name(7), _segment_name(5)]
+    assert [g.uid for g in RolloutBank(str(tmp_path)).restore(7, request_records=records)] == [
+        first,
+        second,
+    ]
+    bank.checkpoint(9, open_window=8)
+    third = bank.append(groups[2])
+    assert third == f"{_segment_name(5)}/2"
+    assert {g.uid for g in bank.restore(9, request_records=records)} == {first, second, third}
 
 
 def _env_group(env_id, problem_id):

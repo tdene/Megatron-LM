@@ -62,7 +62,9 @@ class RLConfig:
 
     rl_durable_rollout_bank: bool = False
     """Persist completed rollout groups to a durable, write-through ledger so they survive a SIGKILL
-    (the SLURM time limit) and are restored at restart instead of regenerated. No-op when unset."""
+    (the SLURM time limit) and are restored at restart instead of regenerated. Every collection also
+    records the engines' in-flight requests and the pipeline's partially generated groups, which a
+    restart resumes. No-op when unset."""
 
     rl_rollout_bank_dir: str | None = None
     """Directory for the durable rollout bank (on Lustre). Defaults to <save>/rollout_bank so the

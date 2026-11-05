@@ -624,7 +624,13 @@ class TestRLUtils:
 
         class FakePipeline:
             def __init__(
-                self, agent, request, parallel_generation_tasks, bank=None, initial_batch_id=0
+                self,
+                agent,
+                request,
+                parallel_generation_tasks,
+                bank=None,
+                initial_batch_id=0,
+                partial_groups=None,
             ):
                 captured["agent"] = agent
                 captured["request"] = request
@@ -632,6 +638,7 @@ class TestRLUtils:
                 self.gate = SimpleNamespace(capacity=parallel_generation_tasks)
                 captured["bank"] = bank
                 captured["initial_batch_id"] = initial_batch_id
+                captured["partial_groups"] = partial_groups
 
             def run(self):
                 return rollout_generator
@@ -680,13 +687,20 @@ class TestRLUtils:
     ):
         """can_skip_inference cold-reads the pipeline bank; a skip routes
         get_environment_rollouts to consume banked groups without inference. Either way the
-        collection drains every engine's request ledger into rank 0 (rotating the backups to
-        the next window), pops the dropped groups' records before the broadcast and, with
+        collection marks every group consumed in the durable bank, drains every engine's
+        request ledger into rank 0 (rotating the backups to the next window), pops the dropped
+        groups' records before the broadcast, records the pipeline's in-flight state and, with
         nothing in flight, fails loudly on a record no consumer claimed."""
         n_prompts = 4
         # The last group holds a failed episode's placeholder naming the one call it made.
-        fake_groups = [[f"group_{i}"] for i in range(n_prompts - 1)] + [
-            [TokenRollout(trajectory=[], reward=0.0, completion_ids=["released-cid"])]
+        fake_groups = [
+            RolloutGroup(rollouts=[Rollout(trajectory=[f"group_{i}"], reward=0.0)], uid=f"g{i}")
+            for i in range(n_prompts - 1)
+        ] + [
+            RolloutGroup(
+                rollouts=[TokenRollout(trajectory=[], reward=0.0, completion_ids=["released-cid"])],
+                uid="g3",
+            )
         ]
         train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
@@ -700,6 +714,8 @@ class TestRLUtils:
         pipeline_stub = SimpleNamespace(
             settle=lambda loop: ready_batches or 0,
             take_dropped_completion_ids=lambda: next(dropped),
+            inflight_manifest=lambda: [{"uid": "in-flight"}],
+            unsettled_resumes=lambda: set(),
         )
 
         def colocated(*args, **kwargs):
@@ -716,7 +732,10 @@ class TestRLUtils:
         interface = SimpleNamespace(
             merge_global_request_ledgers=MagicMock(return_value=drained),
             forget_held_prefixes=MagicMock(),
+            prune_stale_live_requests=MagicMock(),
         )
+        bank = MagicMock()
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
         monkeypatch.setattr(
             rl_utils, "_ROLLOUT_PIPELINE", None if ready_batches is None else pipeline_stub
         )
@@ -765,6 +784,13 @@ class TestRLUtils:
             assert runtime_state.request_ledger == {}
             # The prefix store stops holding the consumed and released calls' tokens.
             interface.forget_held_prefixes.assert_called_once_with({"dropped-cid", "released-cid"})
+            # Consumption is marked on both paths, the dropped and released records retired, and
+            # the in-flight state recorded beside the engines' snapshots.
+            (uids, iteration), _ = bank.mark_consumed_many.call_args
+            assert (list(uids), iteration) == ([group.uid for group in fake_groups], 2)
+            bank.retire_records.assert_called_once_with(["dropped-cid", "released-cid"])
+            bank.save_inflight.assert_called_once_with([{"uid": "in-flight"}], 1)
+            interface.prune_stale_live_requests.assert_called_once_with(set())
         finally:
             loop.run_until_complete(rollout_generator.aclose())
             loop.close()

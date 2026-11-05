@@ -1,12 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Durable rollout bank — the queued-rollout (completed-group) path.
+"""Durable rollout bank: completed groups, and the in-flight state that resumes the rest.
 
 Persists completed ``RolloutGroup``s the instant they assemble, so a SIGKILL (the
 4h SLURM limit) does not destroy work that is already on disk. It covers the queued
 path: groups sitting in the pipeline's ``output_queue`` (assembled, not yet
 trained-in) plus groups consumed at a training step that a restart rolls back.
-In-flight decode state is not persisted.
+At every collection it also records what a restart resumes instead of regenerating
+(``megatron.rl.rollout_resume``): each engine's live requests, snapshotted mid-decode,
+and the pipeline's partially generated groups.
 
 Persisted data comes from two separate sources.
 Data related to the RL pipeline (rewards, env/problem ids, grouping,
@@ -21,8 +23,10 @@ all on Lustre)::
 
     <bank_dir>/
         PIPELINE.json                 # atomically selects one complete generation
+        INFLIGHT.json                 # partially generated groups, replaced at each collection
         request_records/              # live per-rank engine backup files
             records-rank00000-gen000123-<tag>.bin
+            live-<run>/rank00000.bin  # the engine's live requests at its last suspend
         generations/
             generation-<uuid>/
                 consumed.log          # append-only markers {"uid", "iter"}
@@ -52,6 +56,10 @@ iteration number. A surviving group whose request records did not survive the
 crash (lost inside one write-out of the kill) is dropped LOUDLY and excluded from
 the new generation — its work is regenerated, never trained without its inference
 logprobs.
+
+The in-flight state is written whole and atomically (one file per engine rank, one
+manifest for rank 0's pipeline) and read back only at a restart, which keeps the records
+of the groups it resumes alive until they assemble; the next collection replaces it.
 """
 
 import dataclasses
@@ -91,6 +99,8 @@ _REQUEST_RECORDS_DIRNAME = "request_records"
 # Per-run tag: a writer must never append after a crashed run's torn tail.
 _REQUEST_RECORD_BACKUP_TAG = uuid.uuid4().hex[:8]
 _BACKUP_NAME = re.compile(r"records-rank\d+-gen(\d+)-[0-9a-f]+\.bin$")
+_INFLIGHT = "INFLIGHT.json"
+_LIVE_DIR = re.compile(r"live-([A-Za-z0-9_.-]+)$")
 
 
 class LedgerRecord(TypedDict):
@@ -181,6 +191,45 @@ def _backup_paths(bank_dir: str) -> list[str]:
     ]
 
 
+def live_request_dir(bank_dir: str, run_tag: str) -> str:
+    """Directory of one run's live-request files, one per model-parallel coordinator rank."""
+    return os.path.join(request_records_dir(bank_dir), f"live-{run_tag}")
+
+
+def live_request_path(bank_dir: str, run_tag: str, rank: int) -> str:
+    """Live-request file of one engine rank for the run tagged ``run_tag``."""
+    return os.path.join(live_request_dir(bank_dir, run_tag), f"rank{rank:05d}.bin")
+
+
+def live_request_paths(bank_dir: str) -> list[str]:
+    """Every run's live-request files, sorted by run tag then rank."""
+    backup_dir = request_records_dir(bank_dir)
+    if not os.path.isdir(backup_dir):
+        return []
+    paths = []
+    for name in sorted(os.listdir(backup_dir)):
+        run_dir = os.path.join(backup_dir, name)
+        if _LIVE_DIR.match(name) and os.path.isdir(run_dir):
+            paths += [
+                os.path.join(run_dir, file)
+                for file in sorted(os.listdir(run_dir))
+                if file.endswith(".bin")
+            ]
+    return paths
+
+
+def prune_live_request_dirs(bank_dir: str, keep: Iterable[str]) -> None:
+    """Remove the live-request files of every run whose tag is not in ``keep``."""
+    backup_dir = request_records_dir(bank_dir)
+    if not os.path.isdir(backup_dir):
+        return
+    keep = set(keep)
+    for name in os.listdir(backup_dir):
+        match = _LIVE_DIR.match(name)
+        if match and match.group(1) not in keep:
+            shutil.rmtree(os.path.join(backup_dir, name), ignore_errors=True)
+
+
 def _fold_paths(bank_dir: str, manifest: Manifest) -> list[str]:
     """The active generation's folded request-record files (whether or not they exist)."""
     generation_dir = os.path.join(bank_dir, _GENERATIONS, manifest["active_generation"])
@@ -228,6 +277,23 @@ def _record_digest(payload: dict) -> str:
 
 def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> bytes:
     """Encode one record with binary-packed per-token arrays; media and top-N scores are dropped."""
+    return _pack_frame(_record_fields(uid, record))
+
+
+def pack_live_request(uid: str, record: FinishedRequestRecord, offload_params) -> bytes:
+    """Encode a live request's snapshot: a record frame plus the params that re-admit it."""
+    return _pack_frame(
+        {**_record_fields(uid, record), "live": True, "offload_params": offload_params}
+    )
+
+
+def _pack_frame(payload: dict) -> bytes:
+    payload["digest"] = _record_digest(payload)
+    return msgpack.packb(payload, use_bin_type=True)
+
+
+def _record_fields(uid: str, record: FinishedRequestRecord) -> dict:
+    """The packed fields of one record, before its digest."""
 
     def packed(values, dtype) -> Optional[bytes]:
         return None if values is None else np.asarray(values, dtype=dtype).tobytes()
@@ -251,7 +317,7 @@ def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> byt
                 }
             ),
         }
-    payload = {
+    return {
         "format_version": _FORMAT_VERSION,
         "uid": uid,
         "policy_epoch": record.policy_epoch,
@@ -261,8 +327,6 @@ def pack_finished_request_record(uid: str, record: FinishedRequestRecord) -> byt
         "finish_reason": record.finish_reason,
         **tokens,
     }
-    payload["digest"] = _record_digest(payload)
-    return msgpack.packb(payload, use_bin_type=True)
 
 
 def _validate_record(payload: dict, source: str) -> None:
@@ -403,8 +467,12 @@ class FinishedRequestLedgerWriter:
 _RECORD_READ_SIZE = 64 << 20
 
 
-def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
-    """Yield `(uid, decoded payload, packed frame)` for every valid record in `path`."""
+def _scan_frames(path: str) -> Iterator[tuple[str, dict, int, int]]:
+    """Yield `(uid, decoded payload, start, end)` for every valid record in `path`.
+
+    The file is streamed through the unpacker: a window's records, or one request's routing,
+    can run past the 100 MiB that msgpack's default buffer cap would accept in one feed.
+    """
     try:
         f = open(path, "rb")
     except FileNotFoundError:
@@ -416,8 +484,10 @@ def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
             while chunk := f.read(_RECORD_READ_SIZE):
                 unpacker.feed(chunk)
                 for payload in unpacker:
+                    # Right after a decode tell() is this frame's end; once the iteration is
+                    # exhausted it already points into the next, partial frame.
                     end = unpacker.tell()
-                    frame, start = os.pread(f.fileno(), end - start, start), end
+                    span, start = (start, end), end
                     try:
                         _validate_record(payload, path)
                         uid = payload["uid"]
@@ -426,11 +496,22 @@ def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
                             "Skipping an unreadable request record in %s: %s", path, error
                         )
                         continue
-                    yield uid, payload, frame
+                    yield uid, payload, *span
         except Exception:  # pylint: disable=broad-except
             logger.warning(
                 "Corrupt msgpack framing in %s; the records after it were skipped.", path
             )
+
+
+def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
+    """Yield `(uid, decoded payload, packed frame)` for every valid record in `path`."""
+    try:
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return
+    with f:
+        for uid, payload, start, end in _scan_frames(path):
+            yield uid, payload, os.pread(f.fileno(), end - start, start)
 
 
 def load_finished_request_records(paths: Iterable[str]) -> dict[str, FinishedRequestRecord]:
@@ -456,6 +537,92 @@ def _packed_records(paths: Iterable[str]) -> dict[str, bytes]:
 
 #: A request record as the bank folds it: decoded at recovery, a packed frame at a checkpoint.
 RecordOrFrame = FinishedRequestRecord | bytes
+
+
+class LiveRequest(NamedTuple):
+    """A live request as the bank keeps it: its record with the payload pinned, and its params."""
+
+    uid: str
+    record: FinishedRequestRecord
+    offload_params: Optional[dict]
+
+
+class LiveRequestSummary(NamedTuple):
+    """What a restore plans with, read without decoding the request's arrays."""
+
+    uid: str
+    offload_params: Optional[dict]
+    generated: int
+    path: str
+
+
+def _live_request(payload: dict) -> LiveRequest:
+    if not payload.get("live"):
+        raise ValueError(f"request record {payload.get('uid')!r} is not a live-request frame")
+    uid, record = _unpack_record(payload)
+    return LiveRequest(uid, record, payload.get("offload_params"))
+
+
+def write_live_requests(path: str, frames: Iterable[bytes]) -> None:
+    """Atomically replace ``path`` with the given packed frames (an empty file for none)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        for frame in frames:
+            f.write(frame)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_directory(os.path.dirname(path))
+
+
+def scan_live_requests(
+    bank_dir: str, run_tag: Optional[str] = None
+) -> dict[str, LiveRequestSummary]:
+    """Summarize the live requests on disk (one run's with ``run_tag``), by uid; a later run's
+    file wins a repeated uid."""
+    summaries: dict[str, LiveRequestSummary] = {}
+    for path in live_request_paths(bank_dir):
+        if run_tag is not None and os.path.basename(os.path.dirname(path)) != f"live-{run_tag}":
+            continue
+        for uid, payload, _, _ in _scan_frames(path):
+            if not payload.get("live"):
+                continue
+            generated = payload.get("generated_token_ids") or b""
+            summaries[uid] = LiveRequestSummary(
+                uid, payload.get("offload_params"), len(generated) // _TOKEN_DTYPE().nbytes, path
+            )
+    return summaries
+
+
+class LiveRequestIndex:
+    """Where each live request is on disk; a frame is decoded only when a resume asks for it."""
+
+    def __init__(self, bank_dir: str) -> None:
+        self._where: dict[str, tuple[str, int, int]] = {}
+        for path in live_request_paths(bank_dir):
+            for uid, payload, start, end in _scan_frames(path):
+                if payload.get("live"):
+                    self._where[uid] = (path, start, end)
+
+    def __len__(self) -> int:
+        return len(self._where)
+
+    def get(self, uid: str) -> Optional[LiveRequest]:
+        """The live request ``uid``, or None when it is unknown or no longer readable."""
+        where = self._where.get(uid)
+        if where is None:
+            return None
+        path, start, end = where
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                payload = msgpack.unpackb(f.read(end - start), raw=False)
+            _validate_record(payload, path)
+            return _live_request(payload)
+        except (OSError, KeyError, TypeError, ValueError, msgpack.UnpackException) as error:
+            logger.warning("Live request %r could not be read from %s: %s", uid, path, error)
+            return None
 
 
 class LedgerPayloadStager:
@@ -488,8 +655,9 @@ class LedgerPayloadStager:
         with self._lock:
             assert uid not in self.records, f"finished-request ledger: duplicate uid {uid!r}"
             self.records[uid] = finished_metadata
-        # Acknowledge custody before the writer's fsync: Gym's crash domain is this process,
-        # and MRL never resumes an in-flight conversation across a restart.
+        # Acknowledge custody before the writer's fsync: a record the kill loses costs its
+        # group a regeneration at restore (a resumed episode restarts at that turn), never a
+        # rollout trained without its inference log probs.
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if not isinstance(admission, dict):
             if admission is not None:
@@ -650,6 +818,10 @@ class RolloutBank:
         return os.path.join(self.bank_dir, _MANIFEST)
 
     @property
+    def _inflight_path(self) -> str:
+        return os.path.join(self.bank_dir, _INFLIGHT)
+
+    @property
     def _generations_dir(self) -> str:
         return os.path.join(self.bank_dir, _GENERATIONS)
 
@@ -744,7 +916,7 @@ class RolloutBank:
             if segment_created:
                 _fsync_directory(generation_dir)
             self._truncate_torn_ledger_tail(self._seg_dir)
-            self._seq = self._next_sequence(self._seg_dir, seg)
+            self._seq = self._next_sequence(generation_dir, [*manifest["segments"], seg], seg)
             if seg not in manifest["segments"]:
                 manifest["segments"].append(seg)
                 self._write_manifest_atomic(manifest)
@@ -752,13 +924,14 @@ class RolloutBank:
             self._refresh_bytes_written(manifest)
             self._maybe_warn_over_cap()
 
-    def _next_sequence(self, seg_dir: str, seg: str) -> int:
-        """Return the next unused sequence number in ``seg``."""
+    def _next_sequence(self, generation_dir: str, segments: list[str], seg: str) -> int:
+        """The next unused sequence number of ``seg``'s uids, wherever a compaction moved them."""
         next_seq = 0
-        for record in self._read_ledger(seg_dir):
-            uid_seg, separator, uid_seq = record.get("uid", "").partition("/")
-            if separator and uid_seg == seg and uid_seq.isdigit():
-                next_seq = max(next_seq, int(uid_seq) + 1)
+        for segment in dict.fromkeys(segments):
+            for record in self._read_ledger(os.path.join(generation_dir, segment)):
+                uid_seg, separator, uid_seq = record.get("uid", "").partition("/")
+                if separator and uid_seg == seg and uid_seq.isdigit():
+                    next_seq = max(next_seq, int(uid_seq) + 1)
         return next_seq
 
     def _truncate_torn_ledger_tail(self, seg_dir: str) -> None:
@@ -780,6 +953,7 @@ class RolloutBank:
         generation_dir = self._generation_dir(manifest)
         paths = [os.path.join(generation_dir, seg, _LEDGER) for seg in manifest["segments"]]
         paths += _fold_paths(self.bank_dir, manifest) + _backup_paths(self.bank_dir)
+        paths += live_request_paths(self.bank_dir) + [self._inflight_path]
         self._bytes_written = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
 
     def _close_handles(self) -> None:
@@ -795,6 +969,10 @@ class RolloutBank:
     def append(self, group: RolloutGroup) -> str:
         """Write-through one completed group; return its stable uid."""
         with self._lock:
+            if self._seg_dir is None and self._collection_iter is not None:
+                # A compaction closed the segment; a group that assembles before the next
+                # collection (the engine runs during an evaluation) lands in the same window.
+                self.set_collection(self._collection_iter)
             assert self._seg_dir is not None, "set_collection() must be called before append()"
             uid = f"{_segment_name(self._collection_iter)}/{self._seq}"
             self._seq += 1
@@ -865,6 +1043,45 @@ class RolloutBank:
                 os.fsync(f.fileno())
             if created:
                 _fsync_directory(generation_dir)
+
+    # -------------------------------------------------------------- in-flight
+    def save_inflight(self, groups: list[dict], collection_iter: int) -> None:
+        """Atomically replace the manifest of the pipeline's partially generated groups."""
+        record = {
+            "format_version": _FORMAT_VERSION,
+            "collection_iter": collection_iter,
+            "groups": groups,
+        }
+        record["checksum"] = _checksum(record)
+        with self._lock:
+            tmp = self._inflight_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(record, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._inflight_path)
+            _fsync_directory(self.bank_dir)
+
+    def load_inflight(self) -> list[dict]:
+        """The partially generated groups the last collection recorded; empty when unusable."""
+        try:
+            with open(self._inflight_path) as f:
+                record = json.load(f)
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError) as error:
+            logger.warning("Unreadable in-flight manifest at %s: %s", self._inflight_path, error)
+            return []
+        checksum = record.pop("checksum", None) if isinstance(record, dict) else None
+        if (
+            not isinstance(record, dict)
+            or _checksum(record) != checksum
+            or not isinstance(record.get("groups"), list)
+        ):
+            logger.warning("Corrupt in-flight manifest at %s; ignoring it", self._inflight_path)
+            return []
+        _validate_format_version(record, self._inflight_path)
+        return record["groups"]
 
     # --------------------------------------------------------------- restore
     def restore(
@@ -998,7 +1215,8 @@ class RolloutBank:
         to now, are folded into the new generation and then pruned. A record is
         dropped once its group was reclaimed or rank 0 retired it; every other record
         is kept, so in-flight multi-window groups keep theirs across any number of
-        checkpoints. The writer stays closed until the next `set_collection()`.
+        checkpoints. The writer stays closed until the next `set_collection()`, or until
+        a group assembles first and `append()` reopens the collection's segment.
         """
         with self._lock:
             survivors, reclaimed, markers = self._restore_state(iteration)
@@ -1029,19 +1247,25 @@ class RolloutBank:
         self,
         trained_through: int,
         request_records: Optional[dict[str, FinishedRequestRecord]] = None,
+        *,
+        keep_records: Iterable[str] = (),
     ) -> list[RolloutGroup]:
         """Rebase survivors at ``T`` into a new timeline with no old markers.
 
         Groups whose request records did not survive the crash are dropped loudly
-        and excluded; old backup files are pruned at the next checkpoint.
+        and excluded; old backup files are pruned at the next checkpoint. ``keep_records``
+        names the finished turns of the partially generated groups the pipeline resumes:
+        they are folded and kept until those groups assemble and reference them.
         """
         with self._lock:
+            available = request_records or {}
             pairs = self._survivors(trained_through, request_records)
             survivors = [record for record, _ in pairs]
-            referenced = self._referenced_records(survivors, request_records or {})
-            self._retired.update(set(request_records or {}) - set(referenced))
+            folded = self._referenced_records(survivors, available)
+            folded |= {uid: available[uid] for uid in keep_records if uid in available}
+            self._retired.update(set(available) - set(folded))
             self._publish_generation(
-                trained_through, survivors, {}, referenced, timeline=uuid.uuid4().hex
+                trained_through, survivors, {}, folded, timeline=uuid.uuid4().hex
             )
             return [group for _, group in pairs]
 
@@ -1116,7 +1340,6 @@ class RolloutBank:
         # manifest flip is durable. It is safe to reclaim only afterward.
         shutil.rmtree(os.path.join(self._generations_dir, old_generation), ignore_errors=True)
         _fsync_directory(self._generations_dir)
-        self._collection_iter = None
         self._seg_dir = None
 
     def _write_markers(self, generation_dir: str, markers: dict[str, int]) -> None:

@@ -2,6 +2,8 @@
 
 import asyncio
 import functools
+import json
+import logging
 from typing import Any
 
 import numpy as np
@@ -14,6 +16,7 @@ from ..inference import (
     ReturnsRaw,
     ReturnsTokens,
 )
+from ..rollout_resume import resume_point
 from .api import (
     EpisodeResult,
     EvaluationAgent,
@@ -29,6 +32,11 @@ from .api import (
     TokenRollout,
 )
 from .pass_at_evaluation_agent import PassAtEvaluationAgent
+
+logger = logging.getLogger(__name__)
+
+# Set once a golden has failed to serialize: every group of such an agent would warn otherwise.
+_NON_JSON_GOLDEN_LOGGED = False
 
 
 @EvaluationResponse.register_subclass
@@ -139,13 +147,39 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         get_rollout_response().
         get_observation() is consulted only while another generation is still possible;
         on continue, the reply and observation are appended.
+        An episode the rollout bank resumes after a restart re-enters at its first unanswered turn:
+        the answered turns are not re-run and their observations are not recomputed.
 
         Runs inside the infer stage, holding one submission slot for the whole episode.
         """
         conversation = prompt
         responses: list[InferenceResponse] = []
+        pending_prompt = None
+        resumed = resume_point()
+        if resumed is not None:
+            responses = list(resumed.responses)
+            conversation = resumed.conversation
+            pending_prompt = resumed.pending_prompt
 
-        for turn_idx in range(self.max_turns):
+        for turn_idx in range(len(responses), self.max_turns):
+            if turn_idx > 0:
+                if pending_prompt is not None:
+                    # Resumed with this turn already issued: its prompt holds the observation.
+                    conversation, pending_prompt = pending_prompt, None
+                else:
+                    observation, done = await self.get_observation(
+                        turn_idx - 1, responses[-1], conversation, golden
+                    )
+                    if done:
+                        break
+                    if not observation:
+                        raise ValueError("get_observation must return a non-empty observation")
+
+                    conversation += [
+                        responses[-1].response,
+                        LLMChatMessage(role="user", content=observation),
+                    ]
+
             turn_request = request.inference_interface.prepare_request(
                 conversation, request.generation_args
             )
@@ -155,22 +189,6 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
 
             response = await self.get_rollout_response(request, turn_request)
             responses.append(response)
-
-            if turn_idx + 1 < self.max_turns:
-                observation, done = await self.get_observation(
-                    turn_idx, response, conversation, golden
-                )
-                if done:
-                    break
-                if not observation:
-                    raise ValueError(
-                        "get_observation must return a non-empty observation"
-                    )
-
-                conversation += [
-                    response.response,
-                    LLMChatMessage(role="user", content=observation),
-                ]
 
         # The loop appends a reply only when continuing, so the final turn's reply is not in
         # `conversation` yet; append it once so get_trajectory_reward sees the full dialogue.
@@ -253,6 +271,14 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         prompt, golden = await self.get_prompt(validation=request.validation)
         return self.group_rollout_params(request, prompt=prompt, golden=golden)
 
+    async def restore_group_rollout(
+        self, request: GroupedRolloutRequest, blueprint: dict
+    ) -> GroupRolloutParams:
+        prompt = blueprint["prompt"]
+        if not isinstance(prompt, str):
+            prompt = [LLMChatMessage(**message) for message in prompt]
+        return self.group_rollout_params(request, prompt=prompt, golden=blueprint["golden"])
+
     def group_rollout_params(
         self,
         request: RolloutRequest | GroupedRolloutRequest,
@@ -265,7 +291,29 @@ class RewardOnlyAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluatio
         return GroupRolloutParams(
             run_episode=functools.partial(self._run_episode, request, prompt=prompt, golden=golden),
             build_rollout=functools.partial(self._rollout_from_episode, request, golden=golden),
+            blueprint=self._group_blueprint(prompt, golden),
         )
+
+    @staticmethod
+    def _group_blueprint(prompt: str | list[LLMChatMessage], golden: Any) -> dict | None:
+        """What `restore_group_rollout` rebuilds the params from; None when golden is not JSON."""
+        blueprint = {
+            "prompt": prompt if isinstance(prompt, str) else [m.model_dump() for m in prompt],
+            "golden": golden,
+        }
+        try:
+            json.dumps(blueprint)
+        except (TypeError, ValueError) as error:
+            global _NON_JSON_GOLDEN_LOGGED
+            if not _NON_JSON_GOLDEN_LOGGED:
+                _NON_JSON_GOLDEN_LOGGED = True
+                logger.warning(
+                    "The golden is not JSON-serializable (%s), so this agent's partially generated "
+                    "groups are regenerated after a restart rather than resumed (logged once)",
+                    error,
+                )
+            return None
+        return blueprint
 
     async def _evaluation(
         self, prompt: str, golden: Any, request: EvaluationRequest

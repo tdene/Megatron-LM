@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
 import logging
-from typing import Any
+import uuid
+from typing import Any, Iterable
 
 import httpx
 import torch.distributed as dist
@@ -26,11 +28,19 @@ from ..gym_capture import GymPromptPreparer, PrefixStoreClient, PrefixStoreServe
 from ..rollout_bank import (
     FinishedRequestLedgerWriter,
     LedgerPayloadStager,
+    LiveRequestIndex,
     gather_view,
+    live_request_path,
+    pack_live_request,
+    prune_live_request_dirs,
     request_record_backup_path,
     resolve_bank_dir,
+    scan_live_requests,
+    write_live_requests,
 )
+from ..rollout_resume import EPISODE_FIELD, ResumingPromptPreparer, generate_in_episode
 from ..server.api import InferenceServer
+from .api import InferenceRequest, InferenceResponse
 from .chat_interface import MegatronChatInterface
 
 logger = logging.getLogger(__name__)
@@ -90,6 +100,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     _request_record_backup_dir: str | None = PrivateAttr(None)
     _prefix_store: PrefixStoreClient | None = PrivateAttr(None)
     _prefix_store_server: PrefixStoreServer | None = PrivateAttr(None)
+    _live_request_path: str | None = PrivateAttr(None)
+    _live_run_tag: str | None = PrivateAttr(None)
 
     @property
     def generation_lag(self) -> float:
@@ -151,14 +163,22 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         # Gym admissions need the parent call's exact tokens on whichever engine continues it:
         # rank 0 serves them for the job, every stager publishes, every preparer fetches.
         prefix_store_server = PrefixStoreServer() if dist.get_rank() == 0 else None
-        address = [None if prefix_store_server is None else prefix_store_server.address]
-        dist.broadcast_object_list(address, src=0)
-        assert isinstance(address[0], str), f"prefix store address not broadcast: {address[0]!r}"
-        prefix_store = PrefixStoreClient(address[0])
+        shared = [
+            None if prefix_store_server is None else prefix_store_server.address,
+            uuid.uuid4().hex[:8],  # the run tag of this launch's live-request files
+        ]
+        dist.broadcast_object_list(shared, src=0)
+        address, run_tag = shared
+        assert isinstance(address, str), f"prefix store address not broadcast: {address!r}"
+        prefix_store = PrefixStoreClient(address)
         prefix_store.ping()  # a store no rank can reach fails the launch, not every request
-        print_rank_0(f"Prefix store for Gym admissions at {address[0]}")
+        print_rank_0(f"Prefix store for Gym admissions at {address}")
         inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
-        inference_engine.prompt_preparer = GymPromptPreparer(prefix_store)
+        preparer = GymPromptPreparer(prefix_store)
+        if bank_dir is not None:
+            # Any coordinator may be handed a resumed turn: each indexes the last run's snapshots.
+            preparer = ResumingPromptPreparer(preparer, LiveRequestIndex(bank_dir))
+        inference_engine.prompt_preparer = preparer
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -195,6 +215,11 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         launched_server._request_record_backup_dir = bank_dir
         launched_server._prefix_store = prefix_store
         launched_server._prefix_store_server = prefix_store_server
+        launched_server._live_run_tag = run_tag
+        if bank_dir is not None:
+            launched_server._live_request_path = live_request_path(
+                bank_dir, run_tag, dist.get_rank()
+            )
 
         concurrency_limit = (
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
@@ -249,6 +274,42 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         if dist.get_rank() == 0:
             self._prefix_store.forget(uids)
 
+    async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
+        if self._live_request_path is None:
+            return await self._complete(request)
+        return await generate_in_episode(request, self._complete)
+
+    async def _save_live_requests(self) -> None:
+        """Snapshot this engine's live requests into its live-request file."""
+        engine = self._inference_engine
+        if self._live_request_path is None or not engine.is_mp_coordinator:
+            return
+        try:
+            frames = []
+            for snapshot in await engine.snapshot_live_requests():
+                record = dataclasses.replace(snapshot.record, payload=snapshot.payload)
+                frames.append(pack_live_request(snapshot.uid, record, snapshot.offload_params))
+            write_live_requests(self._live_request_path, frames)
+        except Exception:  # pylint: disable=broad-except
+            # Best effort: a request that is not snapshotted is regenerated after a restart.
+            logger.exception("Could not save the live requests to %s", self._live_request_path)
+
+    def prune_stale_live_requests(self, unsettled: Iterable[str]) -> None:
+        """Rank 0: remove earlier runs' live-request files once nothing can still read them."""
+        if dist.get_rank() != 0 or self._live_request_path is None:
+            return
+        unsettled = set(unsettled)
+        if unsettled:
+            mine = scan_live_requests(self._request_record_backup_dir, self._live_run_tag)
+            admitted = {
+                summary.offload_params.get(EPISODE_FIELD)
+                for summary in mine.values()
+                if isinstance(summary.offload_params, dict)
+            }
+            if not unsettled <= admitted:
+                return
+        prune_live_request_dirs(self._request_record_backup_dir, keep=[self._live_run_tag])
+
     def set_generation_epoch(self, generation_epoch: int):
         if dist.get_rank() == 0:
             self._client.set_generation_epoch(generation_epoch)
@@ -257,6 +318,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         if dist.get_rank() == 0:
             self._client.pause_engines()
         await self._inference_engine.wait_until(EngineState.PAUSED)
+
+        await self._save_live_requests()
 
         if dist.get_rank() == 0:
             self._client.suspend_engines()

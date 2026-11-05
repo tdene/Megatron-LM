@@ -30,7 +30,20 @@ class MegatronChatInterface(ReturnsTokens):
         return self._openai_client
 
     async def base_generate(self, request: InferenceRequest) -> InferenceResponse:
+        return await self._complete(request)
+
+    async def _complete(
+        self, request: InferenceRequest, offload_params: dict | None = None
+    ) -> InferenceResponse:
+        """One chat completion; ``offload_params`` ride to the engine's preparer and stager."""
         temperature = request.generation_args.temperature
+        extra_body = {
+            "skip_prompt_log_probs": True,
+            "add_BOS": self.add_bos,
+            "return_raw_text": False,
+        }
+        if offload_params is not None:
+            extra_body["offload_params"] = offload_params
         response = await self.openai_client().chat.completions.create(
             model="",
             messages=[message.model_dump() for message in request.prompt],
@@ -38,11 +51,7 @@ class MegatronChatInterface(ReturnsTokens):
             top_p=request.generation_args.top_p or 0.0,
             n=1,
             logprobs=True,
-            extra_body={
-                "skip_prompt_log_probs": True,
-                "add_BOS": self.add_bos,
-                "return_raw_text": False,
-            },
+            extra_body=extra_body,
         )
 
         choice = response.choices[0]

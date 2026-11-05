@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import time
+import uuid
 from collections import deque
 from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
 
@@ -15,6 +16,7 @@ from megatron.core.utils import trace_async_exceptions
 
 from ..inference import ReturnsRaw, ReturnsTokens
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
+from ..rollout_resume import EpisodeJournal, EpisodeKey, PartialGroup, run_in_episode
 from .api import (
     EpisodeResult,
     GroupedRolloutRequest,
@@ -185,6 +187,7 @@ class _InferWorkItem(NamedTuple):
     index_in_batch: int
     params: GroupRolloutParams
     env_index: int = 0
+    group_uid: str = ""
     prepared_at: float = 0.0
     infer_dequeued_at: float = 0.0
 
@@ -211,6 +214,7 @@ class RolloutPipeline:
         parallel_generation_tasks: int,
         bank: "RolloutBank | None" = None,
         initial_batch_id: int = 0,
+        partial_groups: list[PartialGroup] | None = None,
     ) -> None:
         """Validate the request and size the gate, queues, and worker pool.
 
@@ -220,6 +224,7 @@ class RolloutPipeline:
             parallel_generation_tasks: Submission gate depth in trainer batches.
             bank: Optional durable store for freshly completed rollout groups.
             initial_batch_id: Batch ID assigned to the first batch in this pipeline.
+            partial_groups: Groups an earlier run left in flight, resumed before fresh ones.
         """
         assert isinstance(
             request.inference_interface, (ReturnsRaw, ReturnsTokens)
@@ -260,6 +265,23 @@ class RolloutPipeline:
         self._groups_in_flight = 0
         self._regen_tasks: set[asyncio.Task] = set()
 
+        # The turns of every in-flight episode, keyed by group uid; the in-flight manifest.
+        self.journal = EpisodeJournal()
+        # Groups to resume, by env id, taken before fresh groups of that env are prepared.
+        self._partial_groups: dict[str, deque[PartialGroup]] = {}
+        known_env_ids = {allocation.env_id for allocation in self.allocations}
+        for partial in partial_groups or ():
+            if partial.env_id not in known_env_ids:
+                logger.warning(
+                    "Dropping in-flight group %s of env %r, which is not in the current "
+                    "--langrl-env-config (known: %s); it is regenerated.",
+                    partial.uid,
+                    partial.env_id,
+                    sorted(known_env_ids),
+                )
+                continue
+            self._partial_groups.setdefault(partial.env_id, deque()).append(partial)
+
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
         self._consume_pending: dict[int, list[RolloutGroup]] = {}
@@ -281,10 +303,13 @@ class RolloutPipeline:
         self.filtered_count = 0
         self.refilled_placeholder_groups = 0
         self.restored_count = 0
+        # Groups resumed from an earlier run's in-flight state (prepared from their blueprint).
+        self.resumed_count = 0
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.restored_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
+        self.resumed_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.yielded_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.refill_failure_reasons: dict[str, int] = {}
         self._lifetime_refilled_groups = 0
@@ -327,13 +352,41 @@ class RolloutPipeline:
             await asyncio.gather(*tasks, *regen_tasks, return_exceptions=True)
 
     async def _submit_group_to_infer_queue(
-        self, *, group_id: int, batch_id: int, index_in_batch: int
+        self,
+        *,
+        group_id: int,
+        batch_id: int,
+        index_in_batch: int,
+        partial: PartialGroup | None = None,
     ) -> None:
-        """Enqueue one group's inference items, acquiring per-rollout gate slots."""
+        """Enqueue one group's inference items, acquiring per-rollout gate slots.
+
+        A ``partial`` group is prepared from its blueprint and its episodes continue their
+        recorded turns; when it cannot be, a fresh group takes the slot.
+        """
         env_index = self.gran_policy.env_of_index(index_in_batch)
-        agent = self.allocations[env_index].agent
-        params: GroupRolloutParams = await agent.prepare_group_rollout(self.request)
+        allocation = self.allocations[env_index]
+        params = None
+        if partial is not None:
+            params = await self._restore_group_params(allocation.agent, partial)
+            if params is None:
+                partial = None
+            else:
+                self.resumed_count += 1
+                self.resumed_groups_per_env[env_index] += 1
+        if params is None:
+            params = await allocation.agent.prepare_group_rollout(self.request)
         self.prepared_groups_per_env[env_index] += 1
+        group_uid = uuid.uuid4().hex if partial is None else partial.uid
+        self.journal.open_group(
+            group_uid,
+            env_id=allocation.env_id,
+            blueprint=params.blueprint,
+            batch_id=batch_id,
+            index_in_batch=index_in_batch,
+            members=self.request.rollouts_per_group,
+            plans=None if partial is None else partial.members,
+        )
 
         for rollout_idx in range(self.request.rollouts_per_group):
             await self.gate.acquire_for("R")
@@ -344,10 +397,44 @@ class RolloutPipeline:
                 index_in_batch=index_in_batch,
                 params=params,
                 env_index=env_index,
+                group_uid=group_uid,
                 prepared_at=time.monotonic(),
             )
             await self.infer_queue.put(item)
             self.prepared_count += 1
+
+    async def _restore_group_params(
+        self, agent: "GroupedRolloutGenerator", partial: PartialGroup
+    ) -> GroupRolloutParams | None:
+        """The params of an in-flight group rebuilt from its blueprint; None when that fails."""
+        if len(partial.members) != self.request.rollouts_per_group:
+            logger.warning(
+                "In-flight group %s has %d members, the request %d; regenerating it.",
+                partial.uid,
+                len(partial.members),
+                self.request.rollouts_per_group,
+            )
+            return None
+        try:
+            return await agent.restore_group_rollout(self.request, partial.blueprint)
+        except NotImplementedError as unsupported:
+            logger.warning("In-flight group %s is regenerated: %s", partial.uid, unsupported)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("In-flight group %s could not be restored; regenerating", partial.uid)
+        return None
+
+    def _take_partial_group(self, env_id: str) -> PartialGroup | None:
+        """The next in-flight group of ``env_id`` to resume, if any is left."""
+        queue = self._partial_groups.get(env_id)
+        return queue.popleft() if queue else None
+
+    def inflight_manifest(self) -> list[dict]:
+        """The in-flight groups a restart can resume, as the bank records them."""
+        return self.journal.manifest()
+
+    def unsettled_resumes(self) -> set[str]:
+        """Tags of the turns planned to resume an earlier run's live request, still unanswered."""
+        return self.journal.unsettled_resumes()
 
     def _maybe_close_intake(self) -> None:
         """Shut down infer_queue once no work can ever be submitted again."""
@@ -413,7 +500,10 @@ class RolloutPipeline:
                         group_id += 1
                         continue
                     await self._submit_group_to_infer_queue(
-                        group_id=group_id, batch_id=batch_id, index_in_batch=index_in_batch
+                        group_id=group_id,
+                        batch_id=batch_id,
+                        index_in_batch=index_in_batch,
+                        partial=self._take_partial_group(allocation.env_id),
                     )
                     group_id += 1
                 batch_id += 1
@@ -454,7 +544,9 @@ class RolloutPipeline:
         Args:
             item: The dequeued work item; its params carry the episode closure.
         """
-        episode = await item.params.run_episode()
+        episode = await run_in_episode(
+            self.journal, EpisodeKey(item.group_uid, item.rollout_idx), item.params.run_episode
+        )
         inferred_at = time.monotonic()
         self.gate.release_for("R")
         if item.infer_dequeued_at:
@@ -482,6 +574,7 @@ class RolloutPipeline:
                     continue
                 completed = pending.pop(inferred.item.group_id)
                 completed.sort(key=lambda item: item.item.rollout_idx)
+                self.journal.close_group(inferred.item.group_uid)
                 rollouts = await asyncio.gather(
                     *[item.item.params.build_rollout(item.episode) for item in completed]
                 )

@@ -107,8 +107,10 @@ from megatron.rl.rollout_bank import (
     rebuild_turns,
     request_record_paths,
     resolve_bank_dir,
+    scan_live_requests,
 )
 from megatron.rl.rollout_granularity import ConsumptionGranularity, SubmissionGranularity
+from megatron.rl.rollout_resume import plan_partial_groups
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -416,6 +418,8 @@ class RLRuntimeState:
         # rollout agent, which treats them as per-environment producers.
         self.rollout_bank = None
         self.bank_restored = False
+        # Groups the last run left in flight, handed to the pipeline when it is built.
+        self.partial_groups = []
         # Derived throughput metrics (set by log_rl_throughput_metrics, read by RLProfiler).
         # Per-GPU variants are available via methods that divide by world_size.
         self.world_size = None
@@ -785,13 +789,16 @@ def get_rollout_generator(
             consumption_granularity=consumption_granularity,
         )
         # Keep the pipeline handle so logging can read its queues, gate state, and per-env counters.
+        runtime_state = get_rl_runtime_state()
         _ROLLOUT_PIPELINE = RolloutPipeline(
             agent=_get_or_create_rollout_agent(env_config_path),
             request=request,
             parallel_generation_tasks=generation_lag + 1,
             bank=get_rollout_bank(),
             initial_batch_id=current_iteration,
+            partial_groups=runtime_state.partial_groups,
         )
+        runtime_state.partial_groups = []
         log_single_rank(
             logger,
             logging.INFO,
@@ -959,17 +966,31 @@ def colocated_inference(
                 if not runtime_state.bank_restored:
                     # Restored groups come back fully joined with their durable request records.
                     records = load_finished_request_records(request_record_paths(bank.bank_dir))
+                    # The last run's in-flight groups, resumed from their finished turns'
+                    # records and the engines' live-request snapshots.
+                    partial_groups = plan_partial_groups(
+                        bank.load_inflight(), records, scan_live_requests(bank.bank_dir)
+                    )
+                    resumed_records = {
+                        cid: records[cid] for group in partial_groups for cid in group.record_ids
+                    }
                     restored_groups: GroupedRollouts = bank.recover(
-                        train_state.resume_iteration, request_records=records
+                        train_state.resume_iteration,
+                        request_records=records,
+                        keep_records=resumed_records,
                     )
                     total_restored_groups = agent.set_restored_groups(restored_groups)
+                    # The join pops a resumed episode's finished turns like any other record.
+                    runtime_state.request_ledger.update(resumed_records)
+                    runtime_state.partial_groups = partial_groups
                     runtime_state.bank_restored = True
-                    if total_restored_groups:
+                    if total_restored_groups or partial_groups:
                         log_single_rank(
                             logger,
                             logging.INFO,
-                            f"RolloutBank restored {total_restored_groups} completed groups from "
-                            f"disk at resume iteration {train_state.resume_iteration}",
+                            f"RolloutBank restored {total_restored_groups} completed groups and "
+                            f"{len(partial_groups)} partially generated groups from disk at "
+                            f"resume iteration {train_state.resume_iteration}",
                         )
                 bank.set_collection(train_state.iteration)
 
@@ -1007,18 +1028,24 @@ def colocated_inference(
                     ]
                     if not cfg.rl.rl_partial_rollouts:
                         _ROLLOUT_PIPELINE.assert_no_inflight_rollouts()
-                    # Record consumption for every group handed to the trainer. On a
-                    # rollback (restart before this update) the marker > T rule restores
-                    # these; once a checkpoint includes the update they are pruned.
-                    if bank is not None:
-                        bank.mark_consumed_many(
-                            (group.uid for group in rollouts), train_state.iteration + 1
-                        )
                 else:
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
     return rollouts
+
+
+def _persist_inflight_state(bank: RolloutBank | None) -> None:
+    """Rank 0: record the pipeline's in-flight groups beside the engines' live-request files.
+
+    Written after every ledger drain, so the manifest and the snapshots the suspend took
+    describe the same quiescent engines. Earlier runs' snapshots are pruned once every turn
+    planned to resume from them is answered or decoding under this run.
+    """
+    if bank is None or _ROLLOUT_PIPELINE is None:
+        return
+    bank.save_inflight(_ROLLOUT_PIPELINE.inflight_manifest(), get_train_state().iteration)
+    _INFERENCE_INTERFACE.prune_stale_live_requests(_ROLLOUT_PIPELINE.unsettled_resumes())
 
 
 def get_environment_rollouts(
@@ -1070,6 +1097,13 @@ def get_environment_rollouts(
         # Just set up space to collect the rollouts
         rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
+    bank = get_rollout_bank()
+    if rank == 0 and bank is not None:
+        # Record consumption for every group handed to the trainer, whether inference ran or a
+        # buffered batch was consumed. On a rollback (restart before this update) the marker > T
+        # rule restores these; once a checkpoint includes the update they are pruned.
+        bank.mark_consumed_many((group.uid for group in rollouts), train_state.iteration + 1)
+
     if rank == 0 and torch.are_deterministic_algorithms_enabled():
         # In deterministic mode, sort rollouts by problem_id for consistent ordering
         # regardless of completion order due to system timing jitter.
@@ -1106,7 +1140,6 @@ def get_environment_rollouts(
             for completion_id in released:
                 # A call that finished after its episode failed may only reach a later drain.
                 runtime_state.request_ledger.pop(completion_id, None)
-            bank = get_rollout_bank()
             if bank is not None:
                 bank.retire_records(dropped + released)
             join_request_records(rollouts, runtime_state.request_ledger)
@@ -1114,6 +1147,7 @@ def get_environment_rollouts(
             _INFERENCE_INTERFACE.forget_held_prefixes(
                 (ledgered - set(runtime_state.request_ledger)) | set(released)
             )
+            _persist_inflight_state(bank)
             if not cfg.rl.rl_partial_rollouts:
                 # Nothing is in flight at this boundary (asserted at collection), so every
                 # drained record must have found its consumer.
@@ -2181,6 +2215,10 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_filtered_count": pipeline.filtered_count,
         "rollout_pipeline_refilled_placeholder_groups": pipeline.refilled_placeholder_groups,
         "rollout_pipeline_restored_count": pipeline.restored_count,
+        "rollout_pipeline_resumed_count": pipeline.resumed_count,
+        "rollout_pipeline_resumed_turns_served": pipeline.journal.served_turns,
+        "rollout_pipeline_resumed_requests": pipeline.journal.resumed_requests,
+        "rollout_pipeline_abandoned_resume_plans": pipeline.journal.abandoned_plans,
         "rollout_pipeline_yielded_count": pipeline.yielded_count,
     })
     # Refilled groups never reach the trainer-side failure accounting,
@@ -2218,6 +2256,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
             pipeline.assembled_groups_per_env[env_index]
         )
         metrics[f"{allocation.env_id}_restored_groups"] = restored_groups
+        metrics[f"{allocation.env_id}_resumed_groups"] = pipeline.resumed_groups_per_env[env_index]
         metrics[f"{allocation.env_id}_restored_groups_percentage"] = restored_groups_percentage
         metrics[f"{allocation.env_id}_fresh_groups_percentage"] = fresh_groups_percentage
         metrics[f"{allocation.env_id}_yielded_groups"] = yielded_groups
@@ -2239,11 +2278,16 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.refilled_placeholder_groups = 0
     pipeline.refill_failure_reasons = {}
     pipeline.restored_count = 0
+    pipeline.resumed_count = 0
+    pipeline.journal.served_turns = 0
+    pipeline.journal.resumed_requests = 0
+    pipeline.journal.abandoned_plans = 0
     pipeline.yielded_count = 0
     num_envs = len(pipeline.gran_policy.num_groups_per_env)
     pipeline.prepared_groups_per_env = [0] * num_envs
     pipeline.assembled_groups_per_env = [0] * num_envs
     pipeline.restored_groups_per_env = [0] * num_envs
+    pipeline.resumed_groups_per_env = [0] * num_envs
     pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0
@@ -3121,6 +3165,8 @@ def evaluate_and_print_results_rl(
         if bank is not None:
             bank.retire_records(eval_completion_ids)
         inference_interface.forget_held_prefixes(eval_completion_ids)
+        # Training episodes advanced while the engine served the evaluation.
+        _persist_inflight_state(bank)
 
         dp_eval_results: list[None | list[EvaluationResponse]] = [
             None for _ in range(args.world_size)
