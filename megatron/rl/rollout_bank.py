@@ -77,7 +77,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.rl.types import Rollout, RolloutGroup, TokenRollout
 
-from .gym_capture import NG_CAPTURE_FIELD, PrefixStoreClient, stage_admitted_call
+from .gym_capture import NG_CAPTURE_FIELD, PrefixStoreClient, PrefixStoreError, stage_admitted_call
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +398,10 @@ class LedgerPayloadStager:
         self.prefix_store = prefix_store
         # Requests staged since the last drain(), by uid; stage() runs on worker threads.
         self.records: dict[str, StagedRequest] = {}
+        # Gym-admitted requests whose capture was lost because the prefix store did not take
+        # their tokens within the client's retry budget: uid -> what failed. The trainer takes
+        # them at the ledger drain and refuses the batch (MegatronLocal.merge_global_request_ledgers).
+        self.capture_failures: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def stage(
@@ -422,17 +426,37 @@ class LedgerPayloadStager:
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
         if admission is None:
             return RequestPayloadStageResult()
-        return RequestPayloadStageResult(
-            response_metadata=stage_admitted_call(
+        try:
+            response_metadata = stage_admitted_call(
                 uid, payload, finished_metadata, admission, self.prefix_store
             )
-        )
+        except PrefixStoreError as error:
+            # The record is indexed above, so the ledger is intact; Gym's receipt is what is lost.
+            # Recorded and re-raised: the coordinator serves this reply without coordinates
+            # (coordinator.py _stage_and_reply) and the trainer's next ledger drain turns the
+            # record into a hard stop naming the request, never a placeholder in the batch.
+            detail = (
+                f"{error} [capture_key={admission.get('capture_key')!r}, "
+                f"model_call_id={admission.get('model_call_id')!r}, "
+                f"parent_call_id={admission.get('parent_call_id')!r}]"
+            )
+            with self._lock:
+                self.capture_failures[uid] = detail
+            logger.error("Gym capture of request %s lost: %s", uid, detail)
+            raise
+        return RequestPayloadStageResult(response_metadata=response_metadata)
 
     def drain(self) -> dict[str, StagedRequest]:
         """Take every request staged since the last drain."""
         with self._lock:
             drained, self.records = self.records, {}
         return drained
+
+    def take_capture_failures(self) -> dict[str, str]:
+        """Take every lost capture recorded since the last call: uid -> what failed."""
+        with self._lock:
+            failures, self.capture_failures = self.capture_failures, {}
+        return failures
 
 
 def gather_view(staged: StagedRequest) -> StagedRequest:

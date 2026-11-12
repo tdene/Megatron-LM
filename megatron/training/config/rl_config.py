@@ -69,6 +69,17 @@ class RLConfig:
     """Soft cap (bytes) on the rollout bank size; 0 = unbounded. On exceed, a warning is logged.
     Compaction occurs at the next checkpoint regardless of the cap and never blocks generation."""
 
+    rl_prefix_store_timeout_s: float = 5.0
+    """Seconds one round trip to the Gym prefix store (rank 0's table of finished calls) may take
+    before that attempt is given up. The engine's admission-path lookup makes a single attempt."""
+
+    rl_prefix_store_retry_budget_s: float = 60.0
+    """Wall-clock seconds a stager keeps retrying a failed prefix-store put before the capture is
+    declared lost, which stops training at the next ledger drain instead of padding the batch.
+    Must exceed the longest stall of the store a healthy run can see (the profiler's report write
+    held rank 0's interpreter 5-6 s in the 2026-11-12 traced runs); a dead store is reported
+    once the budget is spent."""
+
     grpo_iterations: int = 2
     """Number of iterations per GRPO implementation."""
 

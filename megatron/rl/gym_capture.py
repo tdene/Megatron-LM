@@ -4,9 +4,10 @@
 
 NeMo RL answers a Gym ``token_in`` admission by fetching the parent call's exact tokens from
 TransferQueue in its prompt preparer and staging the finished call through Gym's capture
-helper. Megatron RL has no data plane, so this module provides the store: a ZMQ key-value
-service rank 0 runs for the job, fed by every engine's stager and read by every engine's
-preparer through the two consumer hooks the engine already exposes.
+helper. Megatron RL has no data plane, so ``megatron.rl.prefix_store`` provides the store: a
+ZMQ key-value service rank 0 runs for the job in a process of its own, fed by every engine's
+stager and read by every engine's preparer through the two consumer hooks the engine already
+exposes. This module is the Gym-facing side: the prompt preparer and the stager's capture step.
 
 Admission modes other than ``token_in`` and ``text`` (Gym's ``candidate`` source-history mode,
 generation-cut resumes) are not prepared here and fail closed in the stager.
@@ -15,13 +16,8 @@ generation-cut resumes) are not prepared here and fail closed in the stager.
 from __future__ import annotations
 
 import logging
-import socket
-import threading
 from collections import OrderedDict
 from typing import Any
-
-import msgpack
-import zmq
 
 from megatron.core.inference.inference_request import (
     PREFIX_EOS_TOKEN_ID_FIELD,
@@ -31,120 +27,33 @@ from megatron.core.inference.inference_request import (
     RequestPromptPreparationResult,
 )
 
+from .prefix_store import (
+    STORE_RETRY_BUDGET_S,
+    STORE_TIMEOUT_MS,
+    HeldCall,
+    PrefixStoreClient,
+    PrefixStoreError,
+    PrefixStoreServer,
+)
+
+__all__ = [
+    "NG_CAPTURE_FIELD",
+    "NG_COMMIT_COORDS_FIELD",
+    "STORE_RETRY_BUDGET_S",
+    "STORE_TIMEOUT_MS",
+    "GymPromptPreparer",
+    "PrefixStoreClient",
+    "PrefixStoreError",
+    "PrefixStoreServer",
+    "replace_prefix_tokens",
+    "stage_admitted_call",
+]
+
 logger = logging.getLogger(__name__)
 
 # Gym's admission rides in offload_params under this key (nemo_gym's NG_CAPTURE_FIELD).
 NG_CAPTURE_FIELD = "ng_capture"
 NG_COMMIT_COORDS_FIELD = "ng_commit_coords"
-# A store round trip that takes longer than this fails the request instead of stalling the engine.
-STORE_TIMEOUT_MS = 5000
-
-HeldCall = tuple[list[int], list[int]]
-
-
-class PrefixStoreServer:
-    """Rank 0's table of finished calls, uid -> packed prompt and generated ids, over ZMQ."""
-
-    def __init__(self, host: str | None = None) -> None:
-        self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.REP)
-        port = self._socket.bind_to_random_port("tcp://0.0.0.0")
-        self.address = f"tcp://{host or socket.gethostname()}:{port}"
-        # Frames stay packed: a few bytes per token instead of a Python int per token.
-        self._held: dict[str, bytes] = {}
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._serve, name="prefix-store", daemon=True)
-        self._thread.start()
-
-    def _handle(self, frame: bytes) -> bytes:
-        op, uid, payload = msgpack.unpackb(frame, raw=False)
-        if op == "put":
-            self._held[uid] = payload
-            return msgpack.packb(None)
-        if op == "get":
-            return self._held.get(uid, msgpack.packb(None))
-        if op == "forget":
-            for key in payload:
-                self._held.pop(key, None)
-            return msgpack.packb(None)
-        raise ValueError(f"unknown prefix store op {op!r}")
-
-    def _serve(self) -> None:
-        poller = zmq.Poller()
-        poller.register(self._socket, zmq.POLLIN)
-        while not self._stop.is_set():
-            if not poller.poll(timeout=100):
-                continue
-            frame = self._socket.recv()
-            try:
-                reply = self._handle(frame)
-            except Exception:  # a bad frame must not take the server down or hang its client
-                logger.exception("prefix store rejected a request")
-                reply = msgpack.packb({"error": "malformed prefix store request"})
-            self._socket.send(reply)
-        self._socket.close(linger=0)
-        self._context.term()
-
-    def size(self) -> int:
-        """A method rather than `__len__` so an empty store is still truthy."""
-        return len(self._held)
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join()
-
-
-class PrefixStoreClient:
-    """Thread-safe client of ``PrefixStoreServer``; one REQ socket per calling thread."""
-
-    def __init__(self, address: str, timeout_ms: int = STORE_TIMEOUT_MS) -> None:
-        self.address = address
-        self.timeout_ms = timeout_ms
-        self._context = zmq.Context.instance()
-        self._local = threading.local()
-
-    def _socket(self):
-        sock = getattr(self._local, "socket", None)
-        if sock is None:
-            sock = self._local.socket = self._context.socket(zmq.REQ)
-            sock.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            sock.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.connect(self.address)
-        return sock
-
-    def _request(self, op: str, uid: str | None = None, payload: Any = None) -> Any:
-        sock = self._socket()
-        try:
-            sock.send(msgpack.packb([op, uid, payload], use_bin_type=True))
-            reply = msgpack.unpackb(sock.recv(), raw=False)
-        except zmq.ZMQError as error:
-            # A REQ socket cannot be reused after a failed exchange; drop it and surface the fault.
-            sock.close(linger=0)
-            self._local.socket = None
-            raise RuntimeError(f"prefix store {op} at {self.address} failed: {error}") from error
-        if isinstance(reply, dict) and "error" in reply:
-            raise RuntimeError(f"prefix store {op} at {self.address} failed: {reply['error']}")
-        return reply
-
-    def ping(self) -> None:
-        """Round-trip once; raises when the store is unreachable, so the launch fails early."""
-        self._request("get", "")
-
-    def put(self, uid: str, prompt_token_ids: list[int], generated_token_ids: list[int]) -> None:
-        packed = msgpack.packb(
-            [list(prompt_token_ids), list(generated_token_ids)], use_bin_type=True
-        )
-        self._request("put", uid, packed)
-
-    def get(self, uid: str) -> HeldCall | None:
-        held = self._request("get", uid)
-        return None if held is None else (held[0], held[1])
-
-    def forget(self, uids) -> None:
-        uids = list(uids)
-        if uids:
-            self._request("forget", None, uids)
 
 
 def replace_prefix_tokens(
@@ -259,15 +168,18 @@ def stage_admitted_call(
 ) -> dict[str, Any]:
     """Run Gym's worker capture over the finished call; return the coordinates it owes Gym.
 
-    Capture failures never fail the completion: any error here, including a Gym schema the
-    installed ``nemo_gym`` no longer accepts or a prefix store that stopped answering, becomes
-    ``capture_failed`` coordinates.
+    The call is published to the prefix store first, so a continuation can only name a held
+    parent. The client retries that ``put`` within its budget; a store that still does not
+    answer raises ``PrefixStoreError`` out of here, which the stager records and the trainer
+    turns into a hard stop at the next ledger drain (a lost capture is a placeholder episode
+    in the batch, never acknowledged quietly). Gym's own capture step never fails the
+    completion: a schema the installed ``nemo_gym`` no longer accepts, or a staging-chain
+    admission the preparer did not resolve, becomes ``capture_failed`` coordinates.
     """
     weight_version = _weight_version(finished_metadata)
+    if prefix_store is not None:
+        prefix_store.put(uid, payload.prompt_token_ids, payload.generated_token_ids)
     try:
-        if prefix_store is not None:
-            # Published before the acknowledgement, so a continuation can only name a held parent.
-            prefix_store.put(uid, payload.prompt_token_ids, payload.generated_token_ids)
         from nemo_gym.token_id_capture.adapters.megatron import MegatronCaptureAdapter
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
         from nemo_gym.token_id_capture.staging.records import CaptureAdmission, StageResult

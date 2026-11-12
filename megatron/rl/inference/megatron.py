@@ -186,7 +186,11 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         address = [None if prefix_store_server is None else prefix_store_server.address]
         dist.broadcast_object_list(address, src=0)
         assert isinstance(address[0], str), f"prefix store address not broadcast: {address[0]!r}"
-        prefix_store = PrefixStoreClient(address[0])
+        prefix_store = PrefixStoreClient(
+            address[0],
+            timeout_ms=int(cfg.rl.rl_prefix_store_timeout_s * 1000),
+            retry_budget_s=cfg.rl.rl_prefix_store_retry_budget_s,
+        )
         prefix_store.ping()  # a store no rank can reach fails the launch, not every request
         print_rank_0(f"Prefix store for Gym admissions at {address[0]}")
         inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
@@ -306,9 +310,17 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
 
         Returns:
             The union of every engine's records on rank 0; an empty dict elsewhere.
+
+        Raises:
+            RuntimeError: on rank 0 when any engine's stager lost a Gym capture this window
+                (its prefix-store put failed for the whole retry budget,
+                rollout_bank.py LedgerPayloadStager.stage). Such an episode is a placeholder
+                in the batch about to be trained on, so the batch is refused with the
+                request ids named instead of being trained on quietly.
         """
         stager = self._inference_engine.payload_stager
         drained = stager.drain()
+        lost_here = stager.take_capture_failures()
         if rotate_to is not None and stager.writer is not None:
             stager.writer.rotate(
                 request_record_backup_path(
@@ -317,14 +329,23 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             )
         local = {uid: gather_view(record) for uid, record in drained.items()}
         shards = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
-        dist.gather_object(local, shards, dst=0)
+        dist.gather_object((local, lost_here), shards, dst=0)
         if shards is None:
             return {}
         merged: dict[str, StagedRequest] = {}
-        for shard in shards:
-            merged.update(shard)
+        lost: dict[str, str] = {}
+        for records, failures in shards:
+            merged.update(records)
+            lost.update(failures)
+        if lost:
+            shown = "; ".join(f"{uid}: {detail}" for uid, detail in sorted(lost.items())[:8])
+            raise RuntimeError(
+                f"Gym capture lost for {len(lost)} request(s) in this collection; refusing to "
+                f"train on a batch with placeholder episodes: {shown}"
+                + ("; ..." if len(lost) > 8 else "")
+            )
         assert len(merged) == sum(
-            len(shard) for shard in shards
+            len(records) for records, _ in shards
         ), "finished-request ledger: duplicate uids across engine ledgers"
         return merged
 
