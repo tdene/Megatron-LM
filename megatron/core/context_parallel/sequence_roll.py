@@ -4,6 +4,8 @@
 import torch
 import torch.distributed as dist
 
+from megatron.core.packed_seq_params import require_flat
+
 
 def _continuation_mask(tensor, packed_seq_params, cp_group, dims, sp_group=None):
     """Return the local rows whose next token belongs to the same packed segment."""
@@ -99,6 +101,7 @@ def roll_contiguous(tensor, dims, cp_group, packed_seq_params=None, fill_value=0
     Both boundary exchanges are differentiable and use the supplied groups.
     Slots after the final physical boundary form a trailing segment.
     """
+    require_flat(packed_seq_params, "roll_contiguous (contiguous CP layout)")
     if tensor.shape[dims] == 0:
         return tensor.clone()
     cp_size = cp_group.size() if cp_group is not None else 1

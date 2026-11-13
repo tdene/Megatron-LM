@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -550,6 +550,8 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
                 kwargs["input_ids"] = input_ids
 
         packed = kwargs.get("packed_seq_params")
+        # The graph rebuilds flat cu_seqlens metadata and would drop the shared-prefix fields.
+        require_flat(packed, "Transformer Engine CUDA graphs (TransformerLayer)")
         if packed is not None and self.config.sequence_packing_scheduler is not None:
             kwargs = dict(kwargs)
             kwargs.pop("packed_seq_params")

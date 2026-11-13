@@ -28,7 +28,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
     get_context_parallel_group,
@@ -2365,6 +2365,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     """
 
     cp_stream: torch.cuda.Stream = None
+    # Backend modules the gathered shared-prefix call switches to cross attention.
+    _SHARED_PREFIX_BACKENDS = ("flash_attention", "fused_attention", "unfused_attention")
 
     def __init__(
         self,
@@ -2545,6 +2547,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.kept_packed_seq_params.discard("cp_scatter_cache")
         # Runtime groups belong to MCore layout conversion and CP binding, not TE's forward API.
         self.kept_packed_seq_params.difference_update({"cp_group", "local_cp_size", "tp_cp_group"})
+        # The shared-prefix fields are consumed before core attention; TE never sees them.
+        self.kept_packed_seq_params.difference_update(
+            {"seq_prefix", "seq_prefix_len", "seq_prefix_halo", "seq_prefix_cache"}
+        )
 
         if get_te_version() < PkgVersion("2.2.0"):
             self.kept_packed_seq_params.discard("pad_between_seqs")
@@ -2572,6 +2578,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             tp_group=pg_collection.tp,
             layer_number=layer_number,
             **extra_kwargs,
+        )
+
+        self.supports_shared_prefix = is_te_min_version("2.15.0") and all(
+            hasattr(self, name) for name in ("attention_type",) + self._SHARED_PREFIX_BACKENDS
         )
 
         if self.config.attention_cp_layout == "contiguous":
@@ -2621,6 +2631,31 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         super().set_context_parallel_group(
             cp_group, cp_global_ranks, cp_stream, cp_comm_type, **kwargs
         )
+
+    @contextmanager
+    def _attention_type_for(self, attn_mask_type: AttnMaskType):
+        """Run a `padding_causal_bottom_right` thd call as cross attention."""
+        if (
+            attn_mask_type != AttnMaskType.padding_causal_bottom_right
+            or self.attention_type == "cross"
+        ):
+            yield
+            return
+        if not self.supports_shared_prefix:
+            raise NotImplementedError(
+                f"shared-prefix attention needs TE >= 2.15, found {get_te_version()}"
+            )
+        backends = [getattr(self, name) for name in self._SHARED_PREFIX_BACKENDS]
+        previous = self.attention_type
+        try:
+            self.attention_type = "cross"
+            for backend in backends:
+                backend.attention_type = "cross"
+            yield
+        finally:
+            self.attention_type = previous
+            for backend in backends:
+                backend.attention_type = previous
 
     @contextmanager
     def _temporary_runtime_context_parallel_group(
@@ -2675,6 +2710,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         bf16_backward: Optional[bool] = None,
     ) -> torch.Tensor:
         """Forward."""
+        require_flat(packed_seq_params, "TEDotProductAttention")
         with self._temporary_runtime_context_parallel_group(packed_seq_params):
             return self._forward(
                 query,
@@ -2791,7 +2827,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
 
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            with self._attention_type_for(attn_mask_type):
+                core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
             if self.config.qk_clip or self.config.log_max_attention_logit:
                 # qk-clip is only supported in TE 2.9.0 and later
@@ -2822,7 +2859,8 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
-            core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+            with self._attention_type_for(attn_mask_type):
+                core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
 
@@ -4123,12 +4161,29 @@ try:
         cp_size: int = 1,
         cp_rank: int = 0,
         interleaved: bool = False,
+        start_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
+        `start_positions` gives each sequence's first position for shared-prefix batches.
         """
         if interleaved:
             assert is_te_min_version("2.3.0"), "Only TE >= 2.3.0 supports interleaved fused RoPE."
+        if start_positions is not None:
+            assert is_te_min_version(
+                "2.10.0"
+            ), f"start_positions in fused thd RoPE needs TE >= 2.10.0, found {get_te_version()}"
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                interleaved=interleaved,
+                start_positions=start_positions.to(dtype=torch.int32),
+            )
 
         if is_te_min_version("2.3.0", check_equality=True):
             return apply_rotary_pos_emb(

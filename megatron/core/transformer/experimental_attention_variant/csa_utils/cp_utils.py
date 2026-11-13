@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
+from megatron.core.packed_seq_params import require_flat
 
 from . import packed_layout
 from .packed_sparse_attention import indexer_topk
@@ -316,6 +317,7 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
     transitions are a separate integration; reject them instead of accidentally
     using a stale build-time group during forward or recompute.
     """
+    require_flat(packed_seq_params, "packed DSv4/CSA attention")
     if config.dsa_kernel_backend != "cudnn":
         raise ValueError("Packed DSv4 attention requires dsa_kernel_backend='cudnn'.")
     if config.deterministic_mode:

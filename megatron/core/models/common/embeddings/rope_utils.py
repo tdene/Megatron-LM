@@ -218,6 +218,7 @@ def _apply_rotary_pos_emb_thd(
     cp_group: torch.distributed.ProcessGroup = None,
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
+    start_positions: Optional[Tensor] = None,
 ) -> Tensor:
     """Apply RoPE for `thd` format using vectorized CUDA operations.
 
@@ -232,6 +233,8 @@ def _apply_rotary_pos_emb_thd(
         cp_group: Context parallel group
         max_seqlen: Global max sequence length for this packed batch when known. Supplying it
             avoids the compatibility-path host sync used by legacy callers.
+        start_positions (Tensor, optional): First position of each sequence, shape [num_seqs];
+            sequences that continue a shared prefix start at the prefix length.
 
     Returns:
         Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
@@ -296,7 +299,11 @@ def _apply_rotary_pos_emb_thd(
         # RoPE / VLMs); shift by the per-sequence start offset so each token
         # samples its absolute position. When `freqs` only spans one max-len
         # sequence, no shift is needed.
+        if start_positions is not None:
+            raise ValueError("start_positions needs a shared frequency table, not per-token rows")
         freq_pos = freq_pos + global_seq_start
+    elif start_positions is not None:
+        freq_pos = freq_pos + start_positions.to(device=device, dtype=torch.int64)[seq_idx]
 
     # Padded positions can sit outside the frequency table. Clamp them into
     # range; downstream padding masks exclude those positions from the result.
@@ -325,10 +332,11 @@ def apply_rotary_pos_emb(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     max_seqlen: Optional[int] = None,
+    start_positions: Optional[Tensor] = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
-    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
+    fused/unfused kernels, or bshd (conventional) / thd (packed seq) format.
     """
     global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
@@ -337,6 +345,13 @@ def apply_rotary_pos_emb(
         cp_group = parallel_state.get_context_parallel_group()
     if mla_rotary_interleaved is None:
         mla_rotary_interleaved = config.multi_latent_attention
+    if start_positions is not None:
+        if cu_seqlens is None or max_seqlen is None:
+            raise ValueError("start_positions needs the thd format and max_seqlen")
+        if start_positions.numel() != cu_seqlens.numel() - 1:
+            raise ValueError("start_positions needs one entry per packed sequence")
+        if freqs.size(0) < max_seqlen:
+            raise ValueError(f"start_positions needs freqs of >= max_seqlen={max_seqlen} rows")
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
@@ -393,6 +408,10 @@ def apply_rotary_pos_emb(
             # Like unfused THD, infer packed-token frequencies from rows > max_seqlen.
             # These rows continue across sequences; shared position tables restart at row 0.
             freqs_in_packed_order = max_seqlen is not None and freqs.size(0) > max_seqlen
+            if start_positions is not None and freqs_in_packed_order:
+                raise ValueError(
+                    "start_positions needs a shared frequency table, not per-token rows"
+                )
             if not use_unfused and freqs_in_packed_order:
                 if cp_group.size() == 1 and freqs.size(0) == t.size(0):
                     # Frequencies already align with local tokens. RoPE is token-wise,
@@ -419,6 +438,7 @@ def apply_rotary_pos_emb(
                     cp_size=cp_group.size(),
                     cp_rank=cp_group.rank(),
                     interleaved=config.rotary_interleaved,
+                    start_positions=start_positions,
                 )
     # use unfused implementation
     if cu_seqlens is None:
@@ -443,6 +463,7 @@ def apply_rotary_pos_emb(
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,
+            start_positions=start_positions,
         )
 
 

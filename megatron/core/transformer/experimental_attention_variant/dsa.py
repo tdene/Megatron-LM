@@ -20,7 +20,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -2533,6 +2533,7 @@ class DSAIndexer(MegatronModule):
         self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """All computations before topk."""
+        require_flat(packed_seq_params, "DeepSeek sparse attention")
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 

@@ -14,7 +14,7 @@ from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     HAVE_FLA,
@@ -290,6 +290,7 @@ class KimiDeltaAttention(_GDNBase):
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        require_flat(packed_seq_params, "KimiDeltaAttention")
 
         active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
         base_cp_group = active_pg_collection.cp

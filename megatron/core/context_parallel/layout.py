@@ -8,7 +8,7 @@ from typing import Literal
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat
 from megatron.core.tensor_parallel.mappings import all_to_all
 
 CPLayout = Literal["contiguous", "zigzag"]
@@ -727,6 +727,7 @@ class ContextParallelLayoutManager:
         """
         if not self.requires_conversion:
             return None
+        require_flat(packed_seq_params, "ContextParallelLayoutManager (contiguous layout)")
 
         if thd_plan is not None and packed_seq_params_by_layout is not None:
             return ContextParallelLayoutState(

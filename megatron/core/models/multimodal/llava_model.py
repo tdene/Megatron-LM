@@ -24,7 +24,7 @@ from megatron.core.models.multimodal.context_parallel import (
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
@@ -1798,6 +1798,7 @@ class LLaVAModel(MegatronModule):
 
             cu = packed_seq_params.cu_seqlens_q
             if cu is not None and cu[-1] > actual_seq_len:
+                require_flat(packed_seq_params, "LLaVA packed-sequence truncation")
                 cu = cu.clamp(max=actual_seq_len)
                 # Remove duplicate consecutive values from clamping.
                 keep = torch.ones(len(cu), dtype=torch.bool, device=cu.device)
