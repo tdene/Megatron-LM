@@ -35,6 +35,11 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
     cp_scatter_cache: object = None
+    # Shared prefixes (megatron.core.shared_prefix)
+    seq_prefix: Tensor | None = None
+    seq_prefix_len: Tensor | None = None
+    seq_prefix_halo: int | None = None
+    seq_prefix_cache: object = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -49,6 +54,8 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.seq_prefix is not None or self.seq_prefix_len is not None:
+            self._validate_seq_prefix()
         if self.local_cp_size is not None:
             resolve_cp_group(None, self)
         cu_seqlens = (
@@ -77,6 +84,15 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def require_flat(packed_seq_params: PackedSeqParams | None, consumer: str) -> None:
+    """Refuse a shared-prefix batch."""
+    if packed_seq_params is not None and packed_seq_params.seq_prefix is not None:
+        raise NotImplementedError(
+            f"{consumer} does not yet (but will soon!) implement the shared-prefix contract "
+            "(PackedSeqParams.seq_prefix); pack without shared prefixes for this model"
+        )
 
 
 def resolve_cp_group(

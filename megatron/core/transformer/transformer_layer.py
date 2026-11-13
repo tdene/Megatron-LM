@@ -27,7 +27,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -2045,6 +2045,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 kwargs["input_ids"] = input_ids
 
         packed = kwargs.get("packed_seq_params")
+        # The graph rebuilds flat cu_seqlens metadata and would drop the shared-prefix fields.
+        require_flat(packed, "Transformer Engine CUDA graphs (TransformerLayer)")
         if packed is not None and self.config.sequence_packing_scheduler is not None:
             kwargs = dict(kwargs)
             kwargs.pop("packed_seq_params")

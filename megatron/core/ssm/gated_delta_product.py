@@ -26,7 +26,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -542,6 +542,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """Run the training pre-attention and core-attention stage."""
+        require_flat(packed_seq_params, "GatedDeltaProduct")
         return self._gdp_chunk_forward(
             hidden_states,
             packed_seq_params=packed_seq_params,
@@ -613,6 +614,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
     ):
         """Run GDP's recurrence followed by its output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        require_flat(packed_seq_params, "GatedDeltaProduct")
         runtime_cp = self._resolve_runtime_cp(packed_seq_params)
 
         if runtime_cp.chunkwise and inference_context is not None:

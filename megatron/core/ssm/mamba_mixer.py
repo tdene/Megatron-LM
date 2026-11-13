@@ -21,7 +21,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -523,6 +523,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
+        require_flat(packed_seq_params, "MambaMixer")
         runtime_cp_group = resolve_cp_group(self.cp.cp_group, packed_seq_params)
         runtime_cp = self.cp.for_context_parallel_group(runtime_cp_group)
 

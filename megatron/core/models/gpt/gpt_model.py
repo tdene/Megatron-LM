@@ -35,6 +35,7 @@ from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    check_shared_prefix_mtp,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -655,6 +656,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        check_shared_prefix_mtp(packed_seq_params, self.config)
 
         preproc_output = self._preprocess(
             input_ids=input_ids,

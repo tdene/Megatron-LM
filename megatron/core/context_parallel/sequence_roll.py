@@ -4,6 +4,8 @@
 import torch
 import torch.distributed as dist
 
+from megatron.core.packed_seq_params import require_flat
+
 
 def _continuation_mask(tensor, packed_seq_params, cp_group, dims):
     """Return the local rows whose next token belongs to the same real document."""
@@ -81,6 +83,7 @@ class _RollLeft(torch.autograd.Function):
 
 def roll_contiguous(tensor, dims, cp_group, packed_seq_params=None, fill_value=0):
     """Roll a dense or packed contiguous shard by one, preserving real document boundaries."""
+    require_flat(packed_seq_params, "roll_contiguous (contiguous CP layout)")
     if tensor.shape[dims] == 0:
         return tensor.clone()
     valid = _continuation_mask(tensor, packed_seq_params, cp_group, dims)

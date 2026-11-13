@@ -12,7 +12,7 @@ from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -1307,6 +1307,8 @@ class TopKRouter(Router):
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
         """
+        # Router statistics count physical rows; a shared-prefix batch stands for more.
+        require_flat(packed_seq_params, "TopKRouter")
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
@@ -1558,6 +1560,7 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
+        require_flat(packed_seq_params, "InferenceTopKRouter")
         if not InferenceMode.is_active():
             return super().forward(
                 input, padding_mask, input_ids, packed_seq_params=packed_seq_params

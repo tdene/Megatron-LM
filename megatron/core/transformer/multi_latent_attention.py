@@ -27,7 +27,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
-from megatron.core.packed_seq_params import resolve_cp_group
+from megatron.core.packed_seq_params import require_flat, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -871,6 +871,7 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        require_flat(packed_seq_params, "MultiLatentAttention")
         inference_context = deprecate_inference_params(inference_context, inference_params)
         runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         assert runtime_cp_group is not None, "MLA requires a context-parallel group"

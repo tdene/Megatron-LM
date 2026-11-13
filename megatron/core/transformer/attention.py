@@ -33,6 +33,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.shared_prefix import get_shared_prefix_plan
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -53,7 +54,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType
+from .enums import AttnBackend, AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -527,6 +528,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         **extra_kwargs,
     ):
         """Run the configured core attention module."""
+        if packed_seq_params is not None and packed_seq_params.seq_prefix is not None:
+            return self._shared_prefix_core_attention(query, key, value, packed_seq_params)
         return apply_module(self.core_attention)(
             query,
             key,
@@ -1602,6 +1605,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
+            rope_start_positions = None
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
@@ -1618,6 +1622,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
                     else None
                 )
+                if packed_seq_params.seq_prefix is not None:
+                    plan = get_shared_prefix_plan(packed_seq_params, device=query.device)
+                    rope_start_positions = plan.start_positions
+                    table = q_pos_emb if q_pos_emb is not None else k_pos_emb
+                    if table is not None and plan.max_seqlen_kv > table.shape[0]:
+                        raise ValueError(
+                            f"the rotary table covers {table.shape[0]} positions but a "
+                            f"shared-prefix segment reaches position {plan.max_seqlen_kv - 1}"
+                        )
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_freqs_max_seqlen = None
@@ -1634,6 +1647,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             mscale=self._yarn_concentration_factor,
                             cp_group=runtime_cp_group,
                             max_seqlen=rope_freqs_max_seqlen,
+                            start_positions=rope_start_positions,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1653,6 +1667,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         mscale=self._yarn_concentration_factor,
                         cp_group=runtime_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
+                        start_positions=rope_start_positions,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
@@ -1707,6 +1722,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         core_attn_manager = off_interface(
             self.offload_core_attention and self.training, query, "core_attn"
         )
+        if packed_seq_params is not None and packed_seq_params.seq_prefix is not None:
+            self._check_shared_prefix_call(
+                inference_context,
+                attention_mask,
+                attention_bias,
+                attn_mask_type,
+                core_attention_extra_kwargs,
+                runtime_cp_group,
+            )
         if self.checkpoint_core_attention and self.training:
             # Upstream _checkpointed_attention_forward now threads tensor-valued
             # core-attention kwargs (e.g. DSA's x/qr) through the checkpoint, so the
@@ -1725,7 +1749,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
                 with core_attn_manager as query:
-                    core_attn_out = apply_module(self.core_attention)(
+                    core_attn_out = self._run_core_attention(
                         query,
                         key,
                         value,
@@ -1794,6 +1818,84 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             nvtx_range_pop(suffix="output_gate")
 
         return core_attn_out
+
+    def _check_shared_prefix_call(
+        self,
+        inference_context,
+        attention_mask,
+        attention_bias,
+        attn_mask_type,
+        core_attention_extra_kwargs,
+        runtime_cp_group,
+    ) -> None:
+        """Refuse a shared-prefix batch this layer cannot run exactly."""
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        if attention_mask is not None or attention_bias is not None:
+            raise ValueError("shared-prefix attention takes no attention mask or bias")
+        if attn_mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
+            raise ValueError(f"shared-prefix attention is causal; got {attn_mask_type}")
+        config = self.config
+        in_cp = runtime_cp_group is not None and runtime_cp_group.size() > 1
+        unsupported = [
+            reason
+            for hit, reason in (
+                (
+                    not getattr(self.core_attention, "supports_shared_prefix", False),
+                    f"core attention {type(self.core_attention).__name__}",
+                ),
+                (self.attention_type != "self", "cross attention"),
+                (config.attention_dropout > 0, "attention dropout"),
+                (config.window_size is not None, "sliding-window attention"),
+                (
+                    config.fp8_dot_product_attention or config.fp8_multi_head_attention,
+                    "FP8 attention",
+                ),
+                (config.qk_clip or config.log_max_attention_logit, "qk-clip statistics"),
+                (config.attn_logit_softcapping is not None, "logit softcapping"),
+                (getattr(config, "mrope_section", None) is not None, "multimodal RoPE"),
+                (
+                    config.attention_backend not in (AttnBackend.flash, AttnBackend.fused),
+                    "attention backends other than flash and fused",
+                ),
+                (config.attention_cp_layout != "zigzag", "the contiguous context-parallel layout"),
+                (config.context_parallel_size > 1 or in_cp, "context parallelism"),
+                (is_graph_capturing() or is_graph_warmup(), "CUDA graphs"),
+                (inference_context is not None, "inference"),
+                (bool(core_attention_extra_kwargs), "core-attention variants with extra inputs"),
+            )
+            if hit
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "shared-prefix attention does not support " + ", ".join(unsupported)
+            )
+
+    def _shared_prefix_core_attention(
+        self, query: Tensor, key: Tensor, value: Tensor, packed_seq_params: PackedSeqParams
+    ) -> Tensor:
+        """Gather each segment's keys and values behind the head of its prefix, run one
+        bottom-right causal thd call over the real rows, and scatter the output back."""
+        plan = get_shared_prefix_plan(packed_seq_params, device=query.device)
+        if plan.num_real_tokens == 0:
+            return query.new_zeros((query.shape[0], query.shape[1] * query.shape[2]))
+        out = apply_module(self.core_attention)(
+            query.index_select(0, plan.q_index),
+            key.index_select(0, plan.kv_index),
+            value.index_select(0, plan.kv_index),
+            None,
+            attn_mask_type=AttnMaskType.padding_causal_bottom_right,
+            attention_bias=None,
+            packed_seq_params=PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=plan.cu_seqlens_q,
+                cu_seqlens_kv=plan.cu_seqlens_kv,
+                max_seqlen_q=plan.max_seqlen_q,
+                max_seqlen_kv=plan.max_seqlen_kv,
+                pad_between_seqs=False,
+            ),
+        )
+        return out.new_zeros((query.shape[0],) + out.shape[1:]).index_copy(0, plan.q_index, out)
 
     def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the attention output projection to a core-attention result."""

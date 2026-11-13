@@ -351,6 +351,23 @@ def roll_tensor(
     return rolled_tensor, rolled_sum
 
 
+def check_shared_prefix_mtp(packed_seq_params: Optional[PackedSeqParams], config) -> None:
+    """Refuse a shared-prefix batch this model's MTP cannot train exactly: with `d` depths every
+    dependent segment must repeat `d + 1` prefix tokens so each head row has its dense input."""
+    if packed_seq_params is None or packed_seq_params.seq_prefix is None:
+        return
+    depth = config.mtp_num_layers or 0
+    if packed_seq_params.seq_prefix_halo is None or packed_seq_params.seq_prefix_halo < depth + 1:
+        raise ValueError(
+            f"MTP with {depth} depths needs seq_prefix_halo >= {depth + 1}, got "
+            f"{packed_seq_params.seq_prefix_halo}"
+        )
+    if config.attention_cp_layout == "contiguous":
+        raise NotImplementedError("shared-prefix batches need the zigzag CP layout")
+    if getattr(config, "mtp_hsm", False):
+        raise NotImplementedError("shared-prefix batches do not support MTP hidden-state mixing")
+
+
 def _roll_tensor_packed_seq(
     tensor, shifts, dims, packed_seq_params, cp_group=None, return_sum=True
 ):
@@ -1714,6 +1731,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
+        check_shared_prefix_mtp(packed_seq_params, self.config)
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
         if mtp_input_mask is not None:

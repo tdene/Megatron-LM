@@ -19,7 +19,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
@@ -218,6 +218,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             packed_sequence_cp_metadata is None
         ), "GDN does not support packed-sequence chunkwise CP metadata."
+        require_flat(packed_seq_params, "GatedDeltaNet")
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
         # Training-only. Inference is dispatched by forward() before this stage, because
