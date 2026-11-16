@@ -3,6 +3,7 @@
 import asyncio
 import gc
 import json
+import logging
 import socket
 import warnings
 from contextlib import nullcontext
@@ -11,8 +12,10 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 from aiohttp import web
+from pydantic import ValidationError
 
 from megatron.rl import GenericGenerationArgs
+from megatron.rl.agent import responses_env_agent
 from megatron.rl.agent.api import TokenRollout
 from megatron.rl.agent.registry import get_agent_class
 from megatron.rl.agent.responses_env_agent import (
@@ -214,6 +217,61 @@ class _ControlServer:
         self.content_types.append(request.content_type)
         self.retired.extend(json.loads(await request.read())["rollout_ids"])
         return web.json_response({"removed": [], "absent": []}, status=self.retire_status)
+
+
+_RUN_C3 = {"reward": 1.0, "response": {"id": "resp-c3", "output": []}}
+
+
+class _ScriptedControl:
+    """Env server + control routes whose control answers follow one script per route.
+
+    ``manifest`` and ``retire`` list the behaviour of each request in turn ("ok" once a script
+    is exhausted): "ok" answers at once (the manifest; ``{"removed": [id], "absent": []}``),
+    "stall" holds the answer past the agent's control timeout, "drop" closes the connection
+    without answering (the client sees ServerDisconnectedError), "absent" is Gym's answer to the
+    retire of an already retired rollout (200, the id under ``absent``), "gone" a 410.
+    """
+
+    def __init__(self, manifest=(), retire=(), stall_s=0.5):
+        self.manifest_script, self.retire_script = list(manifest), list(retire)
+        self.stall_s = stall_s
+        self.manifests, self.retired = [], []
+
+    async def __call__(self, request):
+        if request.path == "/run":
+            return web.json_response(_RUN_C3)
+        if request.path.endswith("/manifest"):
+            self.manifests.append(request.path.split("/")[-2])
+            step = self.manifest_script.pop(0) if self.manifest_script else "ok"
+            ids, answer = None, web.json_response(_CHAIN)
+        else:
+            ids = json.loads(await request.read())["rollout_ids"]
+            self.retired.extend(ids)
+            step = self.retire_script.pop(0) if self.retire_script else "ok"
+            answer = web.json_response({"removed": ids, "absent": []})
+        if step == "stall":
+            await asyncio.sleep(self.stall_s)
+        elif step == "drop":
+            # The server closes the keep-alive connection before answering; the response built
+            # above is never written (the transport is closing).
+            request.transport.close()
+        elif step == "absent":
+            answer = web.json_response({"removed": [], "absent": ids})
+        elif step == "gone":
+            answer = web.Response(status=410, text="gone")
+        return answer
+
+
+def _agent_records(caplog):
+    """(level, message) of the agent's log records, in order."""
+    return [
+        (record.levelname, record.getMessage())
+        for record in caplog.records
+        if record.name == "megatron.rl.agent.responses_env_agent"
+    ]
+
+
+_AGENT_LOGGER = "megatron.rl.agent.responses_env_agent"
 
 
 class TestResponsesEnvAgent:
@@ -1080,3 +1138,157 @@ class TestResponsesEnvAgent:
         multi.agents.append(SimpleNamespace())  # an agent type without aclose holds no sessions
         await multi.aclose()
         assert all(session.closed for session in sessions)
+
+    # su11 (2026-11-16, saturated GRPO): the trainer's loop was blocked about two minutes across
+    # the iteration boundary (suspend, optimizer step, resume) while up to 64 group builds had
+    # control calls in flight; aiohttp's total timeout is loop time, so 283 manifest GETs and 42
+    # retire POSTs expired on the first turn after the resume although Gym had answered. Here the
+    # server stalls the first answer past the control timeout, or drops the connection, and the
+    # agent's retry on the live loop gets the answer: the keys, no warning, one counted retry.
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            "manifest-stall",
+            "retire-stall-already-retired",
+            "retire-stall-ok",
+            "retire-drop",
+            "manifest-drop-twice",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_control_call_is_retried_after_a_stall_or_a_dropped_connection(
+        self, tmp_path, monkeypatch, http, caplog, kind
+    ):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        script = {
+            "manifest-stall": dict(manifest=["stall"]),
+            # The timed-out first POST did retire the rollout on Gym: the second is answered with
+            # 200 and the id under "absent" (CaptureLedger.retire: retiring again is a no-op).
+            "retire-stall-already-retired": dict(retire=["stall", "absent"]),
+            "retire-stall-ok": dict(retire=["stall"]),
+            "retire-drop": dict(retire=["drop"]),
+            # aiohttp itself re-sends an idempotent GET once after a disconnect; the second drop
+            # reaches the agent, whose retry gets the manifest (three GETs on the wire).
+            "manifest-drop-twice": dict(manifest=["drop", "drop"]),
+        }[kind]
+        server = _ScriptedControl(**script)
+        agent = http.serve(_agent(tmp_path, capture_control_timeout_s=0.1), server)
+        params = await agent.prepare_group_rollout(_request())
+        with caplog.at_level(logging.INFO, logger=_AGENT_LOGGER):
+            rollout = await params.build_rollout(await params.run_episode())
+        # The keys arrived: a trainable rollout with the chain's uids, the dead branch retired.
+        assert not rollout.is_placeholder
+        assert rollout.completion_ids == ["uid-c1", "uid-c2", "uid-c3"]
+        assert rollout.retired_completion_ids == ["uid-c2b"]
+        [rollout_id] = set(server.manifests)
+        gets = {"manifest-stall": 2, "manifest-drop-twice": 3}.get(kind, 1)
+        posts = 1 if kind.startswith("manifest") else 2
+        assert (len(http.ports("/manifest")), len(http.ports("/retire"))) == (gets, posts)
+        assert server.retired == [rollout_id] * posts
+        # A retry that succeeds is counted, not logged: no WARNING (su11 printed 325 per
+        # boundary), and the INFO summary is rate limited, so none yet.
+        assert _agent_records(caplog) == []
+        assert (agent.control_retries, agent.control_retry_failures) == (1, 0)
+
+    @pytest.mark.parametrize(
+        "kind", ["every-attempt-stalls", "no-retries-configured", "4xx-not-retried"]
+    )
+    @pytest.mark.asyncio
+    async def test_exhausted_control_retries_keep_the_parent_warning(
+        self, tmp_path, monkeypatch, http, caplog, kind
+    ):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        retries, script = {
+            "every-attempt-stalls": (1, ["stall", "stall"]),
+            "no-retries-configured": (0, ["stall"]),
+            "4xx-not-retried": (1, ["gone"]),
+        }[kind]
+        server = _ScriptedControl(manifest=script)
+        agent = http.serve(
+            _agent(tmp_path, capture_control_timeout_s=0.1, capture_control_retries=retries), server
+        )
+        params = await agent.prepare_group_rollout(_request())
+        with caplog.at_level(logging.INFO, logger=_AGENT_LOGGER):
+            rollout = await params.build_rollout(await params.run_episode())
+        # What the parent left behind: the placeholder without retired ids (the episode's ledger
+        # records are never claimed), no retire of a manifest that never came.
+        assert (rollout.rollout_status, rollout.failure_reason) == (
+            "placeholder",
+            "manifest_unavailable",
+        )
+        assert rollout.retired_completion_ids == []
+        [rollout_id] = set(server.manifests)
+        # Every attempt stalled: the configured retry was made; a 4xx is Gym's answer and no
+        # retries configured is one attempt: today's single GET either way.
+        assert len(http.ports("/manifest")) == (2 if kind == "every-attempt-stalls" else 1)
+        assert http.ports("/retire") == []
+        # Today's WARNING, same text, once.
+        cause = "EnvHTTPError: HTTP 410: gone" if kind == "4xx-not-retried" else "TimeoutError: "
+        assert _agent_records(caplog) == [
+            (
+                "WARNING",
+                f"ResponsesEnvAgent[test_env]: manifest of rollout {rollout_id} unavailable "
+                f"({cause}); its requests' ledger records cannot be claimed: "
+                f"problem_id={rollout.problem_id}",
+            )
+        ]
+        counted = (1, 1) if kind == "every-attempt-stalls" else (0, 0)
+        assert (agent.control_retries, agent.control_retry_failures) == counted
+
+    @pytest.mark.asyncio
+    async def test_control_retry_summary_is_one_line_per_interval(
+        self, tmp_path, monkeypatch, http, caplog
+    ):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        monkeypatch.setattr(responses_env_agent, "CONTROL_RETRY_SUMMARY_INTERVAL_S", 0.4)
+        # Four episodes at once, as the concurrent assembly has them at a boundary: every first
+        # manifest GET stalls, and the first retry to arrive stalls again (retries exhausted).
+        server = _ScriptedControl(manifest=["stall"] * 5)
+        agent = http.serve(
+            _agent(tmp_path, capture_control_timeout_s=0.1, capture_control_retries=1), server
+        )
+        params = await agent.prepare_group_rollout(_request())
+
+        async def episode():
+            return await params.build_rollout(await params.run_episode())
+
+        def summary(retried, failed):
+            return (
+                "INFO",
+                f"ResponsesEnvAgent[test_env]: {retried} control calls retried after a timeout "
+                f"or a dropped connection since the last line, {failed} failed",
+            )
+
+        with caplog.at_level(logging.INFO, logger=_AGENT_LOGGER):
+            rollouts = await asyncio.gather(*[episode() for _ in range(4)])
+            assert sorted(rollout.is_placeholder for rollout in rollouts) == [False] * 3 + [True]
+            assert (agent.control_retries, agent.control_retry_failures) == (4, 1)
+            # Right after the burst: the exhausted call's WARNING, no summary yet.
+            assert [level for level, _ in _agent_records(caplog)] == ["WARNING"]
+            await asyncio.sleep(0.6)
+            # One line for the burst, not one per retry.
+            assert _agent_records(caplog)[1:] == [summary(4, 1)]
+            # A later retry opens a new window; its line carries only the movement since.
+            server.manifest_script[:] = ["stall"]
+            assert not (await episode()).is_placeholder
+            await asyncio.sleep(0.6)
+            assert _agent_records(caplog)[2:] == [summary(1, 0)]
+            # Nothing moved: no line.
+            await asyncio.sleep(0.6)
+            assert len(_agent_records(caplog)) == 3
+            # A summary pending at aclose is dropped; the counters keep their totals.
+            server.manifest_script[:] = ["stall"]
+            assert not (await episode()).is_placeholder
+            await agent.aclose()
+            await asyncio.sleep(0.6)
+            assert len(_agent_records(caplog)) == 3
+            assert (agent.control_retries, agent.control_retry_failures) == (6, 1)
+
+    def test_capture_control_retries_field(self, tmp_path):
+        agent = _agent(tmp_path)
+        # The per-attempt bound keeps its default; two retries by default; none is allowed.
+        assert (agent.capture_control_timeout_s, agent.capture_control_retries) == (60.0, 2)
+        assert _agent(tmp_path, capture_control_retries=0).capture_control_retries == 0
+        with pytest.raises(ValidationError):
+            _agent(tmp_path, capture_control_retries=-1)
+        assert (agent.control_retries, agent.control_retry_failures) == (0, 0)
