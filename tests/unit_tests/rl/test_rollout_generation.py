@@ -1735,7 +1735,9 @@ class TestConcurrentAssembly:
             quiet_from = len(records())
             await asyncio.sleep(4 * interval)
             assert len(records()) == quiet_from
-        timestamps = [record.created for record in records()]
+        # The timer's lines keep the interval apart; the collection's final line (closed_batch)
+        # is written at consumption, off the timer.
+        timestamps = [r.created for r in records() if "closed_batch" not in r.getMessage()]
         assert all(b - a >= 0.9 * interval for a, b in zip(timestamps, timestamps[1:]))
         assert len(groups) == num_groups
 
@@ -1758,6 +1760,41 @@ class TestConcurrentAssembly:
             # No reporter: the dwell window of the progress line does not accumulate either.
             assert pipeline._progress_dwell == []
             await _cancel_pull(first_pull)
+
+    @pytest.mark.asyncio
+    async def test_the_final_progress_line_is_written_when_a_batch_is_consumed(self, caplog):
+        """With an interval the timer never reaches, the collection still ends with one line
+        carrying its final counts (closed_batch names the batch); with interval 0, none."""
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        num_groups, rollouts_per_group = 2, 2
+        for interval, expects_line in ((60.0, True), (0, False)):
+            caplog.clear()
+            gen = HeldBuildGenerator(rollouts_per_group)
+            pipeline = RolloutPipeline(
+                gen,
+                self._request(num_groups, rollouts_per_group),
+                parallel_generation_tasks=1,
+                progress_interval_s=interval,
+            )
+            async with aclosing(pipeline.run()) as it:
+                first_pull = self._start(it)
+                await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+                gen.release.set()
+                groups = [await asyncio.wait_for(first_pull, timeout=10)]
+                groups += [
+                    await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)
+                ]
+            assert len(groups) == num_groups
+            records = self._progress_records(caplog)
+            if not expects_line:
+                assert records == []
+                continue
+            assert len(records) == 1, [r.getMessage() for r in records]
+            final = self._fields(records[0])
+            assert final["closed_batch"] == 1
+            assert final["consumed_batches"] == final["banked_batches"] == 1
+            assert final["assembled"] == num_groups
+            assert final["prepared"] == final["inferred"] == num_groups * rollouts_per_group
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("rank, expects_line", [(0, True), (1, False)], ids=["rank0", "rank1"])

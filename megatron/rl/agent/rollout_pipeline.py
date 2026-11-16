@@ -732,20 +732,24 @@ class RolloutPipeline:
         return loop.run_until_complete(self._drain())
 
     async def _report_progress(self) -> None:
-        """Log the pipeline's state every progress_interval_s seconds of event-loop time.
+        """Log the pipeline's state at most once per progress_interval_s seconds of wall time.
 
-        The timer advances only while the trainer drives the loop (a collection, an
-        evaluation, a settle), so no line is written while the trainer trains.
+        A line is written only on a loop turn, so none while the trainer trains (no turn runs
+        then); a tick overdue after a long training step fires on the first turn of the next
+        drive. The final line of a collection is written by `stage_consume` when its batch is
+        consumed, whatever the interval's phase.
         """
         while True:
             await asyncio.sleep(self.progress_interval_s)
             self._log_progress()
 
-    def _log_progress(self) -> None:
+    def _log_progress(self, *, closed_batch: int | None = None) -> None:
         """One INFO line (rank 0): counters, queue sizes, in-flight work, assemble-queue dwell.
 
         The dwell's p50/max cover the items dequeued since the previous line. Skipped while
-        nothing is in flight and no counter moved since the previous line.
+        nothing is in flight and no counter moved since the previous line, except the final
+        line of a collection (`closed_batch`, the count of batches consumed so far), which is
+        always written so a closed iteration carries its own counts.
         """
         dwell, self._progress_dwell = self._progress_dwell, []
         counters = (
@@ -758,7 +762,8 @@ class RolloutPipeline:
         builds = sum(1 for task in self._assemble_tasks if not task.done())
         regens = sum(1 for task in self._regen_tasks if not task.done())
         if (
-            counters == self._progress_counters
+            closed_batch is None
+            and counters == self._progress_counters
             and not dwell
             and not (self._groups_in_flight or builds or regens)
         ):
@@ -778,7 +783,7 @@ class RolloutPipeline:
             "Rollout pipeline progress: prepared=%d inferred=%d assembled=%d banked_batches=%d "
             "consumed_batches=%d | queues infer=%d assemble=%d output=%d | groups_in_flight=%d "
             "partial_groups=%d builds_in_flight=%d building=%d regen_pending=%d | "
-            "assemble_queue_dwell %s",
+            "assemble_queue_dwell %s%s",
             *counters,
             self.infer_queue.qsize(),
             self.assemble_queue.qsize(),
@@ -789,6 +794,7 @@ class RolloutPipeline:
             self._building,
             regens,
             dwell_text,
+            "" if closed_batch is None else f" | closed_batch={closed_batch}",
         )
 
     async def stage_bank(self) -> None:
@@ -820,6 +826,9 @@ class RolloutPipeline:
             except asyncio_QueueShutDown:
                 return
             self.consumed_batches += 1
+            if self.progress_interval_s > 0:
+                # The collection's final line: its counts at the moment its batch is consumed.
+                self._log_progress(closed_batch=self.consumed_batches)
             for group in batch:
                 self._record_output_dwell(group)
                 self._record_yield(group)
