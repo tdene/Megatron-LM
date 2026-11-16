@@ -755,6 +755,13 @@ def _get_or_create_rollout_agent(env_config_path):
     return _ROLLOUT_AGENT
 
 
+def _close_agent(loop, agent):
+    """Release an agent tree's resources (its HTTP sessions) on the loop that created them."""
+    close = getattr(agent, 'aclose', None)
+    if close is not None:
+        loop.run_until_complete(close())
+
+
 def get_rollout_generator(
     inference_interface: ReturnsRaw | ReturnsTokens,
     n_prompts: int,
@@ -3081,7 +3088,14 @@ def evaluate_and_print_results_rl(
                     },
                 )
                 with get_nvtx_range()("rl/run-evaluation", time=True):
-                    evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
+                    try:
+                        evaluation_responses = loop.run_until_complete(
+                            agent.run_evaluation(request)
+                        )
+                    finally:
+                        # A fresh agent tree per evaluation: close its HTTP sessions here, or
+                        # they stay open until garbage collection.
+                        _close_agent(loop, agent)
                     if not isinstance(evaluation_responses, list):
                         evaluation_responses = [evaluation_responses]
                 eval_completion_ids = [
@@ -3491,12 +3505,17 @@ def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
     global _ROLLOUT_PIPELINE
+    global _ROLLOUT_AGENT
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
     _ROLLOUT_PIPELINE = None
+    if _ROLLOUT_AGENT is not None:
+        # The pipeline's episodes are cancelled above; the agent's HTTP sessions go with them.
+        _close_agent(get_asyncio_loop(), _ROLLOUT_AGENT)
+        _ROLLOUT_AGENT = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()

@@ -318,6 +318,13 @@ class WeightedMultiTask(
         all_rollouts_lists = await asyncio.gather(*tasks)
         return [rollout for rollouts in all_rollouts_lists for rollout in rollouts]
 
+    async def aclose(self) -> None:
+        """Release every sub-agent's resources (HTTP sessions); agents without aclose hold none."""
+        for agent in self.agents:
+            close = getattr(agent, 'aclose', None)
+            if close is not None:
+                await close()
+
     async def run_evaluation(self, request: EvaluationRequest) -> list[EvaluationResponse]:
         """Run evaluation across all sub-agents."""
         # Create tasks for each agent
