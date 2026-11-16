@@ -2,6 +2,9 @@
 
 import asyncio
 import itertools
+import logging
+import re
+import time
 from contextlib import aclosing
 from unittest.mock import AsyncMock, MagicMock
 
@@ -30,6 +33,7 @@ from megatron.rl.inference import (
     ReturnsTokens,
 )
 from megatron.rl.inference.megatron import MegatronLocal
+from megatron.rl.rollout_bank import RolloutBank
 
 
 @pytest.mark.asyncio
@@ -1326,3 +1330,473 @@ class TestMultiTurnEpisode:
         assert agent.observation_turns == expected["observation_turns"]
         # get_trajectory_reward sees the full dialogue, ending on the final reply exactly once.
         assert [(m.role, m.content) for m in agent.reward_conversation] == expected["reward_conv"]
+
+
+async def _wait_until(predicate, timeout: float = 5.0, step: float = 0.0):
+    """Run the loop until `predicate()` holds; fail (never hang) after `timeout` seconds."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "the pipeline did not reach the expected state"
+        await asyncio.sleep(step)
+
+
+async def _cancel_pull(pull: asyncio.Future) -> None:
+    """Cancel a parked pull and wait for the generator it drove to finish."""
+    pull.cancel()
+    await asyncio.gather(pull, return_exceptions=True)
+
+
+class HeldBuildGenerator(MockGenerator):
+    """Assembly fixture: every group's last episode parks on `release`, so completed groups
+    reach stage_assemble together; each build_rollout waits for `build_gate` (when given) and
+    then `build_delay_s` (a float, or a callable of the group's prepare index), recording how
+    many builds run at once, how many were cancelled and the groups' build completion order."""
+
+    def __init__(self, rollouts_per_group, build_delay_s=0.0, build_gate=None, **kwargs):
+        super().__init__(**kwargs)
+        self.rollouts_per_group = rollouts_per_group
+        self.build_delay_s = build_delay_s
+        self.build_gate = build_gate
+        self.release = asyncio.Event()
+        self.held = 0
+        self.building = 0
+        self.max_building = 0
+        self.cancelled_builds = 0
+        self.built_groups = []
+
+    async def prepare_group_rollout(self, request):
+        idx = self._call_count
+        params = await super().prepare_group_rollout(request)
+        episodes, members = itertools.count(1), itertools.count(1)
+        base_run, base_build = params.run_episode, params.build_rollout
+
+        async def run_episode():
+            if next(episodes) == self.rollouts_per_group:
+                self.held += 1
+                await self.release.wait()
+            return await base_run()
+
+        async def build_rollout(episode):
+            delay = self.build_delay_s
+            if callable(delay):
+                delay = delay(idx)
+            self.building += 1
+            self.max_building = max(self.max_building, self.building)
+            try:
+                if self.build_gate is not None:
+                    await self.build_gate.wait()
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                self.cancelled_builds += 1
+                raise
+            finally:
+                self.building -= 1
+            if next(members) == self.rollouts_per_group:
+                self.built_groups.append(idx)
+            return await base_build(episode)
+
+        return GroupRolloutParams(run_episode=run_episode, build_rollout=build_rollout)
+
+
+class TestConcurrentAssembly:
+    """Completed groups build at once: one group's build_rollout calls (the agent's control
+    round trips) no longer hold the next completed group back, so a saturated collection
+    closes its batches; the pipeline reports its progress while it runs."""
+
+    LOGGER = "megatron.rl.agent.rollout_pipeline"
+
+    @staticmethod
+    def _request(num_groups, rollouts_per_group, **kwargs):
+        return GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=rollouts_per_group,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+            **kwargs,
+        )
+
+    @staticmethod
+    def _start(it):
+        """Prime run(): the stages start on the first pull, which parks on the empty bank."""
+        return asyncio.ensure_future(anext(it))
+
+    @staticmethod
+    def _all_held(gen, pipeline, num_groups):
+        """Every group's last episode is parked and its other members sit in partial buckets."""
+        return gen.held == num_groups and len(pipeline._assemble_pending) == num_groups
+
+    @staticmethod
+    def _progress_records(caplog):
+        return [
+            record
+            for record in caplog.records
+            if record.getMessage().startswith("Rollout pipeline progress:")
+        ]
+
+    @staticmethod
+    def _fields(record):
+        return {
+            key: float(value)
+            for key, value in re.findall(r"(\w+)=([0-9.]+)s?", record.getMessage())
+        }
+
+    @pytest.mark.asyncio
+    async def test_completed_groups_build_at_once(self):
+        """Twenty groups whose last rollouts land together assemble within two builds' time
+        (one group at a time took twenty builds), the counters and the per-env count at 20."""
+        num_groups, rollouts_per_group, delay = 20, 8, 0.05
+        gen = HeldBuildGenerator(rollouts_per_group, build_delay_s=delay)
+        pipeline = RolloutPipeline(
+            gen, self._request(num_groups, rollouts_per_group), parallel_generation_tasks=1
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            assert pipeline.inferred_count == num_groups * (rollouts_per_group - 1)
+            assert pipeline.assembled_count == 0
+            started = time.monotonic()
+            gen.release.set()
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            wall = time.monotonic() - started
+            pipeline.assert_no_inflight_rollouts()
+        assert wall < 2 * delay, f"{num_groups} groups assembled in {wall:.3f}s"
+        assert gen.max_building == num_groups * rollouts_per_group
+        assert pipeline.assembled_count == num_groups
+        assert pipeline.assembled_groups_per_env == [num_groups]
+        assert sorted(group.index_in_batch for group in groups) == list(range(num_groups))
+        assert all(len(group) == rollouts_per_group for group in groups)
+
+    @pytest.mark.asyncio
+    async def test_assemble_concurrency_bounds_the_builds(self):
+        """At most assemble_concurrency groups build at once; the other completed groups wait
+        for a slot inside their own task and every group still delivers."""
+        num_groups, rollouts_per_group, concurrency = 8, 2, 3
+        gen = HeldBuildGenerator(rollouts_per_group, build_delay_s=0.02)
+        pipeline = RolloutPipeline(
+            gen,
+            self._request(num_groups, rollouts_per_group),
+            parallel_generation_tasks=1,
+            assemble_concurrency=concurrency,
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            gen.release.set()
+            await _wait_until(lambda: gen.building == concurrency * rollouts_per_group)
+            assert pipeline._building == concurrency
+            assert sum(1 for task in pipeline._assemble_tasks if not task.done()) == num_groups
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            pipeline.assert_no_inflight_rollouts()
+        assert gen.max_building == concurrency * rollouts_per_group
+        assert pipeline.assembled_count == len(groups) == num_groups
+        assert pipeline._building == 0 and not pipeline._assemble_tasks
+
+    @pytest.mark.asyncio
+    async def test_assembly_order_does_not_bind_banking_or_consumption(self, tmp_path):
+        """Builds finish out of completion order (the last group's is the quickest): the batch
+        still delivers whole and in slot order, every group records one output dwell, and the
+        bank restores exactly the delivered groups."""
+        num_groups, rollouts_per_group, delay = 4, 2, 0.02
+        gen = HeldBuildGenerator(
+            rollouts_per_group, build_delay_s=lambda idx: delay * (num_groups - idx)
+        )
+        bank = RolloutBank(str(tmp_path))
+        bank.set_collection(0)
+        pipeline = RolloutPipeline(
+            gen,
+            self._request(num_groups, rollouts_per_group),
+            parallel_generation_tasks=1,
+            bank=bank,
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            gen.release.set()
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            pipeline.assert_no_inflight_rollouts()
+        # Assembly completed in reverse submission order (one group at a time kept the order).
+        assert gen.built_groups == list(reversed(range(num_groups)))
+        assert [(group.batch_id, group.index_in_batch) for group in groups] == [
+            (0, index) for index in range(num_groups)
+        ]
+        assert pipeline.yielded_count == len(pipeline.output_queue_dwell) == num_groups
+        assert pipeline.banked_batches == pipeline.consumed_batches == 1
+        bank.close()
+        restored = RolloutBank(str(tmp_path)).restore(trained_through=0)
+        assert {group.uid for group in restored} == {group.uid for group in groups}
+        assert len(restored) == num_groups
+        assert {(group.batch_id, group.index_in_batch) for group in restored} == {
+            (0, index) for index in range(num_groups)
+        }
+
+    @pytest.mark.asyncio
+    async def test_drop_and_regenerate_under_concurrent_builds(self):
+        """Dropped groups are regenerated while the other groups build: the batch delivers
+        whole, every delivered group carries reward signal and the accounting holds."""
+
+        class DegenerateHeldGenerator(HeldBuildGenerator):
+            """The first `num_degenerate` prepared groups share one reward."""
+
+            def __init__(self, num_degenerate, **kwargs):
+                super().__init__(**kwargs)
+                self.num_degenerate = num_degenerate
+
+            async def prepare_group_rollout(self, request):
+                idx = self._call_count
+                params = await super().prepare_group_rollout(request)
+                degenerate = idx < self.num_degenerate
+                members = itertools.count()
+                base_build = params.build_rollout
+
+                async def build_rollout(episode):
+                    rollout = await base_build(episode)
+                    rollout.reward = 0.0 if degenerate else float(next(members))
+                    return rollout
+
+                return GroupRolloutParams(
+                    run_episode=params.run_episode, build_rollout=build_rollout
+                )
+
+        num_groups, rollouts_per_group, num_degenerate = 4, 2, 2
+        gen = DegenerateHeldGenerator(
+            num_degenerate, rollouts_per_group=rollouts_per_group, build_delay_s=0.02
+        )
+        request = self._request(num_groups, rollouts_per_group, filter_groups_with_same_reward=True)
+        pipeline = RolloutPipeline(gen, request, parallel_generation_tasks=1)
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            gen.release.set()
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            pipeline.assert_no_inflight_rollouts()
+        assert gen.max_building == num_groups * rollouts_per_group
+        for group in groups:
+            assert np.std([rollout.reward for rollout in group]) > 1e-6
+        _assert_batches_arrive_in_submission_order(groups, num_groups)
+        assert pipeline.dropped_count == pipeline.filtered_count == num_degenerate
+        assert gen.prepare_group_rollout_calls == num_groups + num_degenerate
+        assert pipeline.assembled_count == num_groups + num_degenerate
+        assert not pipeline._regen_tasks and not pipeline._assemble_tasks
+
+    @pytest.mark.asyncio
+    async def test_failed_build_ends_the_pipeline_and_cancels_the_other_builds(self):
+        """A build that raises ends the stream with that exception at once; the builds in
+        flight beside it are cancelled, not waited for."""
+
+        class OneBrokenBuildGenerator(HeldBuildGenerator):
+            """Group 1's build_rollout raises; every other group's build is slow."""
+
+            async def prepare_group_rollout(self, request):
+                idx = self._call_count
+                params = await super().prepare_group_rollout(request)
+                if idx != 1:
+                    return params
+
+                async def broken_build(episode):
+                    raise ValueError("reward model exploded")
+
+                return GroupRolloutParams(
+                    run_episode=params.run_episode, build_rollout=broken_build
+                )
+
+        num_groups, rollouts_per_group = 3, 2
+        gen = OneBrokenBuildGenerator(rollouts_per_group, build_delay_s=3.0)
+        pipeline = RolloutPipeline(
+            gen, self._request(num_groups, rollouts_per_group), parallel_generation_tasks=1
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            started = time.monotonic()
+            gen.release.set()
+            with pytest.raises(RuntimeError, match="stage died") as excinfo:
+                await asyncio.wait_for(first_pull, timeout=2)
+            wall = time.monotonic() - started
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert wall < 1.0, f"the failure surfaced after {wall:.3f}s"
+        assert gen.cancelled_builds == (num_groups - 1) * rollouts_per_group
+        assert not pipeline._assemble_tasks
+
+    @pytest.mark.asyncio
+    async def test_closed_intake_completes_the_builds_in_flight(self):
+        """When the intake closes while groups build, the builds finish and their groups deliver
+        before the output queue closes; the stream then ends with the stage's failure."""
+
+        class FinitePromptsGenerator(HeldBuildGenerator):
+            """Raises on the prepare after `num_prompts`, as an exhausted dataset would."""
+
+            def __init__(self, num_prompts, **kwargs):
+                super().__init__(**kwargs)
+                self.num_prompts = num_prompts
+
+            async def prepare_group_rollout(self, request):
+                if self._call_count >= self.num_prompts:
+                    raise LookupError("dataset exhausted")
+                return await super().prepare_group_rollout(request)
+
+        num_groups, rollouts_per_group = 3, 2
+        gen = FinitePromptsGenerator(
+            num_groups, rollouts_per_group=rollouts_per_group, build_delay_s=0.05
+        )
+        # A depth-2 gate: the next batch's first prepare runs (and dies) right after batch 0's.
+        pipeline = RolloutPipeline(
+            gen, self._request(num_groups, rollouts_per_group), parallel_generation_tasks=2
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(
+                lambda: self._all_held(gen, pipeline, num_groups) and pipeline._prepare_done
+            )
+            gen.release.set()
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            with pytest.raises(RuntimeError, match="stage died") as excinfo:
+                await asyncio.wait_for(anext(it), timeout=10)
+        assert isinstance(excinfo.value.__cause__, LookupError)
+        assert gen.max_building == num_groups * rollouts_per_group
+        assert [group.index_in_batch for group in groups] == list(range(num_groups))
+        assert pipeline.assembled_count == num_groups
+        assert not pipeline._assemble_tasks
+
+    @pytest.mark.asyncio
+    async def test_assert_no_inflight_rollouts_counts_the_builds(self):
+        """A group whose build is in flight is in-flight work at an iteration boundary."""
+        gate = asyncio.Event()
+        rollouts_per_group = 2
+        gen = HeldBuildGenerator(rollouts_per_group, build_gate=gate)
+        gen.release.set()
+        pipeline = RolloutPipeline(
+            gen, self._request(1, rollouts_per_group), parallel_generation_tasks=1
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            try:
+                await _wait_until(lambda: gen.building == rollouts_per_group)
+                with pytest.raises(AssertionError, match="'assemble_builds': 1"):
+                    pipeline.assert_no_inflight_rollouts()
+                gate.set()
+                await asyncio.wait_for(first_pull, timeout=10)
+                pipeline.assert_no_inflight_rollouts()
+            finally:
+                if not first_pull.done():
+                    await _cancel_pull(first_pull)
+
+    @pytest.mark.asyncio
+    async def test_progress_line_reports_the_pipeline_at_the_interval(self, caplog):
+        """One line per interval while work is in flight, with the counts of that moment; none
+        while nothing is in flight and nothing moved."""
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        num_groups, rollouts_per_group, interval = 2, 2, 0.05
+        gen = HeldBuildGenerator(rollouts_per_group)
+        pipeline = RolloutPipeline(
+            gen,
+            self._request(num_groups, rollouts_per_group),
+            parallel_generation_tasks=1,
+            progress_interval_s=interval,
+        )
+        records = lambda: self._progress_records(caplog)
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            seen = len(records())
+            await _wait_until(lambda: len(records()) > seen, step=0.005)
+            held = self._fields(records()[seen])
+            assert held["prepared"] == num_groups * rollouts_per_group
+            assert held["inferred"] == num_groups * (rollouts_per_group - 1)
+            assert held["assembled"] == held["banked_batches"] == held["consumed_batches"] == 0
+            assert held["infer"] == held["assemble"] == held["output"] == 0
+            assert held["groups_in_flight"] == held["partial_groups"] == num_groups
+            assert held["builds_in_flight"] == held["building"] == held["regen_pending"] == 0
+            if seen == 0:
+                # The dwell window covers the items dequeued since the previous line.
+                assert held["n"] == num_groups * (rollouts_per_group - 1)
+                assert 0 <= held["p50"] <= held["max"] < 1.0
+            gen.release.set()
+            groups = [await asyncio.wait_for(first_pull, timeout=10)]
+            groups += [await asyncio.wait_for(anext(it), timeout=10) for _ in range(num_groups - 1)]
+            await _wait_until(
+                lambda: any(self._fields(r).get("consumed_batches") == 1 for r in records()),
+                step=0.005,
+            )
+            settled = next(
+                self._fields(r) for r in records() if self._fields(r).get("consumed_batches") == 1
+            )
+            assert settled["assembled"] == num_groups
+            assert settled["banked_batches"] == settled["consumed_batches"] == 1
+            assert settled["groups_in_flight"] == settled["builds_in_flight"] == 0
+            assert settled["partial_groups"] == settled["output"] == 0
+            # Nothing in flight (the batch slot waits for the consumer's next pull) and no
+            # counter moves: the timer keeps ticking but writes no line.
+            quiet_from = len(records())
+            await asyncio.sleep(4 * interval)
+            assert len(records()) == quiet_from
+        timestamps = [record.created for record in records()]
+        assert all(b - a >= 0.9 * interval for a, b in zip(timestamps, timestamps[1:]))
+        assert len(groups) == num_groups
+
+    @pytest.mark.asyncio
+    async def test_progress_interval_zero_logs_nothing(self, caplog):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        num_groups, rollouts_per_group = 2, 2
+        gen = HeldBuildGenerator(rollouts_per_group)
+        pipeline = RolloutPipeline(
+            gen,
+            self._request(num_groups, rollouts_per_group),
+            parallel_generation_tasks=1,
+            progress_interval_s=0,
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            await asyncio.sleep(0.15)
+            assert not self._progress_records(caplog)
+            # No reporter: the dwell window of the progress line does not accumulate either.
+            assert pipeline._progress_dwell == []
+            await _cancel_pull(first_pull)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rank, expects_line", [(0, True), (1, False)], ids=["rank0", "rank1"])
+    async def test_progress_line_is_written_on_rank_0_only(
+        self, caplog, monkeypatch, rank, expects_line
+    ):
+        caplog.set_level(logging.INFO, logger=self.LOGGER)
+        monkeypatch.setattr("megatron.core._rank_utils.safe_get_rank", lambda: rank)
+        num_groups, rollouts_per_group = 2, 2
+        gen = HeldBuildGenerator(rollouts_per_group)
+        pipeline = RolloutPipeline(
+            gen,
+            self._request(num_groups, rollouts_per_group),
+            parallel_generation_tasks=1,
+            progress_interval_s=0.02,
+        )
+        async with aclosing(pipeline.run()) as it:
+            first_pull = self._start(it)
+            await _wait_until(lambda: self._all_held(gen, pipeline, num_groups))
+            await asyncio.sleep(0.1)
+            await _cancel_pull(first_pull)
+        assert bool(self._progress_records(caplog)) == expects_line
+
+    def test_pipeline_defaults(self):
+        pipeline = RolloutPipeline(
+            MockGenerator(), self._request(1, 1), parallel_generation_tasks=1
+        )
+        assert (pipeline.assemble_concurrency, pipeline.progress_interval_s) == (64, 60.0)
+        with pytest.raises(AssertionError, match="assemble_concurrency"):
+            RolloutPipeline(
+                MockGenerator(),
+                self._request(1, 1),
+                parallel_generation_tasks=1,
+                assemble_concurrency=0,
+            )
+        with pytest.raises(AssertionError, match="progress_interval_s"):
+            RolloutPipeline(
+                MockGenerator(),
+                self._request(1, 1),
+                parallel_generation_tasks=1,
+                progress_interval_s=-1,
+            )
