@@ -4,6 +4,7 @@ import asyncio
 import io
 import itertools
 import math
+import os
 import tempfile
 import traceback
 import weakref
@@ -1046,6 +1047,100 @@ class TestRLUtils:
             wandb_writer.log.assert_called_once_with(
                 {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
             )
+
+    def test_evaluate_and_print_results_rl_closes_the_evaluation_agent(self, monkeypatch):
+        """Evaluation builds a fresh agent tree per call: its HTTP sessions are closed when the
+        evaluation returns, and when it raises."""
+        args = SimpleNamespace(world_size=1, cuda_graph_impl="none", seq_length=SEQ)
+        rl_config = RLConfig(
+            rl_prompts_per_eval=1,
+            rl_default_temperature=1.0,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+        )
+        response = SimpleNamespace(env_id="env", metrics=lambda: {"reward": [1.0]}, results=[])
+        events = []
+
+        class Agent:
+            def __init__(self, fail):
+                self.fail = fail
+
+            async def run_evaluation(self, request):
+                events.append("evaluate")
+                if self.fail:
+                    raise RuntimeError("env down")
+                return [response]
+
+            async def aclose(self):
+                events.append("aclose")
+
+        loop = asyncio.new_event_loop()
+        monkeypatch.setattr(rl_utils, "get_args", lambda: args)
+        monkeypatch.setattr(rl_utils, "get_train_state", lambda: TrainState(do_train=True))
+        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(
+            rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
+        )
+        monkeypatch.setattr(
+            rl_utils, "get_nvtx_range", lambda: (lambda *args, **kwargs: nullcontext())
+        )
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(
+            rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
+        )
+        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: None)
+        monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+        monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(
+            rl_utils.dist, "gather_object", lambda obj, lst, dst=0: lst.__setitem__(0, obj)
+        )
+        try:
+            monkeypatch.setattr(rl_utils, "get_agent", lambda *_args: Agent(fail=False))
+            rl_utils.evaluate_and_print_results_rl(
+                model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
+            )
+            assert events == ["evaluate", "aclose"]
+            monkeypatch.setattr(rl_utils, "get_agent", lambda *_args: Agent(fail=True))
+            with pytest.raises(RuntimeError, match="env down"):
+                rl_utils.evaluate_and_print_results_rl(
+                    model=[MagicMock()],
+                    optimizer=MagicMock(),
+                    iteration=8,
+                    write_to_tensorboard=False,
+                )
+            assert events == ["evaluate", "aclose", "evaluate", "aclose"]
+        finally:
+            loop.close()
+
+    def test_rl_inference_interface_shutdown_closes_the_rollout_agent(self, monkeypatch):
+        """The persistent pipeline's agent is closed at shutdown, after its generator."""
+        events = []
+
+        class Generator:
+            async def aclose(self):
+                events.append("generator")
+
+        class Agent:
+            async def aclose(self):
+                events.append("agent")
+
+        class Interface:
+            async def kill(self):
+                events.append("kill")
+
+        loop = asyncio.new_event_loop()
+        monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", Generator())
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", object())
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_AGENT", Agent())
+        monkeypatch.setattr(rl_utils, "_INFERENCE_INTERFACE", Interface())
+        monkeypatch.setattr(os, "_exit", lambda code: events.append(("exit", code)))
+        try:
+            rl_utils.rl_inference_interface_shutdown()
+        finally:
+            loop.close()
+        assert events == ["generator", "agent", "kill", ("exit", 0)]
+        assert rl_utils._ROLLOUT_AGENT is None and rl_utils._ROLLOUT_GENERATOR is None
 
     @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
     def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):

@@ -1,12 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import gc
 import json
+import socket
+import warnings
 from contextlib import nullcontext
 from types import SimpleNamespace
 
-import httpx
 import pytest
+import pytest_asyncio
+from aiohttp import web
 
 from megatron.rl import GenericGenerationArgs
 from megatron.rl.agent.api import TokenRollout
@@ -80,9 +84,80 @@ def _run_result(reward=1.0, response_id="resp-c3", **extra):
     )
 
 
-def _install_transport(agent, handler):
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    object.__setattr__(agent, "_client", client)
+class _LocalServer:
+    """A real HTTP/1.1 server on 127.0.0.1 (aiohttp.web) standing in for the environment
+    server and the policy model server, so the agent's whole client path runs against it.
+
+    ``serve`` points an agent at it and installs the ``async (web.Request) -> response``
+    handler; every request is logged as (method, path, client port) so tests can count
+    connections; the agents served are closed on exit.
+    """
+
+    def __init__(self):
+        self.handler = None
+        self.requests = []
+        self.host_port = None
+        self._agents = []
+
+    async def __aenter__(self):
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._dispatch)
+        # A client that gives up (rollout_timeout_s) cancels its handler; teardown is short.
+        self._runner = web.AppRunner(app, handler_cancellation=True, shutdown_timeout=0.5)
+        await self._runner.setup()
+        await web.TCPSite(self._runner, "127.0.0.1", 0).start()  # an OS-assigned free port
+        host, port = self._runner.addresses[0][:2]
+        self.host_port = f"{host}:{port}"
+        return self
+
+    async def __aexit__(self, *exc):
+        for agent in self._agents:
+            await _close(agent)
+        await self._runner.cleanup()
+
+    def serve(self, agent, handler):
+        self.handler = handler
+        agent.env_server_host_port = agent.capture_control_host_port = self.host_port
+        self._agents.append(agent)
+        return agent
+
+    def forget(self, agent):
+        """The test closes (or drops) this agent itself."""
+        self._agents.remove(agent)
+
+    def ports(self, suffix):
+        """Client ports of the requests whose path ends with ``suffix``: one per connection."""
+        return [port for _, path, port in self.requests if path.endswith(suffix)]
+
+    async def _dispatch(self, request):
+        peer = request.transport.get_extra_info("peername")
+        self.requests.append((request.method, request.path, peer[1]))
+        return await self.handler(request)
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def http():
+    async with _LocalServer() as server:
+        yield server
+
+
+async def _close(agent):
+    close = getattr(agent, "aclose", None)  # the parent's agent had no sessions to close
+    if close is not None:
+        await close()
+
+
+def _respond(status, body):
+    if isinstance(body, dict):
+        return web.json_response(body, status=status)
+    return web.Response(status=status, text=body)
+
+
+def _refused_host_port():
+    """A loopback address nothing listens on: connecting to it is refused at once."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return f"127.0.0.1:{sock.getsockname()[1]}"
 
 
 def _request(**generation_args):
@@ -111,7 +186,7 @@ _EVAL_OUTPUT = [
 
 
 class _ControlServer:
-    """Scripted env server + policy control routes behind one MockTransport."""
+    """Scripted env server + policy control routes behind one local HTTP server."""
 
     def __init__(self, run_responses, manifest=None, manifest_status=200, retire_status=200):
         self.run_responses = list(run_responses)
@@ -119,25 +194,26 @@ class _ControlServer:
         self.manifest_status = manifest_status
         self.retire_status = retire_status
         self.runs, self.manifests, self.retired, self.auth = [], [], [], []
+        self.content_types = []
 
-    def __call__(self, request):
-        path = request.url.path
+    async def __call__(self, request):
+        path = request.path
         if path == "/run":
-            self.runs.append(json.loads(request.content))
+            self.content_types.append(request.content_type)
+            self.runs.append(json.loads(await request.read()))
             status, body = self.run_responses.pop(0)
-            return httpx.Response(
-                status, **({"json": body} if isinstance(body, dict) else {"text": body})
-            )
+            return _respond(status, body)
         self.auth.append(request.headers.get("authorization"))
         assert path.startswith(CAPTURE_CONTROL_PREFIX + "/rollouts/")
         if path.endswith("/manifest"):
             self.manifests.append(path.split("/")[-2])
             if self.manifest_status != 200:
-                return httpx.Response(self.manifest_status, text="gone")
-            return httpx.Response(200, json=self.manifest)
+                return web.Response(status=self.manifest_status, text="gone")
+            return web.json_response(self.manifest)
         assert path.endswith("/retire")
-        self.retired.extend(json.loads(request.content)["rollout_ids"])
-        return httpx.Response(self.retire_status, json={"removed": [], "absent": []})
+        self.content_types.append(request.content_type)
+        self.retired.extend(json.loads(await request.read())["rollout_ids"])
+        return web.json_response({"removed": [], "absent": []}, status=self.retire_status)
 
 
 class TestResponsesEnvAgent:
@@ -589,7 +665,7 @@ class TestResponsesEnvAgent:
     )
     @pytest.mark.asyncio
     async def test_http_handling(
-        self, tmp_path, monkeypatch, responses, agent_kwargs, failure, detail, sleeps
+        self, tmp_path, monkeypatch, http, responses, agent_kwargs, failure, detail, sleeps
     ):
         agent = _agent(tmp_path, **agent_kwargs)
         remaining, seen_sleeps = list(responses), []
@@ -598,17 +674,16 @@ class TestResponsesEnvAgent:
             status, body = remaining.pop(0)
             if status == "hang":  # outlast the wall-clock budget (immune to the sleep patch)
                 await asyncio.Event().wait()
-            return httpx.Response(
-                status, **({"json": body} if isinstance(body, dict) else {"text": body})
-            )
+            return _respond(status, body)
 
-        _install_transport(agent, handler)
+        http.serve(agent, handler)
 
         async def fake_sleep(seconds):
             seen_sleeps.append(seconds)
 
-        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-        response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "sleep", fake_sleep)
+            response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
 
         assert seen_sleeps == sleeps
         if failure is None:
@@ -628,16 +703,11 @@ class TestResponsesEnvAgent:
         agent = RefreshCounting(
             agent_name="t",
             dataset_file=_write_dataset(tmp_path),
-            env_server_host_port="h:1",
+            env_server_host_port=_refused_host_port(),
             connect_failure_cap=5,
             connect_refresh_every=2,
             connect_retry_wait_s=0,
         )
-
-        def handler(request):
-            raise httpx.ConnectError("connection refused", request=request)
-
-        _install_transport(agent, handler)
         with pytest.raises(EnvConnectExhausted):
             await agent._post_run({})
         assert len(refreshes) == 2  # at failures 2 and 4; the cap hits at 5
@@ -645,12 +715,13 @@ class TestResponsesEnvAgent:
         # Through the pipeline path the exhaustion travels as a failure value.
         response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
         assert (response.result, response.failure_reason) == (None, "EnvConnectExhausted")
+        await _close(agent)
 
     @pytest.mark.parametrize(
         "kind", ["ok", "row-cap-binds", "http-failure", "manifest-gone", "retire-fails"]
     )
     @pytest.mark.asyncio
-    async def test_episode_end_to_end(self, tmp_path, monkeypatch, kind):
+    async def test_episode_end_to_end(self, tmp_path, monkeypatch, http, kind):
         monkeypatch.setenv(TOKEN_ENV, "s3cret")
         if kind == "row-cap-binds":
             # A row-level max_output_tokens below the agent cap must win the stamp AND be
@@ -673,7 +744,7 @@ class TestResponsesEnvAgent:
             manifest_status=410 if kind == "manifest-gone" else 200,
             retire_status=500 if kind == "retire-fails" else 200,
         )
-        _install_transport(agent, server)
+        http.serve(agent, server)
 
         params = await agent.prepare_group_rollout(_request(temperature=0.7, top_p=0.9))
         rollout = await params.build_rollout(await params.run_episode())
@@ -726,10 +797,12 @@ class TestResponsesEnvAgent:
             assert len({run[ROLLOUT_ID_KEY] for run in server.runs}) == 5
 
     @pytest.mark.asyncio
-    async def test_missing_control_token_fails_the_episode_as_a_value(self, tmp_path, monkeypatch):
+    async def test_missing_control_token_fails_the_episode_as_a_value(
+        self, tmp_path, monkeypatch, http
+    ):
         monkeypatch.delenv(TOKEN_ENV, raising=False)
         agent = _agent(tmp_path)
-        _install_transport(agent, _ControlServer([(200, _GOOD_BODY)], manifest=_CHAIN))
+        http.serve(agent, _ControlServer([(200, _GOOD_BODY)], manifest=_CHAIN))
         params = await agent.prepare_group_rollout(_request())
         rollout = await params.build_rollout(await params.run_episode())
         assert (rollout.rollout_status, rollout.failure_reason) == (
@@ -738,11 +811,11 @@ class TestResponsesEnvAgent:
         )
 
     @pytest.mark.asyncio
-    async def test_evaluation_reports_every_recorded_key(self, tmp_path, monkeypatch):
+    async def test_evaluation_reports_every_recorded_key(self, tmp_path, monkeypatch, http):
         monkeypatch.setenv(TOKEN_ENV, "s3cret")
         agent = _agent(tmp_path)
         server = _ControlServer([(200, _GOOD_BODY)], manifest=_CHAIN)
-        _install_transport(agent, server)
+        http.serve(agent, server)
         response = await agent._evaluation(agent.dataset[0], agent.dataset[0], _request())
         [entry] = response.results
         assert (entry.reward, entry.problem_id) == (0.5, "p0")
@@ -788,3 +861,222 @@ class TestResponsesEnvAgent:
             else [(m.role, m.content) for m in entry.prompt]
         )
         assert prompt == expected_prompt
+
+    @pytest.mark.asyncio
+    async def test_two_http_sessions_configured_for_held_episodes(self, tmp_path):
+        agent = _agent(tmp_path, http_connect_timeout_s=7.0, capture_control_timeout_s=3.0)
+        episodes, control = agent._episode_http_session(), agent._control_http_session()
+        try:
+            assert episodes is not control
+            # Created once: every call returns the same session.
+            assert agent._episode_http_session() is episodes
+            assert agent._control_http_session() is control
+            # Episodes hold their connection for the whole run: no connection limit, no read or
+            # total timeout; only connection establishment is bounded.
+            assert episodes.connector.limit == 0
+            assert (episodes.timeout.total, episodes.timeout.sock_read) == (None, None)
+            assert episodes.timeout.connect == 7.0
+            # Control calls are short, reuse keep-alive connections, and are bounded in total.
+            assert control.timeout.total == 3.0
+            assert control.connector.limit > 0 and not control.connector.force_close
+        finally:
+            await agent.aclose()
+        assert episodes.closed and control.closed
+
+    @pytest.mark.asyncio
+    async def test_wire_bodies_are_json(self, tmp_path, monkeypatch, http):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        server = _ControlServer([(200, _GOOD_BODY)], manifest=_CHAIN)
+        agent = http.serve(_agent(tmp_path), server)
+        params = await agent.prepare_group_rollout(_request(temperature=0.7))
+        await params.build_rollout(await params.run_episode())
+        # The /run body and the retire body are JSON objects declared as such, parsed back to
+        # the objects the agent built; every control call carries the bearer token.
+        assert server.content_types == ["application/json"] * 2
+        assert server.runs[0]["responses_create_params"]["temperature"] == 0.7
+        assert server.auth == ["Bearer s3cret"] * 2
+
+    @pytest.mark.asyncio
+    async def test_held_run_outlasts_the_control_timeout_unless_rollout_timeout_is_set(
+        self, tmp_path, http
+    ):
+        async def slow_run(request):
+            await asyncio.sleep(0.3)
+            return web.json_response(_GOOD_BODY)
+
+        # No read or total timeout on /run: a response slower than a control call's whole
+        # budget still arrives.
+        agent = http.serve(_agent(tmp_path, capture_control_timeout_s=0.05), slow_run)
+        response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
+        assert response.result.reward == 0.5
+        # rollout_timeout_s is the opt-in wall-clock bound, with the parent's failure reason.
+        bounded = http.serve(_agent(tmp_path, rollout_timeout_s=0.05, http_retries=1), slow_run)
+        response = await bounded.get_rollout_response(None, EnvRunRequest(payload={}))
+        assert (response.result, response.failure_reason) == (None, "rollout_timeout")
+
+    @pytest.mark.asyncio
+    async def test_control_call_is_bounded_by_its_total_timeout(self, tmp_path, monkeypatch, http):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+
+        async def handler(request):
+            if request.path == "/run":
+                return web.json_response(_GOOD_BODY)
+            await asyncio.sleep(0.3)
+            return web.json_response(_CHAIN)
+
+        agent = http.serve(_agent(tmp_path, capture_control_timeout_s=0.05), handler)
+        params = await agent.prepare_group_rollout(_request())
+        rollout = await params.build_rollout(await params.run_episode())
+        assert (rollout.rollout_status, rollout.failure_reason) == (
+            "placeholder",
+            "manifest_unavailable",
+        )
+
+    @pytest.mark.asyncio
+    async def test_control_calls_reuse_one_connection_beside_held_episodes(
+        self, tmp_path, monkeypatch, http
+    ):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        held, release = 32, asyncio.Event()
+
+        async def handler(request):
+            if request.path == "/run":
+                await release.wait()
+                return web.json_response(_GOOD_BODY)
+            return web.json_response(_CHAIN)
+
+        agent = http.serve(_agent(tmp_path), handler)
+        episodes = [asyncio.ensure_future(agent._post_run({})) for _ in range(held)]
+        while len(http.ports("/run")) < held:
+            await asyncio.sleep(0.01)
+        for i in range(5):
+            assert await agent._control("GET", f"/rollouts/r{i}/manifest") == _CHAIN
+        release.set()
+        assert [result.reward for result in await asyncio.gather(*episodes)] == [0.5] * held
+        run_ports, control_ports = http.ports("/run"), http.ports("/manifest")
+        # The 32 held episodes sit on 32 connections; the 5 control calls made while they are
+        # held go over ONE other connection, not through the episode session (whose keep-alive
+        # the held connections defeated on the parent's client: a new connection per call).
+        assert len(set(run_ports)) == held
+        assert len(control_ports) == 5 and len(set(control_ports)) == 1
+        assert not set(control_ports) & set(run_ports)
+        assert agent._control_http_session() is not agent._episode_http_session()
+
+    @pytest.mark.asyncio
+    async def test_held_episodes_run_at_once_on_their_own_connections(self, tmp_path, http):
+        held, arrived, release = 200, [], asyncio.Event()
+
+        async def handler(request):
+            arrived.append(request.path)
+            if len(arrived) == held:
+                release.set()  # every episode is in flight before any one of them completes
+            await release.wait()
+            return web.json_response(_GOOD_BODY)
+
+        agent = http.serve(_agent(tmp_path), handler)
+        responses = await asyncio.wait_for(
+            asyncio.gather(
+                *[agent.get_rollout_response(None, EnvRunRequest(payload={})) for _ in range(held)]
+            ),
+            timeout=30,
+        )
+        assert [response.result.reward for response in responses] == [0.5] * held
+        assert len(set(http.ports("/run"))) == held
+
+    # The three failure kinds of the parent's transport-error and status paths, through real
+    # sockets: the same retries (the recorded sleeps), the same final outcome.
+    @pytest.mark.parametrize("kind", ["connection-refused", "reset-mid-body", "http-500"])
+    @pytest.mark.asyncio
+    async def test_failure_mapping(self, tmp_path, monkeypatch, http, kind):
+        seen_sleeps, runs = [], []
+
+        async def handler(request):
+            runs.append(request.path)
+            if kind == "reset-mid-body" and len(runs) == 1:
+                response = web.StreamResponse()
+                response.content_length = 4000
+                await response.prepare(request)
+                await response.write(b'{"reward": 0.5, ')
+                request.transport.abort()  # RST with the body unfinished
+                return response
+            if kind == "http-500":
+                return web.Response(status=500, text="boom")
+            return web.json_response(_GOOD_BODY)
+
+        agent = http.serve(
+            _agent(tmp_path, http_retries=2, connect_failure_cap=3, connect_retry_wait_s=0), handler
+        )
+        if kind == "connection-refused":
+            agent.env_server_host_port = _refused_host_port()
+
+        async def fake_sleep(seconds):
+            seen_sleeps.append(seconds)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "sleep", fake_sleep)
+            response = await agent.get_rollout_response(None, EnvRunRequest(payload={}))
+        if kind == "connection-refused":
+            # Re-POSTed after each refused connect (the connect wait), a value at the cap.
+            assert (response.result, response.failure_reason) == (None, "EnvConnectExhausted")
+            assert seen_sleeps == [0, 0] and runs == []
+        elif kind == "reset-mid-body":
+            # A body cut short is a transport error: re-POSTed once, then the result.
+            assert response.result.reward == 0.5
+            assert seen_sleeps == [0] and runs == ["/run", "/run"]
+        else:
+            # A 5xx is retried with the backoff, then fails as a value with its detail.
+            assert (response.failure_reason, response.failure_detail) == ("http_500", "boom")
+            assert seen_sleeps == [5] and runs == ["/run", "/run"]
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_both_sessions_and_leaves_no_unclosed_warning(
+        self, tmp_path, monkeypatch, http
+    ):
+        monkeypatch.setenv(TOKEN_ENV, "s3cret")
+        agent = http.serve(_agent(tmp_path), _ControlServer([(200, _GOOD_BODY)], manifest=_CHAIN))
+        params = await agent.prepare_group_rollout(_request())
+        assert not (await params.build_rollout(await params.run_episode())).is_placeholder
+        episodes, control = agent._episode_http_session(), agent._control_http_session()
+        await agent.aclose()
+        assert episodes.closed and control.closed
+        await agent.aclose()  # idempotent
+        # A closed agent is dropped silently; the same check does catch sessions left open.
+        reported = []
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(lambda loop, context: reported.append(context["message"]))
+        try:
+            http.forget(agent)
+            await asyncio.sleep(0)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                del agent, params, episodes, control
+                gc.collect()
+            assert not [w for w in caught if "Unclosed" in str(w.message)] and not reported
+            leaky = _agent(tmp_path)
+            leaky._episode_http_session()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                del leaky
+                gc.collect()
+            assert any("Unclosed client session" in str(w.message) for w in caught)
+        finally:
+            loop.set_exception_handler(None)
+
+    @pytest.mark.asyncio
+    async def test_weighted_multi_task_aclose_closes_every_sub_agent(self, tmp_path):
+        agent_cls = get_agent_class("ResponsesEnvAgent")
+
+        def config(name, weight, **kwargs):
+            args = {
+                "agent_name": name,
+                "dataset_file": _write_dataset(tmp_path),
+                "env_server_host_port": "h:1",
+            }
+            return AgentConfig(agent_type=agent_cls, agent_args=args, weight=weight, **kwargs)
+
+        multi = WeightedMultiTask([config("a", 1.0), config("b", 1.0, evaluation_only=True)])
+        sessions = [agent._episode_http_session() for agent in multi.agents]
+        sessions.append(multi.agents[0]._control_http_session())
+        multi.agents.append(SimpleNamespace())  # an agent type without aclose holds no sessions
+        await multi.aclose()
+        assert all(session.closed for session in sessions)
