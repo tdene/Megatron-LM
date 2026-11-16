@@ -12,6 +12,12 @@ hands the trainer the chain's uids as ``completion_ids``; rank 0 rebuilds the tu
 the ledger at collection. Every other recorded uid (retries, dead branches, the calls of a
 masked or failed episode) travels as ``retired_completion_ids`` so its record is drained.
 
+HTTP goes through aiohttp: one session without a connection limit holds the ``/run``
+connections (an episode holds its connection for its whole duration) and a second keep-alive
+session carries the short control calls. httpx/httpcore's pool re-walks every connection it
+holds on every request, so with thousands of held episodes each call cost time linear in the
+episodes in flight, all of it on the trainer's one asyncio loop.
+
 Gym side: ``token_id_capture`` enabled for the agent (``all_agents`` or the agent flag) with
 ``external_staging: true`` and ``external_staging_backend: megatron_worker``; the policy
 model server hosts the bearer-protected manifest control routes this agent reads.
@@ -29,7 +35,7 @@ from asyncio import Lock
 from dataclasses import dataclass, field
 from typing import Any
 
-import httpx
+import aiohttp
 import numpy as np
 from pydantic import BaseModel, Field, PrivateAttr, ValidationError
 
@@ -59,6 +65,14 @@ ROLLOUT_ID_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 _ATTEMPT_SUFFIX = re.compile(r'-a\d+$')
 CAPTURE_CONTROL_PREFIX = '/training-token-capture/control'
 UNCOMMITTED_CALL_REASON = 'request_finished_without_staged_coordinates'
+
+# The failures the agent re-POSTs (what httpx reported as TransportError): connect refused,
+# reset or timed out, the server gone mid-exchange, a body cut short, a malformed response.
+_TRANSPORT_ERRORS = (
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    aiohttp.ClientResponseError,
+)
 
 
 class _WireModel(BaseModel):
@@ -490,6 +504,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     connect_retry_wait_s: float = Field(default=5.0, ge=0)
     # One warning per process when curriculum sampling degrades to uniform.
     _curriculum_fallback_logged: bool = PrivateAttr(False)
+    # The two aiohttp sessions, created lazily on the running loop (see _episode_http_session).
+    _episode_session: Any = PrivateAttr(None)
+    _control_session: Any = PrivateAttr(None)
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -648,17 +665,45 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     async def refresh_routes(self) -> None:
         """Re-resolve server routes after repeated connection failures. Default: static, no-op."""
 
-    def _http_client(self) -> httpx.AsyncClient:
-        client = getattr(self, '_client', None)
-        if client is None:
-            # Episodes hold their connection for the full run duration;
-            # admission is the environment server's job, so the client pool is unbounded.
-            client = httpx.AsyncClient(
-                timeout=httpx.Timeout(None, connect=self.http_connect_timeout_s),
-                limits=httpx.Limits(max_connections=None, max_keepalive_connections=20),
+    def _episode_http_session(self) -> aiohttp.ClientSession:
+        """The session for ``/run``: an episode holds its connection for its whole duration.
+
+        Admission is the environment server's job, so the connector has no connection limit
+        and the calls no read or total timeout; only connection establishment is bounded.
+        aiohttp's connector keeps per-host free lists and counters, so a request costs the
+        same with ten or ten thousand connections held. Created once, lazily, on the loop.
+        """
+        session = self._episode_session
+        if session is None:
+            session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0),
+                timeout=aiohttp.ClientTimeout(total=None, connect=self.http_connect_timeout_s),
             )
-            object.__setattr__(self, '_client', client)
-        return client
+            self._episode_session = session
+        return session
+
+    def _control_http_session(self) -> aiohttp.ClientSession:
+        """The session for the capture control routes: short calls on keep-alive connections.
+
+        Separate from the episode session so control calls reuse a few connections instead of
+        opening one beside thousands of held episodes; each call is bounded in total by
+        ``capture_control_timeout_s``. Created once, lazily, on the loop.
+        """
+        session = self._control_session
+        if session is None:
+            session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.capture_control_timeout_s)
+            )
+            self._control_session = session
+        return session
+
+    async def aclose(self) -> None:
+        """Close both HTTP sessions; the next call creates them again."""
+        for name in ('_episode_session', '_control_session'):
+            session = getattr(self, name)
+            if session is not None:
+                setattr(self, name, None)
+                await session.close()
 
     async def _refresh_routes_single_flight(self, seen_generation: int) -> None:
         """Run refresh_routes once per generation; concurrent callers piggyback."""
@@ -687,19 +732,19 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         self, payload: dict[str, Any], server_name: str | None = None
     ) -> RunResult:
         name = server_name or self.server_name
-        client = self._http_client()
+        session = self._episode_http_session()
         consecutive_failures = 0
         while True:
             generation = getattr(self, '_route_generation', 0)
             url = self.resolve_run_url(name)
             try:
-                response = await client.post(url, json=payload)
-                body = response.text
-                if response.status_code >= 400:
-                    detail = body.strip() or response.reason_phrase or 'empty response body'
-                    raise EnvHTTPError(response.status_code, detail[:4000])
+                async with session.post(url, json=payload, allow_redirects=False) as response:
+                    body = await response.text(errors='replace')
+                    if response.status >= 400:
+                        detail = body.strip() or response.reason or 'empty response body'
+                        raise EnvHTTPError(response.status, detail[:4000])
                 return RunResult.model_validate_json(body)
-            except httpx.TransportError as e:
+            except _TRANSPORT_ERRORS as e:
                 # Connect refused/reset/timeout and mid-body read errors all land here:
                 # re-POST, re-resolving periodically, and give up at the cap.
                 consecutive_failures += 1
@@ -764,17 +809,18 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
 
     async def _control(self, method: str, path: str, **kwargs) -> dict[str, Any]:
         """One bearer-authenticated call to the capture control routes."""
-        response = await self._http_client().request(
+        async with self._control_http_session().request(
             method,
             self.resolve_control_url() + path,
             headers=self._control_headers(),
-            timeout=httpx.Timeout(self.capture_control_timeout_s),
+            allow_redirects=False,
             **kwargs,
-        )
-        if response.status_code >= 400:
-            detail = response.text.strip() or response.reason_phrase or 'empty response body'
-            raise EnvHTTPError(response.status_code, detail[:4000])
-        return response.json()
+        ) as response:
+            body = await response.text(errors='replace')
+            if response.status >= 400:
+                detail = body.strip() or response.reason or 'empty response body'
+                raise EnvHTTPError(response.status, detail[:4000])
+        return json.loads(body)
 
     async def _episode_keys(
         self, rollout_id: str, result: RunResult | None, problem_id: str | None
@@ -786,7 +832,7 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         """
         try:
             manifest = await self._control('GET', f"/rollouts/{rollout_id}/manifest")
-        except (EnvHTTPError, httpx.HTTPError, ValueError) as e:
+        except (EnvHTTPError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             logger.warning(
                 "ResponsesEnvAgent[%s]: manifest of rollout %s unavailable (%s: %s); its "
                 "requests' ledger records cannot be claimed: problem_id=%s",
@@ -804,7 +850,7 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         )
         try:
             await self._control('POST', '/rollouts/retire', json={'rollout_ids': [rollout_id]})
-        except (EnvHTTPError, httpx.HTTPError, ValueError) as e:
+        except (EnvHTTPError, aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
             logger.warning(
                 "ResponsesEnvAgent[%s]: could not retire rollout %s on the policy server (%s: %s)",
                 self.agent_name,
