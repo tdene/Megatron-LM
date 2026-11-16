@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, AsyncIterator, NamedTuple
 import numpy as np
 
 from megatron.core.inference.utils import asyncio_Queue, asyncio_QueueShutDown
-from megatron.core.utils import trace_async_exceptions
+from megatron.core.utils import log_single_rank, trace_async_exceptions
 
 from ..inference import ReturnsRaw, ReturnsTokens
 from ..rollout_granularity import GRANULARITY_RANK, ConsumptionGranularity, SubmissionGranularity
@@ -28,6 +28,14 @@ if TYPE_CHECKING:
     from .api import GroupedRolloutGenerator, Rollout
 
 logger = logging.getLogger(__name__)
+
+#: Completed groups whose rollouts stage_assemble builds at once, each in its own task. A
+#: group's build is its build_rollout calls (the agent's control calls to the environment
+#: server, at its latency), so one group at a time caps assembly at 1 / latency groups per
+#: second, below the completion rate of a saturated engine.
+DEFAULT_ASSEMBLE_CONCURRENCY = 64
+#: Seconds between two progress lines of a running pipeline (rank 0, INFO); 0 logs none.
+DEFAULT_PROGRESS_INTERVAL_S = 60.0
 
 
 class _GranularityConfig(NamedTuple):
@@ -197,6 +205,12 @@ class _InferredItem(NamedTuple):
     inferred_at: float = 0.0
 
 
+class _AssemblyFailed(NamedTuple):
+    """Put on assemble_queue by a build task that failed: wakes stage_assemble to re-raise."""
+
+    task: asyncio.Task
+
+
 class RolloutPipeline:
     """Orchestrates grouped rollout generation over an agent, one instance per request.
 
@@ -211,6 +225,8 @@ class RolloutPipeline:
         parallel_generation_tasks: int,
         bank: "RolloutBank | None" = None,
         initial_batch_id: int = 0,
+        assemble_concurrency: int = DEFAULT_ASSEMBLE_CONCURRENCY,
+        progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
     ) -> None:
         """Validate the request and size the gate, queues, and worker pool.
 
@@ -220,10 +236,16 @@ class RolloutPipeline:
             parallel_generation_tasks: Submission gate depth in trainer batches.
             bank: Optional durable store for freshly completed rollout groups.
             initial_batch_id: Batch ID assigned to the first batch in this pipeline.
+            assemble_concurrency: Completed groups built at once by stage_assemble (each
+                build gathers the group's build_rollout calls); at least 1.
+            progress_interval_s: Seconds between two progress lines (rank 0, INFO) while
+                the pipeline runs; 0 logs none.
         """
         assert isinstance(
             request.inference_interface, (ReturnsRaw, ReturnsTokens)
         ), "InferenceInterface must return raw text or tokens to provide rollouts."
+        assert assemble_concurrency >= 1, "assemble_concurrency must be at least 1."
+        assert progress_interval_s >= 0, "progress_interval_s must not be negative."
         self.agent = agent
         self.request = request
         self.bank = bank
@@ -259,6 +281,17 @@ class RolloutPipeline:
         self._prepare_done = False
         self._groups_in_flight = 0
         self._regen_tasks: set[asyncio.Task] = set()
+        # Completed groups build concurrently, one task each; at most assemble_concurrency
+        # of them hold a slot (`_building`), the rest wait for one inside their task.
+        self.assemble_concurrency = assemble_concurrency
+        self._assemble_slots = asyncio.Semaphore(assemble_concurrency)
+        self._assemble_tasks: set[asyncio.Task] = set()
+        self._building = 0
+        # Progress line: its interval, the assemble-queue dwell samples since the previous
+        # line, and the counters that line showed (an idle pipeline repeats no line).
+        self.progress_interval_s = progress_interval_s
+        self._progress_dwell: list[float] = []
+        self._progress_counters: tuple[int, ...] | None = None
 
         # Buffers of partial results.
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
@@ -295,12 +328,15 @@ class RolloutPipeline:
         Yields:
             RolloutGroup: Groups in consumption-granularity order.
         """
-        tasks = (
+        stages = [
             asyncio.create_task(self.stage_prepare()),
             asyncio.create_task(self.stage_infer()),
             asyncio.create_task(self.stage_assemble()),
             asyncio.create_task(self.stage_bank()),
-        )
+        ]
+        if self.progress_interval_s > 0:
+            stages.append(asyncio.create_task(self._report_progress()))
+        tasks = tuple(stages)
         try:
             async for group in self.stage_consume():
                 yield group
@@ -321,10 +357,10 @@ class RolloutPipeline:
                 + ("" if failure is not None else " (no stage exception was recovered)")
             ) from failure
         finally:
-            regen_tasks = tuple(self._regen_tasks)
-            for task in (*tasks, *regen_tasks):
+            side_tasks = (*self._regen_tasks, *self._assemble_tasks)
+            for task in (*tasks, *side_tasks):
                 task.cancel()
-            await asyncio.gather(*tasks, *regen_tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *side_tasks, return_exceptions=True)
 
     async def _submit_group_to_infer_queue(
         self, *, group_id: int, batch_id: int, index_in_batch: int
@@ -363,6 +399,7 @@ class RolloutPipeline:
             "assemble_pending": sum(len(items) for items in self._assemble_pending.values()),
             "consume_pending": sum(len(groups) for groups in self._consume_pending.values()),
             "regen_pending": sum(1 for task in self._regen_tasks if not task.done()),
+            "assemble_builds": sum(1 for task in self._assemble_tasks if not task.done()),
         }
         assert not any(buffered.values()), (
             f"The rollout pipeline has buffered rollouts at iteration boundary: {buffered}. "
@@ -465,61 +502,110 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
-        """Build complete rollout groups, and regenerate dropped groups."""
+        """Collect inferred rollouts into groups; each completed group builds in its own task.
+
+        The dequeue loop never waits on a build: a completed group's build_rollout calls run
+        in _assemble_group under the assemble_concurrency semaphore, so the groups that
+        complete while one is being built do not queue behind it. A build's exception ends
+        the stage as it did when the build ran inline (the failed task wakes the loop, which
+        awaits it and re-raises); when the intake closes, the builds in flight finish before
+        the output queue shuts down.
+        """
         pending = self._assemble_pending
+        builds = self._assemble_tasks
         try:
             while True:
                 try:
                     inferred = await self.assemble_queue.get()
                 except asyncio_QueueShutDown:
                     break
+                if isinstance(inferred, _AssemblyFailed):
+                    await inferred.task  # Ended with an exception: awaiting it re-raises.
+                    continue
                 dequeued_at = time.monotonic()
                 if inferred.inferred_at:
-                    self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
+                    dwell = dequeued_at - inferred.inferred_at
+                    self.assemble_queue_dwell.append(dwell)
+                    if self.progress_interval_s > 0:
+                        self._progress_dwell.append(dwell)
                 bucket = pending.setdefault(inferred.item.group_id, [])
                 bucket.append(inferred)
                 if len(bucket) < self.request.rollouts_per_group:
                     continue
                 completed = pending.pop(inferred.item.group_id)
                 completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.episode) for item in completed]
-                )
-                first = completed[0]
-                self.assembled_count += 1
-                self.assembled_groups_per_env[first.item.env_index] += 1
-                group = RolloutGroup(
-                    rollouts=rollouts,
-                    batch_id=first.item.batch_id,
-                    index_in_batch=first.item.index_in_batch,
-                )
-                if self._decide_drop(group):
-                    self.dropped_count += 1
-                    self._dropped_completion_ids.extend(
-                        completion_id
-                        for rollout in group.rollouts
-                        if isinstance(rollout, TokenRollout)
-                        for completion_id in (
-                            *rollout.completion_ids,
-                            *rollout.retired_completion_ids,
-                        )
-                    )
-                    task = asyncio.create_task(
-                        self._regenerate_group(group.batch_id, group.index_in_batch)
-                    )
-                    self._regen_tasks.add(task)
-                    task.add_done_callback(self._regen_tasks.discard)
-                    continue
-                if self.bank is not None:
-                    group.uid = self.bank.append(group)
-                self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
-                    time.monotonic()
-                )
-                await self.output_queue.put(group)
-                self._groups_in_flight -= 1
-                self._maybe_close_intake()
+                task = asyncio.create_task(self._assemble_group(completed))
+                builds.add(task)
+                task.add_done_callback(builds.discard)
+            # Intake closed: the builds in flight finish (the first failure propagates)
+            # before the output queue shuts down and the consumer sees the end of the stream.
+            await asyncio.gather(*tuple(builds))
+        except BaseException:
+            await self._cancel_builds()
+            raise
         finally:
             self.output_queue.shutdown()
+
+    async def _cancel_builds(self) -> None:
+        """Cancel the builds in flight and wait for them, retrieving their exceptions."""
+        builds = tuple(self._assemble_tasks)
+        for task in builds:
+            task.cancel()
+        await asyncio.gather(*builds, return_exceptions=True)
+
+    async def _assemble_group(self, completed: list[_InferredItem]) -> None:
+        """Build a completed group's rollouts and hand the group on, or drop and regenerate it.
+
+        Args:
+            completed: The group's inferred items, in rollout order.
+        """
+        try:
+            async with self._assemble_slots:
+                self._building += 1
+                try:
+                    rollouts = await asyncio.gather(
+                        *[item.item.params.build_rollout(item.episode) for item in completed]
+                    )
+                finally:
+                    self._building -= 1
+            first = completed[0]
+            self.assembled_count += 1
+            self.assembled_groups_per_env[first.item.env_index] += 1
+            group = RolloutGroup(
+                rollouts=rollouts,
+                batch_id=first.item.batch_id,
+                index_in_batch=first.item.index_in_batch,
+            )
+            if self._decide_drop(group):
+                self.dropped_count += 1
+                self._dropped_completion_ids.extend(
+                    completion_id
+                    for rollout in group.rollouts
+                    if isinstance(rollout, TokenRollout)
+                    for completion_id in (*rollout.completion_ids, *rollout.retired_completion_ids)
+                )
+                task = asyncio.create_task(
+                    self._regenerate_group(group.batch_id, group.index_in_batch)
+                )
+                self._regen_tasks.add(task)
+                task.add_done_callback(self._regen_tasks.discard)
+                return
+            if self.bank is not None:
+                group.uid = self.bank.append(group)
+            self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = time.monotonic()
+            await self.output_queue.put(group)
+            self._groups_in_flight -= 1
+            self._maybe_close_intake()
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            # stage_assemble may be parked on an empty queue: wake it with this task, which it
+            # awaits to re-raise (with the intake closed it is already awaiting the builds).
+            try:
+                self.assemble_queue.put_nowait(_AssemblyFailed(asyncio.current_task()))
+            except asyncio_QueueShutDown:
+                pass
+            raise
 
     def take_dropped_completion_ids(self) -> list[str]:
         """Completion ids of the groups dropped since the last call."""
@@ -620,8 +706,10 @@ class RolloutPipeline:
         """
         previous = None
         stable = 0
-        # There will be at least one turn that does not change the metrics:
-        # `stage_assemble` advances a group without updating any counters.
+        # There will be at least one turn that does not change the metrics: a group's build
+        # task advances (its build_rollout calls complete) without updating any counter. The
+        # builds in flight and the slots they hold count as progress, so a group whose build
+        # is about to land is not read as a stall.
         while self.ready_batches < 1 and stable < 2:
             await asyncio.sleep(0)
             progress = (
@@ -632,6 +720,8 @@ class RolloutPipeline:
                 self.infer_queue.qsize(),
                 self.assemble_queue.qsize(),
                 self.output_queue.qsize(),
+                len(self._assemble_tasks),
+                self._building,
             )
             stable = stable + 1 if progress == previous else 0
             previous = progress
@@ -640,6 +730,66 @@ class RolloutPipeline:
     def settle(self, loop: asyncio.AbstractEventLoop) -> int:
         """Synchronously drain to quiescence; return full batches ready to consume."""
         return loop.run_until_complete(self._drain())
+
+    async def _report_progress(self) -> None:
+        """Log the pipeline's state every progress_interval_s seconds of event-loop time.
+
+        The timer advances only while the trainer drives the loop (a collection, an
+        evaluation, a settle), so no line is written while the trainer trains.
+        """
+        while True:
+            await asyncio.sleep(self.progress_interval_s)
+            self._log_progress()
+
+    def _log_progress(self) -> None:
+        """One INFO line (rank 0): counters, queue sizes, in-flight work, assemble-queue dwell.
+
+        The dwell's p50/max cover the items dequeued since the previous line. Skipped while
+        nothing is in flight and no counter moved since the previous line.
+        """
+        dwell, self._progress_dwell = self._progress_dwell, []
+        counters = (
+            self.prepared_count,
+            self.inferred_count,
+            self.assembled_count,
+            self.banked_batches,
+            self.consumed_batches,
+        )
+        builds = sum(1 for task in self._assemble_tasks if not task.done())
+        regens = sum(1 for task in self._regen_tasks if not task.done())
+        if (
+            counters == self._progress_counters
+            and not dwell
+            and not (self._groups_in_flight or builds or regens)
+        ):
+            return
+        self._progress_counters = counters
+        if dwell:
+            samples = np.asarray(dwell, dtype=np.float64)
+            dwell_text = (
+                f"p50={float(np.percentile(samples, 50)):.3f}s "
+                f"max={float(samples.max()):.3f}s n={len(dwell)}"
+            )
+        else:
+            dwell_text = "n=0"
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Rollout pipeline progress: prepared=%d inferred=%d assembled=%d banked_batches=%d "
+            "consumed_batches=%d | queues infer=%d assemble=%d output=%d | groups_in_flight=%d "
+            "partial_groups=%d builds_in_flight=%d building=%d regen_pending=%d | "
+            "assemble_queue_dwell %s",
+            *counters,
+            self.infer_queue.qsize(),
+            self.assemble_queue.qsize(),
+            self.output_queue.qsize(),
+            self._groups_in_flight,
+            len(self._assemble_pending),
+            builds,
+            self._building,
+            regens,
+            dwell_text,
+        )
 
     async def stage_bank(self) -> None:
         """Bank complete batches cut from the consumption-ordered group stream."""
