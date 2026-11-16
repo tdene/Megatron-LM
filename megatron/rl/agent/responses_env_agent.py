@@ -16,7 +16,9 @@ HTTP goes through aiohttp: one session without a connection limit holds the ``/r
 connections (an episode holds its connection for its whole duration) and a second keep-alive
 session carries the short control calls. httpx/httpcore's pool re-walks every connection it
 holds on every request, so with thousands of held episodes each call cost time linear in the
-episodes in flight, all of it on the trainer's one asyncio loop.
+episodes in flight, all of it on the trainer's one asyncio loop. A control call's timeout is
+loop time, and the loop does not turn while a batch trains: a call in flight across that
+boundary is retried once the loop turns again (``_control``).
 
 Gym side: ``token_id_capture`` enabled for the agent (``all_agents`` or the agent flag) with
 ``external_staging: true`` and ``external_staging_backend: megatron_worker``; the policy
@@ -73,6 +75,21 @@ _TRANSPORT_ERRORS = (
     aiohttp.ClientPayloadError,
     aiohttp.ClientResponseError,
 )
+
+# The control-call failures a retry cures (ResponsesEnvAgent._control): the per-attempt timeout,
+# which is loop time, so a call in flight while the trainer's loop is blocked expires on the
+# first turn after although Gym answered long before; a keep-alive connection the server closed
+# meanwhile (ServerDisconnectedError, one of the ClientConnectionErrors with the reset's
+# ClientOSError); a body cut short. An HTTP status is an answer and is not retried.
+_CONTROL_RETRY_ERRORS = (
+    asyncio.TimeoutError,
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+)
+# The control-retry summary (ResponsesEnvAgent._log_control_summary): INFO lines at least this
+# many seconds apart, each written only when the counters moved since the previous one.
+CONTROL_RETRY_SUMMARY_INTERVAL_S = 60.0
 
 
 class _WireModel(BaseModel):
@@ -483,7 +500,11 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     # discovery overrides resolve_control_url instead. The bearer token comes from the environment.
     capture_control_host_port: str | None = None
     capture_control_token_env: str = 'NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN'
+    # Each attempt of a control call is bounded by capture_control_timeout_s of loop time (the
+    # bound is per attempt, not for the call) and a call is retried up to capture_control_retries
+    # more times after a timeout or a dropped connection; see _control.
     capture_control_timeout_s: float = Field(default=60.0, gt=0)
+    capture_control_retries: int = Field(default=2, ge=0)
     # Per-turn output-token caps stamped onto every /run body (training and eval).
     # max_output_tokens_per_step takes priority over defer_output_cap_to_engine.
     max_output_tokens_per_step: int | None = None
@@ -507,6 +528,14 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     # The two aiohttp sessions, created lazily on the running loop (see _episode_http_session).
     _episode_session: Any = PrivateAttr(None)
     _control_session: Any = PrivateAttr(None)
+    # Control-call retry counters (see _control): calls retried after a timeout or a dropped
+    # connection, and those that failed once their retries were exhausted; what the last summary
+    # line reported of each, and the loop timer of the next line (_schedule_control_summary).
+    _control_retries: int = PrivateAttr(0)
+    _control_retry_failures: int = PrivateAttr(0)
+    _control_retries_logged: int = PrivateAttr(0)
+    _control_retry_failures_logged: int = PrivateAttr(0)
+    _control_summary_handle: Any = PrivateAttr(None)
 
     def __init__(self, **data):
         super().__init__(**data)
@@ -686,8 +715,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         """The session for the capture control routes: short calls on keep-alive connections.
 
         Separate from the episode session so control calls reuse a few connections instead of
-        opening one beside thousands of held episodes; each call is bounded in total by
-        ``capture_control_timeout_s``. Created once, lazily, on the loop.
+        opening one beside thousands of held episodes; each attempt of a call is bounded in
+        total by ``capture_control_timeout_s`` (``_control`` retries). Created once, lazily, on
+        the loop.
         """
         session = self._control_session
         if session is None:
@@ -698,7 +728,15 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         return session
 
     async def aclose(self) -> None:
-        """Close both HTTP sessions; the next call creates them again."""
+        """Close both HTTP sessions; the next call creates them again.
+
+        A control-retry summary still pending is cancelled, not written: the agent is being
+        closed, and the counters keep their totals.
+        """
+        handle = self._control_summary_handle
+        if handle is not None:
+            self._control_summary_handle = None
+            handle.cancel()
         for name in ('_episode_session', '_control_session'):
             session = getattr(self, name)
             if session is not None:
@@ -807,8 +845,54 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
             await asyncio.sleep(wait_s)
         raise RuntimeError("exhausted retry loop")  # unreachable: http_retries >= 1
 
+    @property
+    def control_retries(self) -> int:
+        """Control calls retried after a timeout or a dropped connection, over the agent's life."""
+        return self._control_retries
+
+    @property
+    def control_retry_failures(self) -> int:
+        """Retried control calls that still failed once their retries were exhausted."""
+        return self._control_retry_failures
+
     async def _control(self, method: str, path: str, **kwargs) -> dict[str, Any]:
-        """One bearer-authenticated call to the capture control routes."""
+        """A bearer-authenticated call to the capture control routes, retried after a stall.
+
+        Each attempt is bounded by ``capture_control_timeout_s`` of loop time, and the trainer's
+        one loop does not turn while a batch trains (the engines suspend, the optimizer steps,
+        the engines resume: about two minutes at saturation), so a call in flight at the
+        iteration boundary expires on the first turn after the resume although Gym answered
+        long before, on a keep-alive connection the server may have closed meanwhile. The retry
+        asks again on the live loop, up to ``capture_control_retries`` more times, each attempt
+        under the same bound and without a pause between them: the server has already answered,
+        and a closed connection is replaced by a new one (aiohttp itself re-sends an idempotent
+        method such as the manifest's GET once after a disconnect, the retire's POST never).
+        Both routes bear a repeat: the manifest is a read, and Gym answers the retire of an
+        already retired rollout with 200 and the id under ``absent`` ("retiring again is a
+        no-op": nemo_gym/token_id_capture/protocols.py, CaptureLedger.retire). An HTTP status
+        is Gym's answer and a malformed body is Gym's too: neither is retried. Retries are
+        counted (``control_retries``, ``control_retry_failures``), not logged per call; one INFO
+        line per ``CONTROL_RETRY_SUMMARY_INTERVAL_S`` reports the counters while they move, and
+        a call whose retries are exhausted raises as before (the caller's WARNING).
+        """
+        retries = self.capture_control_retries
+        for attempt in range(retries + 1):
+            try:
+                return await self._control_attempt(method, path, **kwargs)
+            except _CONTROL_RETRY_ERRORS:
+                if retries == 0:
+                    raise
+                if attempt == 0:
+                    self._control_retries += 1
+                    self._schedule_control_summary()
+                if attempt == retries:
+                    self._control_retry_failures += 1
+                    self._schedule_control_summary()
+                    raise
+        raise RuntimeError("exhausted retry loop")  # unreachable: the last attempt raises
+
+    async def _control_attempt(self, method: str, path: str, **kwargs) -> dict[str, Any]:
+        """One attempt of a control call: the JSON body, or EnvHTTPError for a 4xx/5xx answer."""
         async with self._control_http_session().request(
             method,
             self.resolve_control_url() + path,
@@ -821,6 +905,29 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                 detail = body.strip() or response.reason or 'empty response body'
                 raise EnvHTTPError(response.status, detail[:4000])
         return json.loads(body)
+
+    def _schedule_control_summary(self) -> None:
+        """Arm the summary timer unless one is pending: one line per interval, on the loop."""
+        if self._control_summary_handle is None:
+            self._control_summary_handle = asyncio.get_running_loop().call_later(
+                CONTROL_RETRY_SUMMARY_INTERVAL_S, self._log_control_summary
+            )
+
+    def _log_control_summary(self) -> None:
+        """The INFO line: the counters' movement since the previous line (none: no line)."""
+        self._control_summary_handle = None
+        retried = self._control_retries - self._control_retries_logged
+        failed = self._control_retry_failures - self._control_retry_failures_logged
+        self._control_retries_logged = self._control_retries
+        self._control_retry_failures_logged = self._control_retry_failures
+        if retried or failed:
+            logger.info(
+                "ResponsesEnvAgent[%s]: %d control calls retried after a timeout or a dropped "
+                "connection since the last line, %d failed",
+                self.agent_name,
+                retried,
+                failed,
+            )
 
     async def _episode_keys(
         self, rollout_id: str, result: RunResult | None, problem_id: str | None
