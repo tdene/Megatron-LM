@@ -1191,7 +1191,8 @@ class TestResponsesEnvAgent:
         assert (agent.control_retries, agent.control_retry_failures) == (1, 0)
 
     @pytest.mark.parametrize(
-        "kind", ["every-attempt-stalls", "no-retries-configured", "4xx-not-retried"]
+        "kind",
+        ["every-attempt-stalls", "no-retries-configured", "4xx-not-retried", "retry-answered-4xx"],
     )
     @pytest.mark.asyncio
     async def test_exhausted_control_retries_keep_the_parent_warning(
@@ -1202,6 +1203,8 @@ class TestResponsesEnvAgent:
             "every-attempt-stalls": (1, ["stall", "stall"]),
             "no-retries-configured": (0, ["stall"]),
             "4xx-not-retried": (1, ["gone"]),
+            # The retry is answered with a status: Gym's answer, the retried call's failure.
+            "retry-answered-4xx": (1, ["stall", "gone"]),
         }[kind]
         server = _ScriptedControl(manifest=script)
         agent = http.serve(
@@ -1220,10 +1223,12 @@ class TestResponsesEnvAgent:
         [rollout_id] = set(server.manifests)
         # Every attempt stalled: the configured retry was made; a 4xx is Gym's answer and no
         # retries configured is one attempt: today's single GET either way.
-        assert len(http.ports("/manifest")) == (2 if kind == "every-attempt-stalls" else 1)
+        two_attempts = kind in ("every-attempt-stalls", "retry-answered-4xx")
+        assert len(http.ports("/manifest")) == (2 if two_attempts else 1)
         assert http.ports("/retire") == []
         # Today's WARNING, same text, once.
-        cause = "EnvHTTPError: HTTP 410: gone" if kind == "4xx-not-retried" else "TimeoutError: "
+        answered = kind in ("4xx-not-retried", "retry-answered-4xx")
+        cause = "EnvHTTPError: HTTP 410: gone" if answered else "TimeoutError: "
         assert _agent_records(caplog) == [
             (
                 "WARNING",
@@ -1232,7 +1237,7 @@ class TestResponsesEnvAgent:
                 f"problem_id={rollout.problem_id}",
             )
         ]
-        counted = (1, 1) if kind == "every-attempt-stalls" else (0, 0)
+        counted = (1, 1) if two_attempts else (0, 0)
         assert (agent.control_retries, agent.control_retry_failures) == counted
 
     @pytest.mark.asyncio

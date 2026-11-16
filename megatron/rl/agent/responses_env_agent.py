@@ -852,7 +852,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
 
     @property
     def control_retry_failures(self) -> int:
-        """Retried control calls that still failed once their retries were exhausted."""
+        """Retried control calls whose last attempt failed too: the retries exhausted by a
+        timeout or a dropped connection, or a retry answered with an HTTP status or a malformed
+        body (Gym's answer, never retried)."""
         return self._control_retry_failures
 
     async def _control(self, method: str, path: str, **kwargs) -> dict[str, Any]:
@@ -889,6 +891,13 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
                     self._control_retry_failures += 1
                     self._schedule_control_summary()
                     raise
+            except (EnvHTTPError, ValueError):
+                # Gym's answer (a status, a malformed body): not retried. On a retry it is the
+                # retried call's failure, counted as one.
+                if attempt > 0:
+                    self._control_retry_failures += 1
+                    self._schedule_control_summary()
+                raise
         raise RuntimeError("exhausted retry loop")  # unreachable: the last attempt raises
 
     async def _control_attempt(self, method: str, path: str, **kwargs) -> dict[str, Any]:
