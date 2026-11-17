@@ -206,6 +206,13 @@ class PrefixStoreClient:
 
     ``put`` retries failed attempts for ``retry_budget_s`` of wall time and then raises
     ``PrefixStoreError``; ``get`` (the engine's admission path) and ``forget`` make one attempt.
+
+    The client owns its ``zmq.Context``. Its sockets live as long as their threads (the launch's
+    ``ping()`` leaves one on the main thread), and on the process-wide ``zmq.Context.instance()``
+    they kept the inference engine's shutdown blocked in ``Context.term()`` until the launcher
+    killed the trainer, so an exception in flight at the shutdown never printed its traceback.
+    The context is never terminated: a REQ socket closes with linger 0 when its thread's locals
+    go, and the process end takes the rest.
     """
 
     def __init__(
@@ -217,7 +224,7 @@ class PrefixStoreClient:
         self.address = address
         self.timeout_ms = int(timeout_ms)
         self.retry_budget_s = float(retry_budget_s)
-        self._context = zmq.Context.instance()
+        self._context = zmq.Context()
         self._local = threading.local()
 
     def _socket(self, timeout_ms: int | None = None) -> zmq.Socket:
