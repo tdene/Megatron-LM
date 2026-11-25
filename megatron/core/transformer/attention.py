@@ -29,6 +29,12 @@ from megatron.core.process_groups_config import (
     warn_global_process_group_fallback,
 )
 from megatron.core.shared_prefix import get_shared_prefix_plan
+from megatron.core.ssm.mamba_context_parallel import (
+    _all_to_all_cp2hp,
+    _all_to_all_hp2cp,
+    _redo_attention_load_balancing,
+    _undo_attention_load_balancing,
+)
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -1865,7 +1871,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if attn_mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
             raise ValueError(f"shared-prefix attention is causal; got {attn_mask_type}")
         config = self.config
-        in_cp = runtime_cp_group is not None and runtime_cp_group.size() > 1
+        cp_size = runtime_cp_group.size() if runtime_cp_group is not None else 1
+        heads = self.num_attention_heads_per_partition
+        kv_heads = self.num_query_groups_per_partition
         unsupported = [
             reason
             for hit, reason in (
@@ -1888,7 +1896,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     "attention backends other than flash and fused",
                 ),
                 (config.attention_cp_layout != "zigzag", "the contiguous context-parallel layout"),
-                (config.context_parallel_size > 1 or in_cp, "context parallelism"),
+                # The head exchange gives each rank whole heads and one key-value group's heads.
+                (
+                    heads % cp_size != 0 or (kv_heads % cp_size != 0 and cp_size % kv_heads != 0),
+                    f"context-parallel size {cp_size} with {heads} heads over {kv_heads} "
+                    "key-value heads per tensor-parallel rank",
+                ),
+                # TE sizes the softmax offset for the head count before the exchange.
+                (
+                    cp_size > 1 and config.softmax_type != "vanilla",
+                    f"{config.softmax_type} softmax under context parallelism",
+                ),
                 (is_graph_capturing() or is_graph_warmup(), "CUDA graphs"),
                 (inference_context is not None, "inference"),
                 (bool(core_attention_extra_kwargs), "core-attention variants with extra inputs"),
@@ -1904,10 +1922,33 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self, query: Tensor, key: Tensor, value: Tensor, packed_seq_params: PackedSeqParams
     ) -> Tensor:
         """Gather each segment's keys and values behind the head of its prefix, run one
-        bottom-right causal thd call over the real rows, and scatter the output back."""
+        bottom-right causal thd call over the real rows, and scatter the output back.
+
+        Under context parallelism a rank holds part of every segment; the call runs head-parallel:
+        an all-to-all gives each rank every token for its share of the heads.
+        """
         plan = get_shared_prefix_plan(packed_seq_params, device=query.device)
         if plan.num_real_tokens == 0:
             return query.new_zeros((query.shape[0], query.shape[1] * query.shape[2]))
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size() if cp_group is not None else 1
+        if cp_size > 1:
+            if key.shape[1] % cp_size != 0:
+                # Fewer key-value heads than ranks: repeat each so every rank gets its group's.
+                repeats = cp_size // key.shape[1]
+                key, value = key.repeat_interleave(repeats, 1), value.repeat_interleave(repeats, 1)
+
+            def to_head_parallel(tensor: Tensor) -> Tensor:
+                """[tokens / cp, heads, dim] -> [tokens, heads / cp, dim], in unsharded order."""
+                flat = _all_to_all_cp2hp(tensor.reshape(tensor.shape[0], 1, -1), cp_group)
+                flat = _undo_attention_load_balancing(flat, cp_size, packed_seq_params)
+                return flat.reshape(flat.shape[0], -1, tensor.shape[-1])
+
+            query, key, value = (
+                to_head_parallel(query),
+                to_head_parallel(key),
+                to_head_parallel(value),
+            )
         out = apply_module(self.core_attention)(
             query.index_select(0, plan.q_index),
             key.index_select(0, plan.kv_index),
@@ -1924,7 +1965,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 pad_between_seqs=False,
             ),
         )
-        return out.new_zeros((query.shape[0],) + out.shape[1:]).index_copy(0, plan.q_index, out)
+        out = out.new_zeros((query.shape[0],) + out.shape[1:]).index_copy(0, plan.q_index, out)
+        if cp_size > 1:
+            out = _redo_attention_load_balancing(out.unsqueeze(1), cp_size, packed_seq_params)
+            out = _all_to_all_hp2cp(out, cp_group).squeeze(1)
+        return out
 
     def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the attention output projection to a core-attention result."""

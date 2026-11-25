@@ -2633,7 +2633,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 
     @contextmanager
-    def _attention_type_for(self, attn_mask_type: AttnMaskType):
+    def _shared_prefix_call(self, attn_mask_type: AttnMaskType, key: Tensor):
         """Run a `padding_causal_bottom_right` thd call as cross attention."""
         if (
             attn_mask_type != AttnMaskType.padding_causal_bottom_right
@@ -2646,16 +2646,24 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"shared-prefix attention needs TE >= 2.15, found {get_te_version()}"
             )
         backends = [getattr(self, name) for name in self._SHARED_PREFIX_BACKENDS]
-        previous = self.attention_type
+        previous = self.attention_type, self.num_gqa_groups_per_partition
+        cp_binding = self.cp_group, self.cp_global_ranks, self.cp_stream
+        cp_groups = self.cp_group if isinstance(self.cp_group, list) else [self.cp_group]
+        in_cp = any(get_pg_size(group) > 1 for group in cp_groups)
         try:
             self.attention_type = "cross"
             for backend in backends:
                 backend.attention_type = "cross"
+            self.num_gqa_groups_per_partition = key.shape[-2]
+            if in_cp:
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             yield
         finally:
-            self.attention_type = previous
+            self.attention_type, self.num_gqa_groups_per_partition = previous
             for backend in backends:
-                backend.attention_type = previous
+                backend.attention_type = previous[0]
+            if in_cp:
+                self.set_context_parallel_group(*cp_binding, self.cp_comm_type)
 
     @contextmanager
     def _temporary_runtime_context_parallel_group(
@@ -2827,7 +2835,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
 
-            with self._attention_type_for(attn_mask_type):
+            with self._shared_prefix_call(attn_mask_type, key):
                 core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
             if self.config.qk_clip or self.config.log_max_attention_logit:
@@ -2859,7 +2867,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 _fa_kwargs["num_splits"] = num_splits
             if bf16_backward is not None:
                 _fa_kwargs["bf16_backward"] = bf16_backward
-            with self._attention_type_for(attn_mask_type):
+            with self._shared_prefix_call(attn_mask_type, key):
                 core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         return core_attn_out
