@@ -19,6 +19,7 @@ class SharedPrefixPlan:
     max_seqlen_q: int
     max_seqlen_kv: int
     start_positions: Tensor
+    forks: tuple[tuple[int, int, Tensor], ...]
 
     @property
     def num_real_tokens(self) -> int:
@@ -67,7 +68,7 @@ def get_shared_prefix_plan(
         elif lengths[s] < halo:
             raise ValueError(f"segment {s} has {lengths[s]} tokens, fewer than the halo of {halo}")
 
-    q_rows, kv_rows, cu_q, cu_kv = [], [], [0], [0]
+    q_rows, kv_rows, cu_q, cu_kv, forks = [], [], [0], [0], {}
     for s in range(n):
         if lengths[s] == 0:
             continue
@@ -79,6 +80,8 @@ def get_shared_prefix_plan(
         kv_rows.extend(own)
         cu_q.append(cu_q[-1] + len(own))
         cu_kv.append(cu_kv[-1] + len(head) + len(own))
+        if p >= 0:
+            forks.setdefault((padded[p], prefix_len[s]), []).append(list(own))
     plan = SharedPrefixPlan(
         q_index=torch.tensor(q_rows, dtype=torch.int64, device=device),
         kv_index=torch.tensor(kv_rows, dtype=torch.int64, device=device),
@@ -87,6 +90,18 @@ def get_shared_prefix_plan(
         max_seqlen_q=max(lengths, default=0),
         max_seqlen_kv=max((prefix_len[s] + lengths[s] for s in range(n)), default=0),
         start_positions=torch.tensor(prefix_len, dtype=torch.int32, device=device),
+        forks=tuple(
+            (
+                start,
+                length,
+                torch.tensor(
+                    [own + [-1] * (max(map(len, rows)) - len(own)) for own in rows],
+                    dtype=torch.int64,
+                    device=device,
+                ),
+            )
+            for (start, length), rows in forks.items()
+        ),
     )
     packed_seq_params.seq_prefix_cache = plan
     return plan

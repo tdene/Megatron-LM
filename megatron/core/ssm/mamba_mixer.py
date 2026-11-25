@@ -9,6 +9,7 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
+from functools import partial
 from typing import Optional, Tuple, Union
 
 import torch
@@ -22,8 +23,9 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.shared_prefix import get_shared_prefix_plan
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
@@ -546,7 +548,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         inference_mode=False,
     ):
         """Run Mamba through its normalized SSM output, before output projection."""
-        require_flat(packed_seq_params, "MambaMixer")
         runtime_cp_group = resolve_cp_group(self.cp.cp_group, packed_seq_params)
         runtime_cp = self.cp.for_context_parallel_group(runtime_cp_group)
 
@@ -873,7 +874,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
         state_dtype_kwarg = (
             {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
         )
-        y = mamba_split_conv1d_scan_combined(
+        forks = (
+            get_shared_prefix_plan(packed_seq_params, device=zxBCdt.device).forks
+            if packed_seq_params is not None and packed_seq_params.seq_prefix is not None
+            else ()
+        )
+        scan = partial(_shared_prefix_scan, forks) if forks else mamba_split_conv1d_scan_combined
+        y = scan(
             zxBCdt,
             rearrange(runtime_cp.get_conv1d_weight(), "d 1 w -> d w"),
             runtime_cp.get_conv1d_bias(),
@@ -1757,6 +1764,81 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             )
 
         return sharded_state_dict
+
+
+def _shared_prefix_scan(
+    forks,
+    zxbcdt,
+    conv_weight,
+    conv_bias,
+    dt_bias,
+    A,
+    D,
+    chunk_size,
+    activation,
+    headdim,
+    ngroups,
+    norm_before_gate,
+    seq_idx,
+    **state_dtype,
+):
+    """`mamba_split_conv1d_scan_combined` for a shared-prefix pack: scan every segment from an
+    empty state, then give each dependent segment its prefix head's conv context and SSM state."""
+    heads = A.shape[0]
+    dim = heads * (D.shape[1] if D.dim() == 2 else headdim)
+    states = (conv_weight.shape[0] - dim) // 2
+    z, xBC, dt = torch.split(zxbcdt.squeeze(0), [dim, conv_weight.shape[0], heads], dim=-1)
+    conv = partial(causal_conv1d_fn, weight=conv_weight, bias=conv_bias, activation=activation)
+    xBC_conv = conv(xBC.T.unsqueeze(0).contiguous(), seq_idx=seq_idx).squeeze(0).T
+    steps = torch.arange(conv_weight.shape[1] - 1, device=xBC.device)
+    index, redone = [], []
+    for head, head_len, rows in forks:
+        # Redo each dependent's first conv outputs behind the head's last inputs.
+        own, context = rows[:, : steps.numel()], head + head_len - steps.numel() + steps
+        context = xBC[context.clamp(min=head)] * (context >= head)[:, None]
+        first = xBC[own.clamp(min=0)] * (own >= 0)[..., None]
+        window = torch.cat([context.expand(len(own), -1, -1), first], dim=1)
+        out = conv(window.transpose(1, 2).contiguous()).transpose(1, 2)[:, steps.numel() :]
+        # A row past a dependent's end rewrites its first row with the same value.
+        index.append(torch.where(own >= 0, own, own[:, :1]).flatten())
+        redone.append(torch.where((own >= 0)[..., None], out, out[:, :1].detach()).flatten(0, 1))
+    xBC_conv = xBC_conv.index_copy(0, torch.cat(index), torch.cat(redone))
+    x, B, C = torch.split(xBC_conv, [dim, states, states], dim=-1)
+    x, z = x.unflatten(-1, (heads, -1)).contiguous(), z.unflatten(-1, (heads, -1)).contiguous()
+    B, C = B.unflatten(-1, (ngroups, -1)).contiguous(), C.unflatten(-1, (ngroups, -1)).contiguous()
+    y = mamba_chunk_scan_combined(
+        x[None],
+        dt[None].contiguous(),
+        A,
+        B[None],
+        C[None],
+        chunk_size,
+        D=D,
+        z=z[None],
+        dt_bias=dt_bias,
+        dt_softplus=True,
+        seq_idx=seq_idx,
+        **state_dtype,
+    ).squeeze(0)
+    step = F.softplus(dt.to(dt_bias.dtype) + dt_bias)
+    decay = step * A
+    index, inherited = [], []
+    for head, head_len, rows in forks:
+        head = slice(head, head + head_len)
+        # State at the head's end: each head token's input, decayed over the tokens after it.
+        after = decay[head].flip(0).cumsum(0).flip(0) - decay[head]
+        inputs = x[head].to(step.dtype) * (step[head] * after.exp())[..., None]
+        state = torch.einsum(
+            "lgkp,lgn->gkpn", inputs.unflatten(1, (ngroups, -1)), B[head].to(step.dtype)
+        )
+        # Each dependent token reads that state, decayed over the dependent's tokens up to it.
+        own = rows.clamp(min=0)
+        read = torch.einsum("dlgn,gkpn->dlgkp", C[own].to(step.dtype), state).flatten(2, 3)
+        read = read * decay[own].cumsum(1).exp()[..., None] * F.silu(z[own])
+        index.append(own.flatten())
+        inherited.append((read * (rows >= 0)[..., None, None]).flatten(0, 1))
+    y = y.index_add(0, torch.cat(index), torch.cat(inherited).to(y.dtype))
+    return y.flatten(1).unsqueeze(0)
 
 
 def _check_mamba_sequence_packing_support(
