@@ -105,3 +105,17 @@ def get_shared_prefix_plan(
     )
     packed_seq_params.seq_prefix_cache = plan
     return plan
+
+
+def find_shared_prefixes(
+    tokens: Tensor, prefix_lengths: Tensor, halo: int
+) -> tuple[list[int], list[int]]:
+    """Per row: the first row with its prefix, and the tokens it may leave to a row holding it."""
+    columns = torch.arange(tokens.shape[1], device=tokens.device)
+    prefixes = tokens.masked_fill(columns >= prefix_lengths[:, None], -1)
+    groups = torch.unique(prefixes, dim=0, return_inverse=True)[1].tolist()
+    first = {}
+    return (
+        [first.setdefault(group, row) for row, group in enumerate(groups)],
+        [max(length - halo, 0) for length in prefix_lengths.tolist()],
+    )

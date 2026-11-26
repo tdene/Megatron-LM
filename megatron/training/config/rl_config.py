@@ -125,6 +125,9 @@ class RLConfig:
     """Algorithm for distributing packed bins across ranks. fifo: first-in-first-out sequential
     distribution. round-robin: distribute bins cyclically across ranks for better load balancing."""
 
+    rl_sequence_packing_share_prefixes: bool = field(default=False, metadata=_BOOL_OPTIONAL)
+    """Store a prompt once per bin for the sequences that start with it."""
+
     rl_training_cuda_graphs: bool = field(default=False, metadata=_BOOL_OPTIONAL)
     """If set, do not toggle CUDA graphs on/off between inference and training phases."""
 
@@ -297,6 +300,9 @@ class RLConfig:
         # Training CGs only make sense if we build any CGs.
         if cuda_graph_impl == "none" and self.rl_training_cuda_graphs:
             raise ValueError("--rl-training-cuda-graphs is set but no CUDA graphs are being built.")
+
+        if self.rl_sequence_packing_share_prefixes and not self.rl_use_sequence_packing:
+            raise ValueError("--rl-sequence-packing-share-prefixes needs --rl-use-sequence-packing.")
 
         if self.rl_use_sequence_packing and micro_batch_size != 1:
             raise ValueError(

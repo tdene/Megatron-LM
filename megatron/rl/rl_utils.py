@@ -2650,7 +2650,10 @@ def prepare_data_for_update(
                     global_advantages,
                     cfg.model.transformer.max_seq_length_per_sample,
                     cfg.rl.rl_sequence_packing_max_sequences_per_bin,
-                    cfg.rl.rl_sequence_packing_algo
+                    cfg.rl.rl_sequence_packing_algo,
+                    shared_prefix_halo=(cfg.model.transformer.mtp_num_layers or 0) + 1
+                    if cfg.rl.rl_sequence_packing_share_prefixes
+                    else 0,
                     )
 
                 compute_trajs = packing_context.packed_trajs

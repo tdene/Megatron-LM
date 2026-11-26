@@ -10,6 +10,7 @@ from megatron.core.utils import log_single_rank, round_up_to_nearest_multiple
 from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.shared_prefix import find_shared_prefixes
 from megatron.core import mpu
 import logging
 import typing
@@ -31,12 +32,16 @@ class PackingInfo:
         seq_lengths: List of all original sequence lengths (indexed by global sequence index)
         seq_to_bin_idx: List mapping each global sequence index to its bin index
         packing_algo: Algorithm used for distributing bins ('fifo' or 'round-robin')
+        seq_prefix: For a sequence whose prompt is held by another sequence in its bin
+        seq_prefix_halo: Prompt tokens such a sequence still keeps (0 without prefix sharing)
     """
     bin_seq_indices: List[List[int]]
     seq_starts: Dict[int, List[int]]
     seq_lengths: List[int]
     seq_to_bin_idx: List[Optional[int]]
     packing_algo: typing.Literal['fifo', 'round-robin']
+    seq_prefix: Dict[int, Tuple[int, int]] = field(default_factory=dict)
+    seq_prefix_halo: int = 0
 
 
 @dataclass
@@ -517,6 +522,22 @@ def create_packed_seq_params_for_bin(
 
     max_seqlen = bin_size
 
+    # Sequences whose prompt another sequence in the bin holds, one entry per cu_seqlens segment.
+    shared_prefix = {}
+    if any(idx in packing_info.seq_prefix for idx in seq_indices):
+        holders, held = zip(*(packing_info.seq_prefix.get(idx, (None, 0)) for idx in seq_indices))
+        ghosts = fixed_size - 1 - len(seq_indices)
+        shared_prefix = dict(
+            seq_prefix=torch.tensor(
+                [-1 if holder is None else seq_indices.index(holder) for holder in holders]
+                + [-1] * ghosts,
+                dtype=torch.int32,
+                device=device,
+            ),
+            seq_prefix_len=torch.tensor(list(held) + [0] * ghosts, dtype=torch.int32, device=device),
+            seq_prefix_halo=packing_info.seq_prefix_halo,
+        )
+
     return PackedSeqParams(
         qkv_format='thd',
         cu_seqlens_q=cu_seqlens,
@@ -527,6 +548,7 @@ def create_packed_seq_params_for_bin(
         max_seqlen_kv=max_seqlen,
         total_tokens=bin_size,
         pad_between_seqs=seq_length_multiple > 1,
+        **shared_prefix,
     )
 
 
@@ -586,11 +608,12 @@ def pack_inference_logprobs(
 
         # Scatter logprobs to their generated token slots.
         # Generation can span multiple regions for multi-turn rollouts; place each logprob at the
-        # slot for its token: a token at position `p` occupies packed slot `seq_start + (p - 1)`.
+        # slot for its token: a token at position `p` occupies packed slot `seq_start + (p - 1)`,
+        # less the prompt tokens another sequence in the bin holds for this one.
         gen_positions = generation_masks[seq_idx].nonzero(as_tuple=True)[0].to(device)
         if gen_positions.numel() == 0:
             continue
-        target = seq_start + gen_positions - 1
+        target = seq_start + gen_positions - 1 - packing_info.seq_prefix.get(seq_idx, (None, 0))[1]
         n = min(seq_inf_logprobs.numel(), target.numel())
         target = target[:n]
         # Keep within this sequence's logprob span in the bin.
@@ -670,6 +693,9 @@ class SequencePacker:
         seq_length_multiple: Align sequences within a bin to multiples of this value:
             the slot a sequence occupies is its length rounded up to the next multiple.
             Context parallelism requires every padded sequence length to be a multiple of 2*cp_size.
+        shared_prefix_halo: If nonzero, a prompt is stored once per bin: the first sequence with
+            it is stored whole, and the others keep only their last shared_prefix_halo prompt
+            tokens (PackedSeqParams.seq_prefix). The model needs one more than its MTP depth.
     """
 
     def __init__(
@@ -678,6 +704,7 @@ class SequencePacker:
         pad_token: int,
         max_sequences_per_bin: int = 16,
         seq_length_multiple: int = 1,
+        shared_prefix_halo: int = 0,
     ):
         assert seq_length_multiple >= 1
         assert bin_size % seq_length_multiple == 0, (
@@ -688,6 +715,7 @@ class SequencePacker:
         self.pad_token = pad_token
         self.max_sequences_per_bin = max_sequences_per_bin
         self.seq_length_multiple = seq_length_multiple
+        self.shared_prefix_halo = shared_prefix_halo
 
     def pack_sequences(
         self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
@@ -705,6 +733,20 @@ class SequencePacker:
 
         sorted_indices = sorted(range(len(sequences)), key=lambda i: seq_lengths[i], reverse=True)
 
+        # A prompt is the tokens before the first generated one.
+        prefix, prefix_len = list(range(len(sequences))), [0] * len(sequences)
+        if self.shared_prefix_halo and generation_masks is not None:
+            prefix, prefix_len = find_shared_prefixes(
+                sequences_tensor, generation_masks.int().argmax(dim=1), self.shared_prefix_halo
+            )
+            # Keep the sequences of a prompt together, ordered by their longest sequence.
+            longest = {}
+            for idx in sorted_indices:
+                longest.setdefault(prefix[idx], seq_lengths[idx])
+            sorted_indices.sort(key=lambda i: (longest[prefix[i]], -prefix[i]), reverse=True)
+        seq_prefix: Dict[int, Tuple[int, int]] = {}
+        holders = {}  # In the current bin: the sequence stored whole for each prompt.
+
         bins = []
         bin_seq_indices = []  # Track which sequences are in each bin
         current_bin = []
@@ -715,6 +757,8 @@ class SequencePacker:
         sequences_per_bin = []
         for idx in sorted_indices:
             seq = sequences[idx]
+            if prefix[idx] in holders:
+                seq = seq[prefix_len[idx] :]
             seq_len = round_up_to_nearest_multiple(len(seq), self.seq_length_multiple)
 
             if (
@@ -730,9 +774,15 @@ class SequencePacker:
                     bins.append(current_bin)
                     bin_seq_indices.append(current_bin_indices)
                     sequences_per_bin.append(len(current_bin))
+                seq, holders = sequences[idx], {}
+                seq_len = round_up_to_nearest_multiple(len(seq), self.seq_length_multiple)
                 current_bin = [seq]
                 current_bin_indices = [idx]
                 current_bin_length = seq_len
+            if len(seq) < seq_lengths[idx]:
+                seq_prefix[idx] = (holders[prefix[idx]], prefix_len[idx])
+                seq_lengths[idx] = len(seq)
+            holders.setdefault(prefix[idx], idx)
 
         # Don't forget the last bin
         if current_bin:
@@ -798,8 +848,9 @@ class SequencePacker:
                 # Pack sequence
                 packed_sequences[bin_idx, start:end] = seq
 
-                # Position IDs reset for each sequence
-                position_ids[bin_idx, start:end] = torch.arange(
+                # Position IDs reset for each sequence, and count the prompt tokens another holds
+                offset = seq_prefix.get(seq_indices[seq_idx], (None, 0))[1]
+                position_ids[bin_idx, start:end] = offset + torch.arange(
                     len(seq), device=device, requires_grad=False
                 )
 
@@ -810,7 +861,7 @@ class SequencePacker:
                 if generation_masks is not None:
                     orig_idx = seq_indices[seq_idx]
                     gen_mask = generation_masks[orig_idx][
-                        : len(seq)
+                        offset : offset + len(seq)
                     ]  # Truncate to actual seq length
                     loss_mask[bin_idx, start:end] *= gen_mask.float()
 
@@ -823,7 +874,9 @@ class SequencePacker:
             seq_starts=seq_starts_dict,
             seq_lengths=seq_lengths,
             seq_to_bin_idx=seq_to_bin_idx,
-            packing_algo='fifo'
+            packing_algo='fifo',
+            seq_prefix=seq_prefix,
+            seq_prefix_halo=self.shared_prefix_halo,
         )
 
         seq_per_bin = [len(indices) for indices in packing_info.bin_seq_indices]
@@ -968,6 +1021,8 @@ def distribute_packed_bins(
         seq_lengths=packing_info.seq_lengths,  # Keep all sequence lengths
         seq_to_bin_idx=packing_info.seq_to_bin_idx,  # Keep mapping
         packing_algo=packing_algo,
+        seq_prefix=packing_info.seq_prefix,
+        seq_prefix_halo=packing_info.seq_prefix_halo,
     )
 
     # Add empty bins if this rank has fewer than max_bins_per_rank
@@ -1006,7 +1061,7 @@ def distribute_packed_bins(
     return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
+def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo, shared_prefix_halo=0):
     tokenizer = get_tokenizer()
     data_parallel_world_size = mpu.get_data_parallel_world_size()
     data_parallel_group = mpu.get_data_parallel_group()
@@ -1035,6 +1090,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             pad_token=tokenizer.pad,
             max_sequences_per_bin=max_sequences_per_bin,
             seq_length_multiple=2 * cp_size if cp_size > 1 else 1,
+            shared_prefix_halo=shared_prefix_halo,
         )
 
         # Pack sequences with generation masks
