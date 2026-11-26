@@ -55,7 +55,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnBackend, AttnMaskType
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -1891,10 +1891,6 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 (config.qk_clip or config.log_max_attention_logit, "qk-clip statistics"),
                 (config.attn_logit_softcapping is not None, "logit softcapping"),
                 (getattr(config, "mrope_section", None) is not None, "multimodal RoPE"),
-                (
-                    config.attention_backend not in (AttnBackend.flash, AttnBackend.fused),
-                    "attention backends other than flash and fused",
-                ),
                 (config.attention_cp_layout != "zigzag", "the contiguous context-parallel layout"),
                 # The head exchange gives each rank whole heads and one key-value group's heads.
                 (
