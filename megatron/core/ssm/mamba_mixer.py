@@ -26,7 +26,10 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.shared_prefix import get_shared_prefix_plan
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
+from megatron.core.ssm.causal_conv1d import (
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_shared_prefix,
+)
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
 from megatron.core.ssm.ops.common.intermediate_extraction import (
@@ -1790,19 +1793,7 @@ def _shared_prefix_scan(
     z, xBC, dt = torch.split(zxbcdt.squeeze(0), [dim, conv_weight.shape[0], heads], dim=-1)
     conv = partial(causal_conv1d_fn, weight=conv_weight, bias=conv_bias, activation=activation)
     xBC_conv = conv(xBC.T.unsqueeze(0).contiguous(), seq_idx=seq_idx).squeeze(0).T
-    steps = torch.arange(conv_weight.shape[1] - 1, device=xBC.device)
-    index, redone = [], []
-    for head, head_len, rows in forks:
-        # Redo each dependent's first conv outputs behind the head's last inputs.
-        own, context = rows[:, : steps.numel()], head + head_len - steps.numel() + steps
-        context = xBC[context.clamp(min=head)] * (context >= head)[:, None]
-        first = xBC[own.clamp(min=0)] * (own >= 0)[..., None]
-        window = torch.cat([context.expand(len(own), -1, -1), first], dim=1)
-        out = conv(window.transpose(1, 2).contiguous()).transpose(1, 2)[:, steps.numel() :]
-        # A row past a dependent's end rewrites its first row with the same value.
-        index.append(torch.where(own >= 0, own, own[:, :1]).flatten())
-        redone.append(torch.where((own >= 0)[..., None], out, out[:, :1].detach()).flatten(0, 1))
-    xBC_conv = xBC_conv.index_copy(0, torch.cat(index), torch.cat(redone))
+    xBC_conv = causal_conv1d_shared_prefix(conv, conv_weight.shape[1], xBC, xBC_conv, forks)
     x, B, C = torch.split(xBC_conv, [dim, states, states], dim=-1)
     x, z = x.unflatten(-1, (heads, -1)).contiguous(), z.unflatten(-1, (heads, -1)).contiguous()
     B, C = B.unflatten(-1, (ngroups, -1)).contiguous(), C.unflatten(-1, (ngroups, -1)).contiguous()

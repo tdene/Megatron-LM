@@ -26,12 +26,17 @@ from megatron.core.inference.contexts import BaseInferenceContext, DynamicInfere
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, require_flat, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
+from megatron.core.shared_prefix import get_shared_prefix_plan
+from megatron.core.ssm.causal_conv1d import (
+    assert_causal_conv1d_deterministic,
+    causal_conv1d_cp,
+    causal_conv1d_shared_prefix,
+)
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
@@ -566,7 +571,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """Run the training pre-attention and core-attention stage."""
-        require_flat(packed_seq_params, "GatedDeltaProduct")
         return self._gdp_chunk_forward(
             hidden_states,
             packed_seq_params=packed_seq_params,
@@ -638,7 +642,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
     ):
         """Run GDP's recurrence followed by its output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        require_flat(packed_seq_params, "GatedDeltaProduct")
         runtime_cp = self._resolve_runtime_cp(packed_seq_params)
 
         if runtime_cp.chunkwise and inference_context is not None:
@@ -750,6 +753,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
         if runtime_cp is None:
             runtime_cp = self._resolve_runtime_cp(packed_seq_params)
+        forks = ()
+        if packed_seq_params is not None and packed_seq_params.seq_prefix is not None:
+            if runtime_cp.chunkwise or self.config.gdp_cutedsl_kernel or conv_state is not None:
+                raise NotImplementedError(
+                    "shared-prefix GDP needs the FLA kernel in training, without chunkwise "
+                    "context parallelism"
+                )
+            forks = get_shared_prefix_plan(packed_seq_params, device=hidden_states.device).forks
 
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
@@ -809,6 +820,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                         seq_idx=conv_seq_idx,
                         l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
                         runtime_cp=runtime_cp,
+                        forks=forks,
                     ),
                     VKQ,
                 )
@@ -820,6 +832,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                     seq_idx=conv_seq_idx,
                     l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
                     runtime_cp=runtime_cp,
+                    forks=forks,
                 )
 
         beta, g = self._compute_gating(ba, runtime_cp=runtime_cp)
@@ -836,6 +849,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             preceding_rank_start=preceding_rank_start,
             following_rank_stop=following_rank_stop,
             runtime_cp=runtime_cp,
+            forks=forks,
         )
 
         if ssm_state is not None:
@@ -876,6 +890,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         following_rank_stop=None,
         *,
         runtime_cp: _GDPRuntimeCP,
+        forks=(),
     ):
         """Run the selected chunked gated delta product kernel and return
         (core_attn_out, final_state).
@@ -909,7 +924,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 g=g,
                 beta=beta,
                 num_householder=self.num_householder,
-                initial_state=None,
+                initial_state=(
+                    _shared_prefix_states(
+                        self.gdp_kernel, query, key, value, g, beta, cu_seqlens, forks
+                    )
+                    if forks
+                    else None
+                ),
                 output_final_state=output_final_state,
                 use_qk_l2norm_in_kernel=self.config.gdp_cutedsl_kernel,
                 cu_seqlens=cu_seqlens,
@@ -992,6 +1013,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         l2_norm_in_kernel=False,
         *,
         runtime_cp: _GDPRuntimeCP,
+        forks=(),
     ):
         """Run the causal conv on the VKQ slice and split/reshape it into query, key,
         and value.
@@ -1039,13 +1061,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 x = self.act(runtime_cp.helper.conv1d(x)[..., :seqlen])
             else:
                 # causal_conv1d uses seq_idx to reset the convolution boundaries
-                x = causal_conv1d_fn(
-                    x=x,
+                conv = partial(
+                    causal_conv1d_fn,
                     weight=rearrange(runtime_cp.helper.get_conv1d_weight(), "d 1 w -> d w"),
                     bias=runtime_cp.helper.get_conv1d_bias(),
                     activation=self.activation,
-                    seq_idx=seq_idx,
                 )
+                inputs, x = x, conv(x=x, seq_idx=seq_idx)
+                if forks:
+                    x = causal_conv1d_shared_prefix(
+                        conv, self.d_conv, inputs[0].T, x[0].T, forks
+                    ).T[None]
             x = rearrange(x, "b d l ->  b l d")
 
         value, key, query = torch.split(
@@ -1740,6 +1766,35 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
                 )
 
         return sharded_state_dict
+
+
+def _shared_prefix_states(kernel, query, key, value, g, beta, cu_seqlens, forks):
+    """Starting state of every sequence of a shared-prefix pack: the end state of the prefix head
+    it continues, from a scan of the heads alone, or zeros."""
+    householders = key.shape[1] // query.shape[1]
+    tokens = torch.cat(
+        [torch.arange(head, head + length, device=query.device) for head, length, _ in forks]
+    )
+    steps = torch.arange(householders, device=tokens.device)
+    steps = (tokens[:, None] * householders + steps).flatten()
+    lengths = torch.tensor([0] + [length for _, length, _ in forks], device=tokens.device)
+    _, states = kernel(
+        q=query[:, tokens],
+        k=key[:, steps],
+        v=value[:, steps],
+        g=g[:, tokens],
+        beta=beta[:, steps],
+        num_householder=householders,
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=lengths.cumsum(0).to(cu_seqlens.dtype),
+    )
+    # A continuing sequence is found by its first row; all those of one fork share a state.
+    first = torch.cat([rows[:, 0] for _, _, rows in forks])
+    fork = torch.cat([rows.new_full((len(rows),), i) for i, (_, _, rows) in enumerate(forks)])
+    sequence = torch.searchsorted(cu_seqlens.long(), first, right=True) - 1
+    zeros = states.new_zeros((cu_seqlens.numel() - 1, *states.shape[1:]))
+    return zeros.index_copy(0, sequence, states[fork])
 
 
 def _get_in_proj_checkpoint_split_layout(

@@ -60,6 +60,25 @@ def assert_causal_conv1d_deterministic(deterministic_mode):
     )
 
 
+def causal_conv1d_shared_prefix(conv, width, inputs, outputs, forks):
+    """Redo each shared-prefix dependent's first conv outputs behind its prefix head's last inputs.
+
+    `inputs` and `outputs` are `[tokens, channels]`; `conv` takes `[batch, channels, length]`.
+    """
+    steps = torch.arange(width - 1, device=inputs.device)
+    index, redone = [], []
+    for head, head_len, rows in forks:
+        own, context = rows[:, : steps.numel()], head + head_len - steps.numel() + steps
+        context = inputs[context.clamp(min=head)] * (context >= head)[:, None]
+        first = inputs[own.clamp(min=0)] * (own >= 0)[..., None]
+        window = torch.cat([context.expand(len(own), -1, -1), first], dim=1)
+        out = conv(window.transpose(1, 2).contiguous()).transpose(1, 2)[:, steps.numel() :]
+        # A row past a dependent's end rewrites its first row with the same value.
+        index.append(torch.where(own >= 0, own, own[:, :1]).flatten())
+        redone.append(torch.where((own >= 0)[..., None], out, out[:, :1].detach()).flatten(0, 1))
+    return outputs.index_copy(0, torch.cat(index), torch.cat(redone))
+
+
 def _exchange_initial_states(
     x: torch.Tensor,
     state_len: int,
