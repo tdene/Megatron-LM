@@ -12,12 +12,9 @@ from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import (
-    PackedSeqParams,
-    require_flat,
-    resolve_cp_group,
-    resolve_tp_cp_group,
-)
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
+from megatron.core.shared_prefix import get_shared_prefix_plan
+from megatron.core.ssm.mamba_context_parallel import _redo_attention_load_balancing
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -933,7 +930,13 @@ class TopKRouter(Router):
             mtp_layer_number = min(mtp_layer_number, self.config.mtp_num_layers)
         return mtp_layer_number + self.config.num_layers
 
-    def apply_z_loss(self, logits, padding_mask: Optional[torch.Tensor] = None):
+    def apply_z_loss(
+        self,
+        logits,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_weights: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
         """Encourages the router's logits to remain small to enhance stability.
         Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
 
@@ -949,7 +952,17 @@ class TopKRouter(Router):
         if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
             moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+            if token_weights is None:
+                z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+            else:
+                # Ranks hold unequal shares of a shared-prefix batch:
+                # each divides by the group's mean share, not its own.
+                num_local_tokens = token_weights.sum().float()
+                for group in self._get_aux_loss_groups(packed_seq_params).loss_reduce_groups:
+                    torch.distributed.all_reduce(num_local_tokens, group=group)
+                num_local_tokens = num_local_tokens.clamp(min=1) / self.tp_cp_group.size()
+                z_loss = (logits.logsumexp(-1).square() * token_weights).sum()
+                z_loss = z_loss * moe_z_loss_coeff / num_local_tokens
             if self.calculate_per_token_loss:
                 # Same derivation as in attach_and_log_load_balancing_loss:
                 #   - Target final scaling on z_loss gradients: 1 / (num_micro_batches * dp_size).
@@ -963,9 +976,10 @@ class TopKRouter(Router):
                 # correction: z_loss is computed independently on each TP+CP rank's local
                 # logits and must be averaged across TP+CP rather than summed.
                 # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_local_tokens = (
-                    (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                )
+                if token_weights is None:
+                    num_local_tokens = (
+                        (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                    )
                 logits = MoEAuxLossAutoScaler.apply(
                     logits, z_loss * num_local_tokens * self.tp_cp_group.size()
                 )
@@ -1022,7 +1036,10 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        token_weights: Optional[torch.Tensor] = None,
     ):
         """
         Update expert bias and tokens_per_expert
@@ -1050,6 +1067,10 @@ class TopKRouter(Router):
                     if padding_mask is not None:
                         valid = (~flat_mask).unsqueeze(-1).expand(-1, routing_map.shape[-1])
                         token_counts = token_counts * valid.reshape(-1).to(token_counts.dtype)
+                    if token_weights is not None:
+                        token_counts = token_counts * token_weights.repeat_interleave(
+                            routing_map.shape[-1]
+                        )
                     invalid_routes = expert_indices < 0
                     expert_indices = expert_indices.masked_fill(invalid_routes, 0)
                     token_counts = token_counts.masked_fill(invalid_routes, 0)
@@ -1058,6 +1079,8 @@ class TopKRouter(Router):
                     else:
                         self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
                 else:
+                    if token_weights is not None:
+                        routing_map = routing_map * token_weights[:, None]
                     self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(
@@ -1171,8 +1194,13 @@ class TopKRouter(Router):
         if padding_mask is not None:
             padding_mask = padding_mask.reshape(-1)
 
+        # Statistics count a shared-prefix row once for every segment that reads it.
+        token_weights = self._token_weights(packed_seq_params, padding_mask, logits)
+        if token_weights is not None:
+            padding_mask = token_weights == 0
+
         # Apply Z-Loss
-        logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+        logits = self.apply_z_loss(logits, padding_mask, token_weights, packed_seq_params)
 
         # Calculate probs and routing_map for token dispatching
         topk_indices_dtype = self._dense_route_indices_dtype()
@@ -1274,14 +1302,17 @@ class TopKRouter(Router):
                         )
                         .bool()
                     )
+                # An observation sees a shared-prefix row once for every segment that reads it.
+                shared = token_weights is not None
+                rows = torch.repeat_interleave(token_weights) if shared else slice(None)
                 diagnostics = build_router_diagnostics(
-                    scores_for_aux_loss,
-                    routing_map_for_aux_loss,
-                    actual_routing_map,
+                    scores_for_aux_loss[rows],
+                    routing_map_for_aux_loss[rows],
+                    actual_routing_map[rows],
                     selection_bias,
-                    seq_length,
+                    rows.numel() if shared else seq_length,
                     bsz,
-                    padding_mask=padding_mask,
+                    padding_mask=None if shared else padding_mask,
                 )
                 observe_tensor(
                     self,
@@ -1293,6 +1324,9 @@ class TopKRouter(Router):
                     batch_dim=0,
                 )
             if apply_aux_loss:
+                if token_weights is not None:
+                    scores_for_aux_loss = scores_for_aux_loss * token_weights[:, None]
+                    routing_map_for_aux_loss = routing_map_for_aux_loss * token_weights[:, None]
                 probs = self._apply_aux_loss(
                     probs,
                     scores_for_aux_loss,
@@ -1317,9 +1351,61 @@ class TopKRouter(Router):
                 )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(routing_map, padding_mask, token_weights)
 
         return probs, routing_map
+
+    def _token_weights(
+        self, packed_seq_params: Optional[PackedSeqParams], padding_mask, logits: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Segments reading each of this rank's rows of a shared-prefix batch, else None."""
+        if packed_seq_params is None or packed_seq_params.seq_prefix is None:
+            return None
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+
+        config = self.config
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        cp_size = cp_group.size() if cp_group is not None else 1
+        unsupported = [
+            reason
+            for hit, reason in (
+                # These balance or drop over the rows present, not the tokens they stand for.
+                (
+                    self.routing_type in ("sinkhorn", "quantile_balancing"),
+                    f"{self.routing_type} routing",
+                ),
+                (config.moe_expert_capacity_factor is not None, "expert capacity"),
+                # Every segment reading a row would share its one random draw.
+                (config.moe_input_jitter_eps is not None, "input jitter"),
+                (config.moe_router_force_load_balancing, "forced load balancing"),
+                # A chunk's offset into the rows does not reach the router.
+                (config.mlp_chunks_for_training > 1, "chunked MLPs"),
+                (
+                    cp_size > 1
+                    and "contiguous" in (config.attention_cp_layout, config.linear_cp_layout),
+                    "the contiguous context-parallel layout",
+                ),
+                (is_graph_capturing() or is_graph_warmup(), "CUDA graphs"),
+            )
+            if hit
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "shared-prefix routing does not support " + ", ".join(unsupported)
+            )
+        tp_size = self.tp_group.size() if config.sequence_parallel else 1
+        plan = get_shared_prefix_plan(packed_seq_params, device=logits.device)
+        num_tokens = logits.numel() // logits.shape[-1] * cp_size * tp_size
+        weights = torch.bincount(plan.kv_index, minlength=num_tokens)
+        if cp_size > 1:
+            weights = _redo_attention_load_balancing(weights, cp_size, packed_seq_params)
+        # This rank's context-parallel shard, then its sequence-parallel chunk of that.
+        weights = weights.view(cp_size, tp_size, -1)[
+            cp_group.rank() if cp_size > 1 else 0, self.tp_group.rank() if tp_size > 1 else 0
+        ]
+        if padding_mask is not None:
+            weights = weights * ~padding_mask.reshape(-1)
+        return weights
 
     def reset_global_aux_loss_tracker(self):
         """Reset the global aux loss tracker."""
@@ -1349,8 +1435,6 @@ class TopKRouter(Router):
             input_ids (torch.Tensor, optional): Token IDs with shape [batch, sequence].
                 Required when this is a hash-routing layer.
         """
-        # Router statistics count physical rows; a shared-prefix batch stands for more.
-        require_flat(packed_seq_params, "TopKRouter")
         self._maintain_float32_expert_bias()
 
         # Apply input jitter
@@ -1361,10 +1445,15 @@ class TopKRouter(Router):
         if observe_logits or observe_scores:
             with torch.no_grad():
                 observed_logits = logits.detach()
-                if padding_mask is not None:
+                token_weights = self._token_weights(packed_seq_params, padding_mask, logits)
+                if token_weights is not None:
+                    observed_logits = observed_logits.flatten(0, 1).repeat_interleave(
+                        token_weights, dim=0
+                    )
+                elif padding_mask is not None:
                     observed_logits = observed_logits[~padding_mask]
                 tp_shard_dim = 0 if self.config.sequence_parallel else None
-                batch_dim = 0 if padding_mask is not None else 1
+                batch_dim = 0 if observed_logits.dim() == 2 else 1
                 if observe_logits:
                     observe_tensor(
                         self,
@@ -1602,7 +1691,6 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        require_flat(packed_seq_params, "InferenceTopKRouter")
         if not InferenceMode.is_active():
             return super().forward(
                 input, padding_mask, input_ids, packed_seq_params=packed_seq_params
