@@ -101,11 +101,12 @@ def roll_contiguous(tensor, dims, cp_group, packed_seq_params=None, fill_value=0
     Both boundary exchanges are differentiable and use the supplied groups.
     Slots after the final physical boundary form a trailing segment.
     """
-    require_flat(packed_seq_params, "roll_contiguous (contiguous CP layout)")
-    if tensor.shape[dims] == 0:
-        return tensor.clone()
     cp_size = cp_group.size() if cp_group is not None else 1
     sp_size = sp_group.size() if sp_group is not None else 1
+    if cp_size > 1 or sp_size > 1:
+        require_flat(packed_seq_params, "roll_contiguous (contiguous CP layout)")
+    if tensor.shape[dims] == 0:
+        return tensor.clone()
     if cp_size == sp_size == 1:
         result = torch.roll(tensor, -1, dims)
         result.select(dims, -1).fill_(fill_value)

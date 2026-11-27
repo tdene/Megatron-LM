@@ -1792,7 +1792,8 @@ def _shared_prefix_scan(
     states = (conv_weight.shape[0] - dim) // 2
     z, xBC, dt = torch.split(zxbcdt.squeeze(0), [dim, conv_weight.shape[0], heads], dim=-1)
     conv = partial(causal_conv1d_fn, weight=conv_weight, bias=conv_bias, activation=activation)
-    xBC_conv = conv(xBC.T.unsqueeze(0).contiguous(), seq_idx=seq_idx).squeeze(0).T
+    # `causal_conv1d_fn` takes `seq_idx` only on a channels-last view, not on a copy.
+    xBC_conv = conv(xBC[None].transpose(1, 2), seq_idx=seq_idx)[0].T
     xBC_conv = causal_conv1d_shared_prefix(conv, conv_weight.shape[1], xBC, xBC_conv, forks)
     x, B, C = torch.split(xBC_conv, [dim, states, states], dim=-1)
     x, z = x.unflatten(-1, (heads, -1)).contiguous(), z.unflatten(-1, (heads, -1)).contiguous()
